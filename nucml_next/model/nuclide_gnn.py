@@ -11,7 +11,8 @@ Why GNN for Nuclear Data?
     - (n,2n) connects along diagonal lines
 
 Architecture:
-    - Input: Node features [Z, A, N, N/Z, mass_excess, ...]
+    - Input: Node features [Z, A, N, N/Z, Mass_Excess, Binding_Energy, Is_Fissile, Is_Stable]
+        (8 features, enriched with AME2020 data when available)
     - GNN layers: Message passing on reaction graph
     - Output: Rich isotope embeddings that encode topology
 
@@ -40,7 +41,7 @@ class NuclideGNN(nn.Module):
 
     def __init__(
         self,
-        node_features: int = 7,
+        node_features: int = 8,
         hidden_dim: int = 64,
         embedding_dim: int = 32,
         num_layers: int = 3,
@@ -51,7 +52,8 @@ class NuclideGNN(nn.Module):
         Initialize Nuclide GNN.
 
         Args:
-            node_features: Number of input node features
+            node_features: Number of input node features (8 with AME2020 enrichment:
+                          Z, A, N, N/Z, Mass_Excess, Binding_Energy, Is_Fissile, Is_Stable)
             hidden_dim: Hidden dimension size
             embedding_dim: Final embedding dimension
             num_layers: Number of GNN layers

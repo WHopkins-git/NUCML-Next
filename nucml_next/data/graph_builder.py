@@ -79,37 +79,62 @@ class GraphBuilder:
         Build node feature matrix.
 
         Features for each isotope:
-            [Z, A, N, N/Z ratio, Mass excess (approx), Is_Fissile]
+            [Z, A, N, N/Z ratio, Mass excess, Binding energy, Is_Fissile, Is_Stable]
+
+        If AME2020 data is available (from EXFOR ingestor), uses real values.
+        Otherwise, uses SEMF approximation.
 
         Returns:
             Array of shape [num_isotopes, num_features]
         """
         features = []
 
-        for _, row in self.isotopes.iterrows():
-            Z, A, N = row['Z'], row['A'], row['N']
+        # Check if AME2020 columns are available
+        has_ame2020 = 'Mass_Excess_keV' in self.df.columns
+
+        for _, isotope_row in self.isotopes.iterrows():
+            Z, A, N = isotope_row['Z'], isotope_row['A'], isotope_row['N']
 
             # Nuclear properties
             nz_ratio = N / Z if Z > 0 else 0.0
 
-            # Approximate mass excess using semi-empirical mass formula (SEMF)
-            # This is a simplified version
-            mass_excess = self._approximate_mass_excess(Z, A, N)
+            # Get mass excess and binding energy
+            if has_ame2020:
+                # Use real AME2020 data
+                # Look up this isotope in the dataframe
+                isotope_data = self.df[(self.df['Z'] == Z) & (self.df['A'] == A)]
+                if len(isotope_data) > 0:
+                    mass_excess_kev = isotope_data['Mass_Excess_keV'].iloc[0]
+                    binding_energy_kev = isotope_data['Binding_Energy_keV'].iloc[0]
 
-            # Is this a fissile isotope?
-            is_fissile = 1.0 if (Z == 92 and A == 235) or (Z == 94 and A == 239) else 0.0
+                    # Handle NaN values (fallback to SEMF)
+                    if pd.isna(mass_excess_kev):
+                        mass_excess_kev = self._approximate_mass_excess(Z, A, N) * 1000  # eV to keV
+                    if pd.isna(binding_energy_kev):
+                        binding_energy_kev = -mass_excess_kev
+                else:
+                    # Fallback to SEMF
+                    mass_excess_kev = self._approximate_mass_excess(Z, A, N) * 1000
+                    binding_energy_kev = -mass_excess_kev
+            else:
+                # Use SEMF approximation (eV)
+                mass_excess_ev = self._approximate_mass_excess(Z, A, N)
+                mass_excess_kev = mass_excess_ev / 1000.0
+                binding_energy_kev = -mass_excess_kev
 
-            # Is this stable? (Very rough heuristic)
+            # Derived features
+            is_fissile = 1.0 if (Z == 92 and A == 235) or (Z == 94 and A == 239) or (Z == 92 and A == 233) else 0.0
             is_stable = 1.0 if abs(N - Z) < 5 and Z < 83 else 0.0
 
             feat = [
-                Z / 100.0,          # Normalized Z
-                A / 250.0,          # Normalized A
-                N / 150.0,          # Normalized N
-                nz_ratio,           # N/Z ratio
-                mass_excess / 1e8,  # Normalized mass excess
-                is_fissile,         # Binary flag
-                is_stable,          # Binary flag
+                Z / 100.0,                      # Normalized Z
+                A / 250.0,                      # Normalized A
+                N / 150.0,                      # Normalized N
+                nz_ratio,                       # N/Z ratio
+                mass_excess_kev / 1e6,          # Normalized mass excess (MeV)
+                binding_energy_kev / 1e6,       # Normalized binding energy (MeV)
+                is_fissile,                     # Binary flag
+                is_stable,                      # Binary flag
             ]
             features.append(feat)
 

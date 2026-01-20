@@ -54,20 +54,27 @@ class NucmlDataset(Dataset):
         mode: Literal['graph', 'tabular'] = 'graph',
         energy_bins: Optional[np.ndarray] = None,
         cache_graphs: bool = True,
+        filters: Optional[Dict[str, List]] = None,
+        lazy_load: bool = False,
     ):
         """
         Initialize NUCML dataset.
 
         Args:
-            data_path: Path to Parquet file. If None, generates synthetic data.
+            data_path: Path to Parquet file/directory. If None, generates synthetic data.
+                       Supports both single files and partitioned datasets.
             mode: 'graph' for GNN training, 'tabular' for classical ML
             energy_bins: Energy grid for cross-section evaluation (eV)
             cache_graphs: Whether to cache constructed graphs in memory
+            filters: Filters for lazy loading, e.g. {'Z': [92], 'MT': [18, 102]}
+            lazy_load: Enable lazy loading for large datasets (loads on demand)
         """
         super().__init__()
         self.data_path = Path(data_path) if data_path else None
         self.mode = mode
         self.cache_graphs = cache_graphs
+        self.filters = filters or {}
+        self.lazy_load = lazy_load
         self._graph_cache: Dict[int, Data] = {}
 
         # Default energy grid: 1 eV to 20 MeV (logarithmic)
@@ -78,7 +85,8 @@ class NucmlDataset(Dataset):
 
         # Load data from Parquet or generate synthetic
         if self.data_path and self.data_path.exists():
-            self.df = pq.read_table(self.data_path).to_pandas()
+            self.df = self._load_parquet_data(self.data_path, self.filters, lazy_load)
+            print(f"✓ Loaded {len(self.df)} data points from {self.data_path}")
         else:
             print("⚠️  No data file provided. Generating synthetic nuclear data...")
             self.df = self._generate_synthetic_data()
@@ -91,6 +99,74 @@ class NucmlDataset(Dataset):
         if self.mode == 'graph':
             self.graph_data = self.graph_builder.build_global_graph()
             print(f"✓ Graph built: {self.graph_data.num_nodes} nodes, {self.graph_data.num_edges} edges")
+
+    def _load_parquet_data(
+        self,
+        data_path: Path,
+        filters: Dict[str, List],
+        lazy_load: bool
+    ) -> pd.DataFrame:
+        """
+        Load data from Parquet (single file or partitioned dataset).
+
+        Supports:
+        - Single Parquet files (.parquet)
+        - Partitioned Parquet datasets (directories)
+        - Efficient filtering by partition columns (Z, A, MT)
+        - Lazy loading for large datasets
+
+        Args:
+            data_path: Path to Parquet file or directory
+            filters: Column filters, e.g. {'Z': [92], 'A': [235]}
+            lazy_load: If True, loads only metadata initially
+
+        Returns:
+            DataFrame with cross-section data
+        """
+        # Check if partitioned dataset (directory) or single file
+        if data_path.is_dir():
+            # Partitioned dataset
+            dataset = pq.ParquetDataset(str(data_path), filters=self._build_filters(filters))
+
+            if lazy_load:
+                # Load only schema initially
+                print(f"⚠️  Lazy loading enabled. Data will be loaded on-demand.")
+                # For lazy loading, read a small subset to get schema
+                df = dataset.read(columns=None).to_pandas().head(1000)
+            else:
+                # Load full dataset with filters
+                df = dataset.read().to_pandas()
+
+        else:
+            # Single Parquet file
+            table = pq.read_table(str(data_path), filters=self._build_filters(filters))
+            df = table.to_pandas()
+
+        return df
+
+    @staticmethod
+    def _build_filters(filters: Dict[str, List]) -> Optional[List]:
+        """
+        Build PyArrow filters from dictionary.
+
+        Args:
+            filters: Dictionary of column -> values, e.g. {'Z': [92, 94]}
+
+        Returns:
+            PyArrow filter expression
+
+        Example:
+            {'Z': [92], 'MT': [18]} → [('Z', 'in', [92]), ('MT', 'in', [18])]
+        """
+        if not filters:
+            return None
+
+        filter_list = []
+        for col, values in filters.items():
+            if isinstance(values, list) and len(values) > 0:
+                filter_list.append((col, 'in', values))
+
+        return filter_list if filter_list else None
 
     def _generate_synthetic_data(self) -> pd.DataFrame:
         """

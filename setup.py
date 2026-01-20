@@ -11,10 +11,10 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="nucml-next",
-    version="1.0.0",
+    version="1.1.0-alpha",
     author="NUCML-Next Team",
     author_email="nucml@example.com",
-    description="Next-Generation Nuclear Data Evaluation with Physics-Informed Deep Learning",
+    description="Next-Generation Nuclear Data Evaluation with Physics-Informed Deep Learning (Production-Ready with EXFOR Data)",
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/WHopkins-git/NUCML-Next",
@@ -36,6 +36,7 @@ setup(
         "pandas>=2.0.0",
         "scipy>=1.10.0",
         "pyarrow>=12.0.0",
+        "fastparquet>=2023.10.0",
         "scikit-learn>=1.3.0",
         "xgboost>=2.0.0",
         "torch>=2.0.0",

@@ -34,14 +34,89 @@ git clone https://github.com/WHopkins-git/NUCML-Next.git
 cd NUCML-Next
 pip install -r requirements.txt
 
-# Run educational notebooks
+# Run educational notebooks (uses real EXFOR data)
 jupyter notebook notebooks/00_Baselines_and_Limitations.ipynb
+```
+
+---
+
+## Data Setup (Production Mode with EXFOR)
+
+NUCML-Next v1.1.0-alpha now supports **real-world nuclear cross-section data** from the IAEA EXFOR database.
+
+### Option 1: Download EXFOR-X5json Bulk Database
+
+1. Download the EXFOR-X5json bulk database from IAEA:
+   - Visit: https://www-nds.iaea.org/exfor/
+   - Download: EXFOR-X5json bulk ZIP file (~500 MB compressed)
+   - Unzip to a local directory, e.g., `~/data/EXFOR-X5json/`
+
+2. Run the EXFOR ingestor:
+
+```python
+from nucml_next.data import ingest_exfor
+
+# Ingest EXFOR database to Parquet
+df = ingest_exfor(
+    exfor_root='~/data/EXFOR-X5json/',
+    output_path='data/exfor_processed.parquet',
+    ame2020_path=None,  # Will use SEMF approximation
+    max_files=None      # Process all files (set to 100 for testing)
+)
+```
+
+3. Use the processed data:
+
+```python
+from nucml_next.data import NucmlDataset
+
+# Load processed EXFOR data
+dataset = NucmlDataset(
+    data_path='data/exfor_processed.parquet',
+    mode='graph',
+    filters={'Z': [92], 'MT': [18, 102]}  # U reactions only
+)
+```
+
+### Option 2: Quick Start with Synthetic Data
+
+For educational purposes or quick testing, NUCML-Next generates synthetic data automatically:
+
+```python
+from nucml_next.data import NucmlDataset
+
+# Generates synthetic U-235, U-238, Pu-239 data
+dataset = NucmlDataset(data_path=None, mode='graph')
+```
+
+### AME2020 Integration (Optional)
+
+For enhanced isotope features, download AME2020 data:
+
+```bash
+wget https://www-nds.iaea.org/amdc/ame2020/mass_1.mas20.txt -O data/ame2020.txt
+```
+
+Then use it during ingestion:
+
+```python
+df = ingest_exfor(
+    exfor_root='~/data/EXFOR-X5json/',
+    output_path='data/exfor_processed.parquet',
+    ame2020_path='data/ame2020.txt'  # Real AME2020 data
+)
 ```
 
 ---
 
 ## Features
 
+### v1.1.0-alpha (Production-Ready)
+✓ **EXFOR-X5json bulk ingestor** with AME2020 enrichment
+✓ **Partitioned Parquet** data fabric for large-scale datasets
+✓ **Real experimental data** from IAEA EXFOR database
+
+### Core Framework
 ✓ **Dual-view data architecture** (Graph + Tabular)
 ✓ **Baseline models** (Decision Trees, XGBoost)
 ✓ **GNN-Transformer** architecture
