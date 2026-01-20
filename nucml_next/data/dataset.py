@@ -50,37 +50,56 @@ class NucmlDataset(Dataset):
 
     def __init__(
         self,
-        data_path: Optional[str] = None,
+        data_path: str,
         mode: Literal['graph', 'tabular'] = 'graph',
         energy_bins: Optional[np.ndarray] = None,
         cache_graphs: bool = True,
         filters: Optional[Dict[str, List]] = None,
         lazy_load: bool = False,
-        require_real_data: bool = False,
     ):
         """
-        Initialize NUCML dataset.
+        Initialize NUCML dataset from EXFOR data.
 
         Args:
-            data_path: Path to Parquet file/directory. If None, generates synthetic data.
+            data_path: Path to EXFOR Parquet file/directory (REQUIRED).
                        Supports both single files and partitioned datasets.
             mode: 'graph' for GNN training, 'tabular' for classical ML
             energy_bins: Energy grid for cross-section evaluation (eV)
             cache_graphs: Whether to cache constructed graphs in memory
             filters: Filters for lazy loading, e.g. {'Z': [92], 'MT': [18, 102]}
             lazy_load: Enable lazy loading for large datasets (loads on demand)
-            require_real_data: If True, raises error if data_path not provided.
-                              Use this in production to prevent accidental synthetic data use.
+
+        Raises:
+            ValueError: If data_path is not provided
+            FileNotFoundError: If data_path does not exist
         """
         super().__init__()
-        self.data_path = Path(data_path) if data_path else None
+
+        # Require data_path
+        if not data_path:
+            raise ValueError(
+                "❌ ERROR: data_path is required!\n"
+                "   NUCML-Next requires real EXFOR experimental data.\n"
+                "   \n"
+                "   To obtain EXFOR data:\n"
+                "   1. Download from: https://www-nds.iaea.org/exfor/\n"
+                "   2. Run: python scripts/ingest_exfor.py --exfor-root /path/to/EXFOR-X5json/\n"
+                "   3. Load: NucmlDataset(data_path='data/exfor_processed.parquet')"
+            )
+
+        self.data_path = Path(data_path)
+        if not self.data_path.exists():
+            raise FileNotFoundError(
+                f"❌ ERROR: EXFOR data not found at {self.data_path}\n"
+                f"   Please run EXFOR ingestor first:\n"
+                f"   python scripts/ingest_exfor.py --exfor-root /path/to/EXFOR-X5json/ --output {self.data_path}"
+            )
+
         self.mode = mode
         self.cache_graphs = cache_graphs
         self.filters = filters or {}
         self.lazy_load = lazy_load
-        self.require_real_data = require_real_data
         self._graph_cache: Dict[int, Data] = {}
-        self.is_real_data = False  # Track if using real EXFOR data
 
         # Default energy grid: 1 eV to 20 MeV (logarithmic)
         if energy_bins is None:
@@ -88,23 +107,9 @@ class NucmlDataset(Dataset):
         else:
             self.energy_bins = energy_bins
 
-        # Load data from Parquet or generate synthetic
-        if self.data_path and self.data_path.exists():
-            self.df = self._load_parquet_data(self.data_path, self.filters, lazy_load)
-            self.is_real_data = True
-            print(f"✓ Loaded {len(self.df)} REAL EXFOR data points from {self.data_path}")
-        else:
-            if require_real_data:
-                raise ValueError(
-                    "❌ PRODUCTION MODE: Real EXFOR data required!\n"
-                    "   Please provide data_path to EXFOR Parquet dataset.\n"
-                    "   Run: python scripts/ingest_exfor.py --exfor-root /path/to/EXFOR-X5json/\n"
-                    "   Then: NucmlDataset(data_path='data/exfor_processed.parquet')"
-                )
-            print("⚠️  WARNING: Using SYNTHETIC data (educational mode only)!")
-            print("   For production use, provide data_path to real EXFOR data.")
-            self.df = self._generate_synthetic_data()
-            self.is_real_data = False
+        # Load EXFOR data from Parquet
+        self.df = self._load_parquet_data(self.data_path, self.filters, lazy_load)
+        print(f"✓ Loaded {len(self.df)} EXFOR data points from {self.data_path}")
 
         # Initialize graph builder and tabular projector
         self.graph_builder = GraphBuilder(self.df, self.energy_bins)
@@ -182,127 +187,6 @@ class NucmlDataset(Dataset):
                 filter_list.append((col, 'in', values))
 
         return filter_list if filter_list else None
-
-    def _generate_synthetic_data(self) -> pd.DataFrame:
-        """
-        Generate synthetic nuclear cross-section data for demonstration.
-
-        Creates realistic-looking data with:
-        - Multiple isotopes (U-235, U-238, Pu-239, etc.)
-        - Multiple reaction types (fission, capture, elastic)
-        - Resonance structures
-        - Physical constraints (thresholds, unitarity)
-
-        Returns:
-            DataFrame with columns: [Z, A, N, MT, Energy, CrossSection, Q_Value, Threshold]
-        """
-        np.random.seed(42)
-
-        # Define common isotopes
-        isotopes = [
-            (92, 235, 143, "U-235"),   # Fissile
-            (92, 238, 146, "U-238"),   # Fertile
-            (94, 239, 145, "Pu-239"),  # Fissile
-            (94, 240, 146, "Pu-240"),  # Absorber
-            (1, 1, 0, "H-1"),          # Moderator
-            (8, 16, 8, "O-16"),        # Coolant
-        ]
-
-        # MT codes (ENDF-6 format)
-        reactions = {
-            2: ("Elastic", 0.0, 0.0),        # (n,n)
-            18: ("Fission", 200e6, 0.0),     # (n,f) - releases 200 MeV
-            102: ("Capture", 5e6, 0.0),      # (n,γ)
-            16: ("n2n", -8e6, 8e6),          # (n,2n) - endothermic, threshold at 8 MeV
-        }
-
-        records = []
-
-        for Z, A, N, isotope_name in isotopes:
-            for mt_code, (reaction_name, q_value, threshold) in reactions.items():
-                # Skip unphysical reactions
-                if mt_code == 18 and Z < 90:  # Only actinides fission
-                    continue
-                if mt_code == 16 and A < 10:  # Skip (n,2n) for light isotopes
-                    continue
-
-                # Generate cross sections with realistic features
-                for energy in self.energy_bins:
-                    # Base cross section (decreasing with energy, roughly 1/v law)
-                    base_xs = 10.0 / np.sqrt(energy + 1.0)
-
-                    # Add resonance peaks (especially for capture)
-                    if mt_code == 102 and 1 < energy < 1000:
-                        # Add resonances at ~10, 50, 100 eV
-                        resonance = 100.0 * np.exp(-((np.log10(energy) - 1.0) ** 2) / 0.5)
-                        resonance += 50.0 * np.exp(-((np.log10(energy) - 1.7) ** 2) / 0.3)
-                        base_xs += resonance
-
-                    # Fission cross section (large for fissile isotopes at thermal)
-                    if mt_code == 18:
-                        if "235" in isotope_name or "239" in isotope_name:
-                            base_xs = 500.0 / np.sqrt(energy + 1.0) + 2.0
-                        else:
-                            base_xs = 0.1  # Very small for non-fissile
-
-                    # (n,2n) threshold behavior
-                    if mt_code == 16:
-                        if energy < threshold:
-                            base_xs = 0.0
-                        else:
-                            # Rises sharply above threshold
-                            base_xs = 2.0 * (1.0 - np.exp(-(energy - threshold) / 1e6))
-
-                    # Apply threshold
-                    if energy < threshold:
-                        cross_section = 0.0
-                    else:
-                        cross_section = max(0.0, base_xs)
-
-                    records.append({
-                        'Z': Z,
-                        'A': A,
-                        'N': N,
-                        'Isotope': isotope_name,
-                        'MT': mt_code,
-                        'Reaction': reaction_name,
-                        'Energy': energy,
-                        'CrossSection': cross_section,
-                        'Q_Value': q_value,
-                        'Threshold': threshold,
-                    })
-
-        df = pd.DataFrame(records)
-        print(f"✓ Generated {len(df)} synthetic data points for {len(isotopes)} isotopes")
-        print(f"⚠️  REMINDER: This is SYNTHETIC data for educational purposes only!")
-        return df
-
-    def assert_real_data(self):
-        """
-        Assert that real EXFOR data is loaded (not synthetic).
-
-        Raises:
-            RuntimeError: If using synthetic data
-
-        Use this before production training to ensure real data:
-            >>> dataset = NucmlDataset(data_path='data/exfor.parquet')
-            >>> dataset.assert_real_data()  # Will pass
-            >>>
-            >>> dataset = NucmlDataset()  # Synthetic
-            >>> dataset.assert_real_data()  # Will raise error
-        """
-        if not self.is_real_data:
-            raise RuntimeError(
-                "❌ PRODUCTION ERROR: Cannot proceed with SYNTHETIC data!\n"
-                "   This method requires real EXFOR experimental data.\n"
-                "   Please load data using:\n"
-                "   dataset = NucmlDataset(data_path='data/exfor_processed.parquet')\n"
-                "   \n"
-                "   To obtain EXFOR data:\n"
-                "   1. Download from: https://www-nds.iaea.org/exfor/\n"
-                "   2. Run: python scripts/ingest_exfor.py --exfor-root /path/to/EXFOR/\n"
-            )
-        print(f"✓ Verified: Using REAL EXFOR data ({len(self.df)} points)")
 
     def __len__(self) -> int:
         """Return number of samples (isotope-energy combinations)."""
