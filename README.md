@@ -41,16 +41,31 @@ pip install -r requirements.txt
 
 ### Data Setup
 
-**Step 1: Download EXFOR-X5json database**
-- Visit: https://www-nds.iaea.org/exfor/
-- Download: EXFOR-X5json bulk ZIP (~500 MB compressed)
-- Unzip to: `~/data/EXFOR-X5json/`
+**Step 1: Obtain X4Pro SQLite Database**
 
-**Step 2: Ingest EXFOR to Parquet**
+NUCML-Next uses the X4Pro SQLite format for EXFOR data ingestion.
+
+**Option A: Use Sample Database (Quick Start)**
 ```bash
-python scripts/ingest_exfor.py \
-    --exfor-root ~/data/EXFOR-X5json/ \
-    --output data/exfor_processed.parquet
+# Sample database included in repository
+ls data/x4sqlite1_sample.db  # Contains subset for testing
+```
+
+**Option B: Download Full Database (Production)**
+- Visit: https://www-nds.iaea.org/x4/
+- Download: x4sqlite1.db (~2-4 GB)
+- Place in project directory or specify custom path
+
+> **Note:** The full X4Pro database is NOT committed to GitHub due to size.
+> Only a small sample database (`data/x4sqlite1_sample.db`) is included.
+
+**Step 2: Ingest X4 to Parquet**
+```bash
+# Using sample database
+python scripts/ingest_exfor.py --x4-db data/x4sqlite1_sample.db --output data/exfor_processed.parquet
+
+# Using full database
+python scripts/ingest_exfor.py --x4-db /path/to/x4sqlite1.db --output data/exfor_processed.parquet
 ```
 
 **Step 3: Load in notebooks**
@@ -76,27 +91,41 @@ jupyter notebook notebooks/00_Production_EXFOR_Data_Loading.ipynb
 
 ### EXFOR Database (Required)
 
-NUCML-Next uses real experimental nuclear cross-section data from the IAEA EXFOR database.
+NUCML-Next uses real experimental nuclear cross-section data from the IAEA EXFOR database via the X4Pro SQLite format.
+
+**Why X4Pro SQLite?**
+- Single-file database (no directory recursion)
+- Efficient querying with SQL
+- Standardized schema across EXFOR releases
+- Faster ingestion than JSON formats
 
 **Ingestion Process:**
 
 ```python
-from nucml_next.data import ingest_exfor
+from nucml_next.ingest import ingest_x4
 
-# Ingest EXFOR database to Parquet
-df = ingest_exfor(
-    exfor_root='~/data/EXFOR-X5json/',
+# Ingest X4 database to Parquet
+df = ingest_x4(
+    x4_db_path='data/x4sqlite1.db',
     output_path='data/exfor_processed.parquet',
     ame2020_path='data/ame2020.txt',  # Optional: for enhanced isotope features
-    max_files=None  # Process all files
 )
+```
+
+**Or use the convenience helper:**
+
+```python
+from nucml_next.examples import quick_ingest
+
+# Automatically uses sample database if no path specified
+df = quick_ingest()
 ```
 
 **Output:**
 - Partitioned Parquet dataset by Z/A/MT
-- AME2020-enriched isotope features
+- Optional AME2020-enriched isotope features
 - Preserves experimental uncertainties
-- Flags natural targets
+- Standard schema: [Entry, Z, A, MT, Energy, CrossSection, Uncertainty]
 
 ### AME2020 Integration (Optional)
 
@@ -108,20 +137,23 @@ wget https://www-nds.iaea.org/amdc/ame2020/mass_1.mas20.txt -O data/ame2020.txt
 
 # Use during ingestion
 python scripts/ingest_exfor.py \
-    --exfor-root ~/data/EXFOR-X5json/ \
+    --x4-db data/x4sqlite1.db \
     --output data/exfor_processed.parquet \
     --ame2020 data/ame2020.txt
 ```
+
+If AME2020 is not provided, the ingestor uses SEMF (Semi-Empirical Mass Formula) approximations for common isotopes.
 
 ---
 
 ## Features
 
 ### v1.1.0-alpha (Production-Ready)
-✓ **EXFOR-X5json bulk ingestor** with AME2020 enrichment
+✓ **X4Pro SQLite ingestor** with AME2020 enrichment
 ✓ **Partitioned Parquet** data fabric for large-scale datasets
 ✓ **Real experimental data** from IAEA EXFOR database
 ✓ **No simulation or synthetic data** - production-grade only
+✓ **Minimal examples helper** for notebooks and documentation
 
 ### Core Framework
 ✓ **Dual-view data architecture** (Graph + Tabular)
@@ -139,11 +171,14 @@ python scripts/ingest_exfor.py \
 
 ```
 nucml_next/
-├── data/                      # Data ingestion and handling
-│   ├── exfor_ingestor.py      # EXFOR-X5json bulk ingestor
+├── ingest/                    # Data ingestion
+│   └── x4.py                  # X4Pro SQLite ingestor
+├── data/                      # Data handling
 │   ├── dataset.py             # NucmlDataset with dual-view
 │   ├── graph_builder.py       # Chart of Nuclides graph
 │   └── tabular_projector.py   # Graph → Tabular projection
+├── examples/                  # Convenience helpers for notebooks
+│   └── helpers.py             # Quick-start functions
 ├── baselines/                 # Classical ML baselines
 │   ├── decision_tree_evaluator.py
 │   └── xgboost_evaluator.py
@@ -153,8 +188,6 @@ nucml_next/
 │   └── gnn_transformer_evaluator.py
 ├── physics/                   # Physics-informed constraints
 │   ├── physics_informed_loss.py
-│   ├── unitarity_constraint.py
-│   ├── threshold_constraint.py
 │   └── sensitivity_weighted_loss.py
 ├── validation/                # OpenMC integration
 │   ├── openmc_validator.py
@@ -166,9 +199,9 @@ nucml_next/
 ### Data Flow
 
 ```
-EXFOR-X5json Database
+X4Pro SQLite Database (x4sqlite1.db)
         ↓
-EXFORIngestor (with AME2020)
+X4Ingestor (with AME2020)
         ↓
 Partitioned Parquet (by Z/A/MT)
         ↓
@@ -184,16 +217,22 @@ Predictions → OpenMC Validation → Sensitivity Analysis
 ## Usage Example
 
 ```python
-from nucml_next.data import NucmlDataset
+from nucml_next.examples import quick_ingest, load_dataset, print_dataset_summary
 from nucml_next.baselines import XGBoostEvaluator
 from nucml_next.model import GNNTransformerEvaluator
 
-# Load EXFOR data
-dataset = NucmlDataset(
+# Quick start: Ingest sample database
+df = quick_ingest()  # Uses data/x4sqlite1_sample.db
+
+# Load dataset with filters
+dataset = load_dataset(
     data_path='data/exfor_processed.parquet',
     mode='tabular',
-    filters={'Z': [92], 'A': [235], 'MT': [18, 102]}
+    filters={'Z': [92, 17], 'A': [235, 35], 'MT': [18, 103]}
 )
+
+# Print summary
+print_dataset_summary(dataset)
 
 # Baseline: XGBoost with physics features
 df = dataset.to_tabular(mode='physics')
@@ -201,7 +240,7 @@ xgb = XGBoostEvaluator()
 xgb.train(df)
 
 # Advanced: GNN-Transformer
-dataset_graph = NucmlDataset(
+dataset_graph = load_dataset(
     data_path='data/exfor_processed.parquet',
     mode='graph'
 )
@@ -226,6 +265,50 @@ Progressive learning pathway:
 
 4. **03_OpenMC_Loop_and_Inference.ipynb**
    Reactor validation and sensitivity analysis
+
+---
+
+## Migration Notes (X5json → X4Pro SQLite)
+
+**What Changed:**
+- ❌ **Removed:** EXFOR-X5json ingestion (directory recursion, JSON parsing)
+- ✅ **Added:** X4Pro SQLite ingestion (single database file, SQL queries)
+- ✅ **Added:** `nucml_next.examples` helper module for notebooks
+- ✅ **Simplified:** Single clean ingestion path, no legacy abstractions
+
+**Required Actions:**
+1. **Obtain X4 database:**
+   - Sample: Use `data/x4sqlite1_sample.db` (in repository)
+   - Full: Download from https://www-nds.iaea.org/x4/
+
+2. **Update ingestion command:**
+   ```bash
+   # Old (X5json)
+   python scripts/ingest_exfor.py --exfor-root ~/data/EXFOR-X5json/ --output data/exfor.parquet
+
+   # New (X4)
+   python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --output data/exfor.parquet
+   ```
+
+3. **Update code imports:**
+   ```python
+   # Old
+   from nucml_next.data import ingest_exfor
+
+   # New
+   from nucml_next.ingest import ingest_x4
+   # Or use convenience helper
+   from nucml_next.examples import quick_ingest
+   ```
+
+**Output Compatibility:**
+- ✅ Parquet schema unchanged (Z, A, MT, Energy, CrossSection, Uncertainty)
+- ✅ NucmlDataset API unchanged
+- ✅ Downstream models work without modification
+
+**Known Limitations:**
+- X4 schema variations may require manual inspection for non-standard databases
+- AME2020 enrichment is optional (falls back to SEMF approximation)
 
 ---
 
