@@ -204,7 +204,7 @@ class NucmlDataset(Dataset):
                     )
 
                     read_time = time.time() - start
-                    pbar.set_postfix_str(f"{read_time:.1f}s, {table.nbytes / 1e9:.2f} GB}")
+                    pbar.set_postfix_str(f"{read_time:.1f}s, {table.nbytes / 1e9:.2f} GB")
                     pbar.update(1)
 
                     # Convert to pandas (this is often the slowest part)
