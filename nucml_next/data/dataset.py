@@ -213,12 +213,6 @@ class NucmlDataset(TorchDataset):
                 # Use PyArrow dataset API for partitioned data
                 dataset = ds.dataset(str(data_path), format='parquet')
 
-                # For partitioned datasets, partition columns (Z, A, MT) are in directory names
-                # and will be automatically added by PyArrow. We only need to request the
-                # data columns that exist in the actual parquet files.
-                partition_columns = {'Z', 'A', 'MT'}  # Common partition columns
-                data_columns = [col for col in essential_columns if col not in partition_columns]
-
                 # Get fragments for progress tracking
                 filter_expr = self._build_dataset_filter(filters)
                 fragments = list(dataset.get_fragments(filter=filter_expr))
@@ -232,11 +226,18 @@ class NucmlDataset(TorchDataset):
                 report_interval = max(1, total_fragments // 10)  # Report every 10%
 
                 for i, fragment in enumerate(fragments):
-                    # Read fragment with column pruning
+                    # Read fragment - PyArrow will automatically reconstruct partition columns
+                    # from directory names (Z=92/A=235/MT=18/ -> adds Z, A, MT columns)
                     fragment_table = fragment.to_table(
-                        columns=data_columns if data_columns else None,
+                        columns=None,  # Read all columns (includes partition columns from path)
                         use_threads=True
                     )
+
+                    # Apply column pruning after reading (if needed)
+                    if essential_columns:
+                        available_columns = [col for col in essential_columns if col in fragment_table.column_names]
+                        fragment_table = fragment_table.select(available_columns)
+
                     tables.append(fragment_table)
 
                     # Show progress every 10%
