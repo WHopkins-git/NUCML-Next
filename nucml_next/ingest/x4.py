@@ -371,7 +371,7 @@ class X4Ingestor:
 
         Returns:
             Normalized DataFrame with columns:
-                [Entry, Z, A, MT, Energy, CrossSection, Uncertainty]
+                [Entry, Z, A, MT, Energy, CrossSection, Uncertainty, N]
         """
         # Map column names to standard names
         column_map = {
@@ -443,6 +443,10 @@ class X4Ingestor:
         df_norm['Energy'] = df_norm['Energy'].astype(float)
         df_norm['CrossSection'] = df_norm['CrossSection'].astype(float)
 
+        # Calculate neutron number (N = A - Z)
+        # This is a fundamental nuclear property and should always be present
+        df_norm['N'] = df_norm['A'] - df_norm['Z']
+
         return df_norm
 
     def _enrich_ame2020(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -450,23 +454,23 @@ class X4Ingestor:
         Enrich dataset with AME2020 isotopic properties.
 
         Args:
-            df: Normalized DataFrame
+            df: Normalized DataFrame (already has N column)
 
         Returns:
-            Enriched DataFrame with Mass_Excess_keV, Binding_Energy_keV, N
+            Enriched DataFrame with Mass_Excess_keV, Binding_Energy_keV
         """
         if self.ame2020 is None:
             return df
 
+        # Select only AME2020 columns we need (avoid N duplication since df already has N)
+        ame_cols = ['Z', 'A', 'Mass_Excess_keV', 'Binding_Energy_keV']
+        ame_subset = self.ame2020[ame_cols].copy()
+
         df_enriched = df.merge(
-            self.ame2020,
+            ame_subset,
             on=['Z', 'A'],
             how='left'
         )
-
-        # Fill N for non-enriched rows
-        if 'N' not in df_enriched.columns or df_enriched['N'].isna().any():
-            df_enriched['N'] = df_enriched['A'] - df_enriched['Z']
 
         return df_enriched
 
