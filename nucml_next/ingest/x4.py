@@ -101,7 +101,8 @@ class AME2020Loader:
         """
         Parse AME2020 fixed-width format file.
 
-        Format: N Z A El Mass_Excess(keV) ... Binding_Energy(keV)
+        Format (space-separated):
+        N-Z  N  Z  A  El  Mass_Excess(keV)  unc  Binding_Energy(keV)  unc  flag
 
         Args:
             filepath: Path to mass_1.mas20.txt
@@ -118,13 +119,14 @@ class AME2020Loader:
                     continue
 
                 parts = line.split()
-                if len(parts) >= 7:
+                if len(parts) >= 9:
                     try:
-                        N = int(parts[0])
-                        Z = int(parts[1])
-                        A = int(parts[2])
-                        mass_excess = float(parts[4])  # keV
-                        binding_energy = float(parts[6])  # keV
+                        # Format: N-Z  N  Z  A  El  Mass_Excess  unc  Binding_Energy  unc  flag
+                        N = int(parts[1])
+                        Z = int(parts[2])
+                        A = int(parts[3])
+                        mass_excess = float(parts[5])  # keV
+                        binding_energy = float(parts[7])  # keV
 
                         records.append({
                             'Z': Z,
