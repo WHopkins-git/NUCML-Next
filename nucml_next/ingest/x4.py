@@ -214,6 +214,7 @@ class X4Ingestor:
         output_path: str = 'data/exfor_processed.parquet',
         ame2020_path: Optional[str] = None,
         partitioning: List[str] = ['Z', 'A', 'MT'],
+        max_partitions: int = 10000,
     ):
         """
         Initialize X4 ingestor.
@@ -223,10 +224,14 @@ class X4Ingestor:
             output_path: Output path for Parquet dataset
             ame2020_path: Optional path to AME2020 file for enrichment
             partitioning: Partition columns for Parquet output
+            max_partitions: Maximum number of partitions allowed (default: 10000)
+                           The full EXFOR database can have >1000 unique Z/A/MT combinations.
+                           PyArrow's default limit is 1024, which is insufficient for full EXFOR.
         """
         self.x4_db_path = Path(x4_db_path)
         self.output_path = Path(output_path)
         self.partitioning = partitioning
+        self.max_partitions = max_partitions
 
         if not self.x4_db_path.exists():
             raise FileNotFoundError(f"X4 database not found: {self.x4_db_path}")
@@ -659,9 +664,23 @@ class X4Ingestor:
         """
         Write DataFrame to partitioned Parquet dataset.
 
+        For large datasets like the full EXFOR database, the number of unique
+        Z/A/MT combinations can exceed PyArrow's default partition limit (1024).
+        This method calculates the expected partition count and uses the
+        configured max_partitions limit to handle large datasets.
+
         Args:
             df: DataFrame to write
         """
+        # Calculate expected number of partitions
+        if self.partitioning:
+            n_partitions = df[self.partitioning].drop_duplicates().shape[0]
+            logger.info(f"Creating {n_partitions:,} partitions by {self.partitioning}")
+
+            if n_partitions > 1024:
+                logger.info(f"Partition count exceeds PyArrow default limit (1024)")
+                logger.info(f"Using max_partitions={self.max_partitions:,}")
+
         table = pa.Table.from_pandas(df)
 
         pq.write_to_dataset(
@@ -669,6 +688,7 @@ class X4Ingestor:
             root_path=str(self.output_path),
             partition_cols=self.partitioning,
             existing_data_behavior='overwrite_or_ignore',
+            max_partitions=self.max_partitions,
         )
 
     def _print_summary(self, df: pd.DataFrame):
@@ -693,6 +713,7 @@ def ingest_x4(
     x4_db_path: str,
     output_path: str = 'data/exfor_processed.parquet',
     ame2020_path: Optional[str] = None,
+    max_partitions: int = 10000,
 ) -> pd.DataFrame:
     """
     Convenience function for X4 ingestion.
@@ -701,9 +722,15 @@ def ingest_x4(
         x4_db_path: Path to X4Pro SQLite database
         output_path: Output Parquet path
         ame2020_path: Optional AME2020 file for enrichment
+        max_partitions: Maximum number of partitions (default: 10000 for full EXFOR)
 
     Returns:
         Processed DataFrame
     """
-    ingestor = X4Ingestor(x4_db_path, output_path, ame2020_path)
+    ingestor = X4Ingestor(
+        x4_db_path=x4_db_path,
+        output_path=output_path,
+        ame2020_path=ame2020_path,
+        max_partitions=max_partitions,
+    )
     return ingestor.ingest()
