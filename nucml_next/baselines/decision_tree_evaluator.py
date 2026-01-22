@@ -218,17 +218,36 @@ class DecisionTreeEvaluator:
         """
         energies = np.linspace(energy_range[0], energy_range[1], num_points)
 
-        # Build feature matrix
+        # Build feature matrix matching training features
         if mode == 'naive':
-            # One-hot encoding
+            # Create DataFrame with all feature columns from training
             features = []
             for energy in energies:
                 feat_dict = {'Z': Z, 'A': A, 'Energy': energy}
-                # Add MT one-hot (assuming MT codes are known)
-                for mt in [2, 16, 18, 102]:  # Common reactions
-                    feat_dict[f'MT_{mt}'] = 1.0 if mt == mt_code else 0.0
+
+                # Add all MT one-hot columns that exist in trained model
+                for col in self.feature_columns:
+                    if col.startswith('MT_'):
+                        # Extract MT code from column name (e.g., 'MT_18' -> 18)
+                        try:
+                            mt_value = int(col.split('_')[1])
+                            feat_dict[col] = 1.0 if mt_value == mt_code else 0.0
+                        except (IndexError, ValueError):
+                            feat_dict[col] = 0.0
+                    elif col not in feat_dict:
+                        # Handle any other feature columns
+                        feat_dict[col] = 0.0
+
                 features.append(feat_dict)
             df = pd.DataFrame(features)
+
+            # Ensure all feature columns exist (fill missing with 0)
+            for col in self.feature_columns:
+                if col not in df.columns:
+                    df[col] = 0.0
+
+            # Reorder columns to match training order
+            df = df[self.feature_columns]
 
         else:  # physics mode
             features = []
@@ -246,6 +265,14 @@ class DecisionTreeEvaluator:
                 }
                 features.append(feat_dict)
             df = pd.DataFrame(features)
+
+            # Ensure all feature columns exist
+            for col in self.feature_columns:
+                if col not in df.columns:
+                    df[col] = 0.0
+
+            # Reorder columns to match training order
+            df = df[self.feature_columns]
 
         # Predict
         predictions = self.predict(df)
