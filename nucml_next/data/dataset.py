@@ -172,12 +172,16 @@ class NucmlDataset(Dataset):
                 print(f"⚠️  Lazy loading enabled. Data will be loaded on-demand.")
                 # For lazy loading, read a small subset to get schema
                 dataset = ds.dataset(str(data_path), format='parquet')
+
+                # Filter out partition columns for partitioned datasets
+                partition_columns = {'Z', 'A', 'MT'}
+                data_columns = [col for col in essential_columns if col not in partition_columns]
+
                 table = dataset.to_table(
-                    columns=essential_columns,
+                    columns=data_columns if data_columns else None,
                     filter=self._build_dataset_filter(filters)
                 )
                 df = table.to_pandas().head(1000)
-            else:
                 # Load full dataset with optimizations
                 # Read with progress bar
                 with tqdm(total=2, desc="Loading EXFOR database", unit="stage", ncols=80) as pbar:
@@ -186,14 +190,21 @@ class NucmlDataset(Dataset):
 
                     # Use PyArrow dataset API for partitioned data
                     dataset = ds.dataset(str(data_path), format='parquet')
+
+                    # For partitioned datasets, partition columns (Z, A, MT) are in directory names
+                    # and will be automatically added by PyArrow. We only need to request the
+                    # data columns that exist in the actual parquet files.
+                    partition_columns = {'Z', 'A', 'MT'}  # Common partition columns
+                    data_columns = [col for col in essential_columns if col not in partition_columns]
+
                     table = dataset.to_table(
-                        columns=essential_columns,
+                        columns=data_columns if data_columns else None,  # Only request non-partition columns
                         filter=self._build_dataset_filter(filters),
                         use_threads=True  # Parallel read (multi-core)
                     )
 
                     read_time = time.time() - start
-                    pbar.set_postfix_str(f"{read_time:.1f}s, {table.nbytes / 1e9:.2f} GB")
+                    pbar.set_postfix_str(f"{read_time:.1f}s, {table.nbytes / 1e9:.2f} GB}")
                     pbar.update(1)
 
                     # Convert to pandas (this is often the slowest part)
