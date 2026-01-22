@@ -45,7 +45,9 @@ class TabularProjector:
 
         # Get unique MT codes for one-hot encoding
         self.mt_codes = sorted(self.df['MT'].unique())
-        self.encoder = OneHotEncoder(sparse_output=False, categories=[self.mt_codes])
+        # CRITICAL: Use sparse_output=True to avoid massive memory allocation
+        # For 16.9M rows × 117 MT codes, dense would require 14.7 GB!
+        self.encoder = OneHotEncoder(sparse_output=True, categories=[self.mt_codes], dtype=np.float32)
         self.encoder.fit(self.df[['MT']])
 
     def project(
@@ -92,16 +94,31 @@ class TabularProjector:
 
         This is the "legacy" approach that ignores physics.
 
+        MEMORY OPTIMIZATION: Uses pandas sparse arrays to avoid massive memory allocation.
+        For 16.9M rows × 117 MT codes:
+        - Dense: 14.7 GB (16.9M × 117 × 8 bytes)
+        - Sparse: ~135 MB (only stores non-zero values)
+
         Returns:
             DataFrame with features: [Z, A, Energy, MT_2, MT_16, MT_18, MT_102, ...]
                                target: CrossSection
         """
-        # One-hot encode MT codes
-        mt_onehot = self.encoder.transform(df[['MT']])
+        # One-hot encode MT codes (returns scipy sparse matrix)
+        mt_onehot_sparse = self.encoder.transform(df[['MT']])
+
+        # Convert sparse matrix to pandas DataFrame with sparse arrays (memory efficient!)
         mt_columns = [f'MT_{code}' for code in self.mt_codes]
-        mt_df = pd.DataFrame(mt_onehot, columns=mt_columns, index=df.index)
+
+        # Create sparse DataFrame from scipy sparse matrix
+        # This keeps memory usage low while maintaining compatibility
+        mt_df = pd.DataFrame.sparse.from_spmatrix(
+            mt_onehot_sparse,
+            columns=mt_columns,
+            index=df.index
+        )
 
         # Combine features
+        # Reset index to ensure alignment (dense + sparse DataFrames)
         features = pd.concat([
             df[['Z', 'A', 'Energy']].reset_index(drop=True),
             mt_df.reset_index(drop=True),

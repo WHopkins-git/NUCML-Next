@@ -95,14 +95,25 @@ class XGBoostEvaluator:
         if exclude_columns is None:
             exclude_columns = [target_column, 'Isotope', 'Reaction']
 
-        # Filter out non-numeric columns
-        numeric_columns = df.select_dtypes(include=[np.number]).columns
+        # Filter out non-numeric columns (includes pandas sparse arrays)
+        numeric_columns = df.select_dtypes(include=[np.number, pd.SparseDtype]).columns
         self.feature_columns = [
             col for col in numeric_columns
             if col not in exclude_columns
         ]
 
-        X = df[self.feature_columns].values
+        # Handle sparse DataFrames efficiently (avoid memory explosion)
+        X_df = df[self.feature_columns]
+        is_sparse = any(isinstance(dtype, pd.SparseDtype) for dtype in X_df.dtypes)
+
+        if is_sparse:
+            # XGBoost natively supports scipy sparse matrices
+            import scipy.sparse as sp
+            X = sp.csr_matrix(X_df.sparse.to_coo())
+            print(f"  → Using sparse matrix format (memory efficient)")
+        else:
+            X = X_df.values
+
         y = df[target_column].values
 
         # Log-transform target for better numerical stability
@@ -179,7 +190,17 @@ class XGBoostEvaluator:
         if not self.is_trained:
             raise RuntimeError("Model must be trained before prediction")
 
-        X = df[self.feature_columns].values
+        # Handle sparse DataFrames efficiently
+        X_df = df[self.feature_columns]
+        is_sparse = any(isinstance(dtype, pd.SparseDtype) for dtype in X_df.dtypes)
+
+        if is_sparse:
+            # Convert to scipy sparse matrix
+            import scipy.sparse as sp
+            X = sp.csr_matrix(X_df.sparse.to_coo())
+        else:
+            X = X_df.values
+
         y_pred_log = self.model.predict(X)
         y_pred = 10 ** y_pred_log
 

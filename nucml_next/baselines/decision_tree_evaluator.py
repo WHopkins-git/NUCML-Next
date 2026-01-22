@@ -91,7 +91,23 @@ class DecisionTreeEvaluator:
             if col not in exclude_columns
         ]
 
-        X = df[self.feature_columns].values
+        # Handle sparse DataFrames efficiently (avoid memory explosion)
+        # Pandas sparse arrays are common with one-hot encoded MT codes
+        X_df = df[self.feature_columns]
+
+        # Check if DataFrame contains sparse arrays
+        is_sparse = any(isinstance(dtype, pd.SparseDtype) for dtype in X_df.dtypes)
+
+        if is_sparse:
+            # Convert pandas sparse DataFrame to scipy sparse matrix (memory efficient)
+            # DecisionTree can handle sparse matrices directly
+            import scipy.sparse as sp
+            X = sp.csr_matrix(X_df.sparse.to_coo())
+            print(f"  → Using sparse matrix format (memory efficient)")
+        else:
+            # Dense data - use numpy array
+            X = X_df.values
+
         y = df[target_column].values
 
         # Log-transform target for better numerical stability
@@ -158,7 +174,17 @@ class DecisionTreeEvaluator:
         if not self.is_trained:
             raise RuntimeError("Model must be trained before prediction")
 
-        X = df[self.feature_columns].values
+        # Handle sparse DataFrames efficiently
+        X_df = df[self.feature_columns]
+        is_sparse = any(isinstance(dtype, pd.SparseDtype) for dtype in X_df.dtypes)
+
+        if is_sparse:
+            # Convert to scipy sparse matrix
+            import scipy.sparse as sp
+            X = sp.csr_matrix(X_df.sparse.to_coo())
+        else:
+            X = X_df.values
+
         y_pred_log = self.model.predict(X)
         y_pred = 10 ** y_pred_log
 
