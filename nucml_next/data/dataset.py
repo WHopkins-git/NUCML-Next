@@ -163,30 +163,32 @@ class NucmlDataset(Dataset):
 
         # Check if partitioned dataset (directory) or single file
         if data_path.is_dir():
-            # Partitioned dataset
-            dataset = pq.ParquetDataset(
-                str(data_path),
-                filters=self._build_filters(filters),
-                use_legacy_dataset=False  # Use new PyArrow dataset API (faster)
-            )
+            # Partitioned dataset - use PyArrow dataset API
+            import pyarrow.dataset as ds
+            import time
 
             if lazy_load:
                 # Load only schema initially
                 print(f"⚠️  Lazy loading enabled. Data will be loaded on-demand.")
                 # For lazy loading, read a small subset to get schema
-                df = dataset.read(columns=essential_columns).to_pandas().head(1000)
+                dataset = ds.dataset(str(data_path), format='parquet')
+                table = dataset.to_table(
+                    columns=essential_columns,
+                    filter=self._build_dataset_filter(filters)
+                )
+                df = table.to_pandas().head(1000)
             else:
                 # Load full dataset with optimizations
-                import time
-
                 # Read with progress bar
                 with tqdm(total=2, desc="Loading EXFOR database", unit="stage", ncols=80) as pbar:
-                    pbar.set_description("Reading Parquet file")
+                    pbar.set_description("Reading Parquet dataset")
                     start = time.time()
 
-                    # Read with memory mapping and column pruning
-                    table = dataset.read(
+                    # Use PyArrow dataset API for partitioned data
+                    dataset = ds.dataset(str(data_path), format='parquet')
+                    table = dataset.to_table(
                         columns=essential_columns,
+                        filter=self._build_dataset_filter(filters),
                         use_threads=True  # Parallel read (multi-core)
                     )
 
@@ -240,7 +242,7 @@ class NucmlDataset(Dataset):
     @staticmethod
     def _build_filters(filters: Dict[str, List]) -> Optional[List]:
         """
-        Build PyArrow filters from dictionary.
+        Build PyArrow filters from dictionary (legacy format for read_table).
 
         Args:
             filters: Dictionary of column -> values, e.g. {'Z': [92, 94]}
@@ -260,6 +262,40 @@ class NucmlDataset(Dataset):
                 filter_list.append((col, 'in', values))
 
         return filter_list if filter_list else None
+
+    @staticmethod
+    def _build_dataset_filter(filters: Dict[str, List]):
+        """
+        Build PyArrow dataset filter expression (new dataset API).
+
+        Args:
+            filters: Dictionary of column -> values, e.g. {'Z': [92, 94]}
+
+        Returns:
+            PyArrow compute expression or None
+
+        Example:
+            {'Z': [92], 'MT': [18]} → (field('Z').isin([92])) & (field('MT').isin([18]))
+        """
+        if not filters:
+            return None
+
+        import pyarrow.compute as pc
+        import pyarrow as pa
+
+        filter_expr = None
+        for col, values in filters.items():
+            if isinstance(values, list) and len(values) > 0:
+                # Create isin expression for this column
+                col_filter = pc.field(col).isin(values)
+
+                # Combine with existing filters using AND
+                if filter_expr is None:
+                    filter_expr = col_filter
+                else:
+                    filter_expr = filter_expr & col_filter
+
+        return filter_expr
 
     def get_global_graph(self) -> Data:
         """
