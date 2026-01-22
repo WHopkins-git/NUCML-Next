@@ -15,16 +15,26 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from pathlib import Path
-from torch.utils.data import Dataset
-import torch
-from torch_geometric.data import Data
 from tqdm import tqdm
 
-from nucml_next.data.graph_builder import GraphBuilder
+# Optional PyTorch imports (only required for graph mode)
+try:
+    from torch.utils.data import Dataset as TorchDataset
+    import torch
+    from torch_geometric.data import Data
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+    TorchDataset = object  # Fallback base class for tabular-only mode
+    torch = None
+    Data = None
+
+# Lazy import GraphBuilder (requires torch) - only imported when needed
+# from nucml_next.data.graph_builder import GraphBuilder  # Moved to lazy import in __init__
 from nucml_next.data.tabular_projector import TabularProjector
 
 
-class NucmlDataset(Dataset):
+class NucmlDataset(TorchDataset):
     """
     Main dataset class for NUCML-Next with dual-view interface.
 
@@ -96,6 +106,14 @@ class NucmlDataset(Dataset):
                 f"   python scripts/ingest_exfor.py --exfor-root /path/to/EXFOR-X5json/ --output {self.data_path}"
             )
 
+        # Check PyTorch availability for graph mode
+        if mode == 'graph' and not TORCH_AVAILABLE:
+            raise ImportError(
+                "❌ ERROR: PyTorch is required for graph mode!\n"
+                "   Install with: pip install torch torch-geometric\n"
+                "   Or use mode='tabular' for classical ML without PyTorch"
+            )
+
         self.mode = mode
         self.cache_graphs = cache_graphs
         self.filters = filters or {}
@@ -113,8 +131,14 @@ class NucmlDataset(Dataset):
         self.df = self._load_parquet_data(self.data_path, self.filters, lazy_load)
         print(f"✓ Loaded {len(self.df):,} EXFOR data points from {self.data_path}")
 
-        # Initialize graph builder and tabular projector
-        self.graph_builder = GraphBuilder(self.df, self.energy_bins)
+        # Initialize graph builder (only for graph mode) and tabular projector
+        if self.mode == 'graph':
+            # Lazy import GraphBuilder (requires torch)
+            from nucml_next.data.graph_builder import GraphBuilder
+            self.graph_builder = GraphBuilder(self.df, self.energy_bins)
+        else:
+            self.graph_builder = None
+
         self.tabular_projector = TabularProjector(self.df, self.energy_bins)
 
         # Lazy graph building - only build when accessed (saves initialization time)
@@ -182,6 +206,7 @@ class NucmlDataset(Dataset):
                     filter=self._build_dataset_filter(filters)
                 )
                 df = table.to_pandas().head(1000)
+            else:
                 # Load full dataset with optimizations
                 # Read with progress bar
                 with tqdm(total=2, desc="Loading EXFOR database", unit="stage", ncols=80) as pbar:
@@ -318,6 +343,9 @@ class NucmlDataset(Dataset):
         Returns:
             PyG Data object with complete nuclear topology
         """
+        if self.mode != 'graph':
+            raise ValueError("get_global_graph() is only available in graph mode")
+
         if self.graph_data is None:
             print("Building global graph structure (first access)...")
             self.graph_data = self.graph_builder.build_global_graph()
@@ -402,6 +430,9 @@ class NucmlDataset(Dataset):
         Returns:
             PyG Data object for this isotope and its neighbors
         """
+        if self.mode != 'graph':
+            raise ValueError("get_isotope_graph() is only available in graph mode")
+
         return self.graph_builder.build_isotope_subgraph(Z, A)
 
     def save_to_parquet(self, output_path: str) -> None:

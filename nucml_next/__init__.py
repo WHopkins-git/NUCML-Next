@@ -25,7 +25,16 @@ License: MIT
 
 __version__ = "1.0.0"
 
-from nucml_next import data, baselines, model, physics, validation, utils
+# Lazy import to avoid forcing all dependencies (torch, xgboost, etc.)
+# Submodules will be imported on first access
+def __getattr__(name):
+    """Lazy import for submodules to avoid loading unnecessary dependencies."""
+    if name in ["data", "baselines", "model", "physics", "validation", "utils"]:
+        import importlib
+        module = importlib.import_module(f"nucml_next.{name}")
+        globals()[name] = module
+        return module
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     "data",
