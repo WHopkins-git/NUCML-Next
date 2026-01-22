@@ -629,6 +629,48 @@ class X4Ingestor:
         df_norm['Energy'] = df_norm['Energy'].astype(float)
         df_norm['CrossSection'] = df_norm['CrossSection'].astype(float)
 
+        # Data quality filtering
+        initial_count = len(df_norm)
+
+        # Filter 1: Remove non-positive energies (Energy must be > 0)
+        df_norm = df_norm[df_norm['Energy'] > 0]
+        energy_filtered = initial_count - len(df_norm)
+        if energy_filtered > 0:
+            logger.info(f"Filtered {energy_filtered:,} points with Energy ≤ 0")
+
+        # Filter 2: Remove non-positive cross sections (CrossSection must be > 0)
+        df_norm = df_norm[df_norm['CrossSection'] > 0]
+        xs_filtered = initial_count - energy_filtered - len(df_norm)
+        if xs_filtered > 0:
+            logger.info(f"Filtered {xs_filtered:,} points with CrossSection ≤ 0")
+
+        # Filter 3: Remove infinite values
+        df_norm = df_norm[np.isfinite(df_norm['Energy'])]
+        df_norm = df_norm[np.isfinite(df_norm['CrossSection'])]
+        inf_filtered = initial_count - energy_filtered - xs_filtered - len(df_norm)
+        if inf_filtered > 0:
+            logger.info(f"Filtered {inf_filtered:,} points with infinite values")
+
+        # Filter 4: Remove unrealistic values
+        # Energy: 1e-5 eV (thermal) to 1e9 eV (1 GeV)
+        # CrossSection: 1e-10 barns to 1e6 barns
+        df_norm = df_norm[
+            (df_norm['Energy'] >= 1e-5) &
+            (df_norm['Energy'] <= 1e9) &
+            (df_norm['CrossSection'] >= 1e-10) &
+            (df_norm['CrossSection'] <= 1e6)
+        ]
+        range_filtered = initial_count - energy_filtered - xs_filtered - inf_filtered - len(df_norm)
+        if range_filtered > 0:
+            logger.info(f"Filtered {range_filtered:,} points outside physical ranges")
+
+        total_filtered = initial_count - len(df_norm)
+        if total_filtered > 0:
+            logger.info(f"Total filtered: {total_filtered:,} / {initial_count:,} points ({100*total_filtered/initial_count:.1f}%)")
+
+        if len(df_norm) == 0:
+            raise ValueError("No valid data points after quality filtering!")
+
         # Calculate neutron number (N = A - Z)
         # This is a fundamental nuclear property and should always be present
         df_norm['N'] = df_norm['A'] - df_norm['Z']
