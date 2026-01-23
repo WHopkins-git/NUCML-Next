@@ -45,6 +45,9 @@ class DecisionTreeEvaluator:
         self,
         max_depth: int = 8,
         min_samples_leaf: int = 10,
+        min_samples_split: int = 2,
+        min_impurity_decrease: float = 0.0,
+        max_features: Optional[str] = None,
         random_state: int = 42,
     ):
         """
@@ -53,15 +56,24 @@ class DecisionTreeEvaluator:
         Args:
             max_depth: Maximum tree depth (lower = more stairs)
             min_samples_leaf: Minimum samples per leaf (higher = coarser steps)
+            min_samples_split: Minimum samples required to split a node
+            min_impurity_decrease: Minimum impurity decrease for a split
+            max_features: Number of features to consider ('sqrt', 'log2', or None for all)
             random_state: Random seed for reproducibility
         """
         self.max_depth = max_depth
         self.min_samples_leaf = min_samples_leaf
+        self.min_samples_split = min_samples_split
+        self.min_impurity_decrease = min_impurity_decrease
+        self.max_features = max_features
         self.random_state = random_state
 
         self.model = DecisionTreeRegressor(
             max_depth=max_depth,
             min_samples_leaf=min_samples_leaf,
+            min_samples_split=min_samples_split,
+            min_impurity_decrease=min_impurity_decrease,
+            max_features=max_features,
             random_state=random_state,
         )
 
