@@ -154,10 +154,14 @@ class NucmlDataset(TorchDataset):
             self.filters = None
             print(f"Using DataSelection:\n{self.selection}")
         else:
-            # Legacy filters (deprecated path)
+            # Legacy filters (still supported for evaluation/simple selections)
             self.selection = None
             self.filters = filters
-            print("⚠️  Warning: Legacy 'filters' parameter is deprecated. Use 'selection' for physics-aware filtering.")
+            # Only show informational note if this looks like a training use case
+            # (no specific isotope filtering suggests broad usage)
+            if 'Z' not in filters and 'A' not in filters:
+                print("💡 Note: Consider using DataSelection for physics-aware filtering with predicate pushdown.")
+                print("   Legacy 'filters' still work but don't provide performance optimizations.")
 
         # Default energy grid: 1 eV to 20 MeV (logarithmic)
         if energy_bins is None:
