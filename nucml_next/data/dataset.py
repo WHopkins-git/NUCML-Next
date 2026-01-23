@@ -399,7 +399,13 @@ class NucmlDataset(TorchDataset):
             print(f"\nApplying post-load filters...")
 
             # 1. Projectile filtering (neutrons only - based on MT codes)
-            if selection.projectile == 'neutron':
+            # NOTE: Skip if already filtered at fragment level (mt_mode='all_physical' + projectile='neutron')
+            # In that case, predicate pushdown already filtered to neutron MT codes
+            needs_projectile_filter = (
+                selection.projectile == 'neutron' and
+                not (selection.mt_mode == 'all_physical')  # Already filtered at fragment level
+            )
+            if needs_projectile_filter:
                 projectile_mt = selection.get_projectile_mt_filter()
                 if projectile_mt is not None:
                     before = len(df)
@@ -494,17 +500,19 @@ class NucmlDataset(TorchDataset):
             filter_expr = energy_max_filter if filter_expr is None else filter_expr & energy_max_filter
 
         # MT code filter (reaction type selection)
+        # CRITICAL: When projectile='neutron' and mt_mode='all_physical',
+        # get_mt_codes() returns neutron MT codes for predicate pushdown
         mt_codes = selection.get_mt_codes()
         if mt_codes is not None and len(mt_codes) > 0:
             mt_filter = pc.field('MT').isin(mt_codes)
             filter_expr = mt_filter if filter_expr is None else filter_expr & mt_filter
 
-        # Projectile filter (inferred from MT codes)
-        # Note: This is applied AFTER reading since we need to cross-reference MT codes
-        # Cannot be pushed down to PyArrow level efficiently
+        # Projectile filter: Handled by MT code filtering when possible
+        # For mt_mode='all_physical' + projectile='neutron': filtered at fragment level
+        # For other modes: filtered post-load (see post-load filtering section)
 
         # Holdout isotopes filter (exclude specific Z/A pairs)
-        # This is more complex and done post-load for clarity
+        # Done post-load for clarity and flexibility
 
         return filter_expr
 
