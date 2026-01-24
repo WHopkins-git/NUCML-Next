@@ -348,10 +348,10 @@ class X4Ingestor:
             df = self._normalize(df)
             logger.info(f"Normalized to standard schema")
 
-            # Enrich with AME2020 if available
-            if self.ame2020 is not None:
+            # Enrich with AME2020/NUBASE2020 if available
+            if self.ame_enricher is not None:
                 df = self._enrich_ame2020(df)
-                logger.info(f"Enriched with AME2020 isotopic data")
+                logger.info(f"Enriched with AME2020/NUBASE2020 data")
 
             # Write to Parquet
             self._write_parquet(df)
