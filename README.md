@@ -225,11 +225,45 @@ wget https://www-nds.iaea.org/amdc/ame2020/covariance.mas20.txt
 
 **Tier-Based Feature System:**
 
-- **Tier A** (Core): Z, A, Energy + particle-emission vector [n, p, d, t, He3, α] - 14 features
-- **Tier B** (Geometric): + Nuclear radius, kR parameter - 16 features
-- **Tier C** (Energetics): + Mass excess, binding energy, separation energies - 23 features
-- **Tier D** (Topological): + Spin, parity, valence, magic numbers - 32 features
-- **Tier E** (Complete): + All reaction Q-values - 40 features
+- **Tier A** (Core): Z, A, N, Energy + **9-feature Numerical Particle Vector** → **13 features**
+- **Tier B** (Geometric): + Nuclear radius (R_fm), kR parameter → **15 features**
+- **Tier C** (Energetics): + Mass excess, binding energy, separation energies → **22 features**
+- **Tier D** (Topological): + Spin, parity, valence, pairing, magic numbers → **30 features**
+- **Tier E** (Complete): + All reaction Q-values (8 Q-values) → **38 features**
+
+**Numerical Particle Vector (Tier A):**
+
+Instead of categorical MT codes, NUCML-Next uses a **9-feature physics-based coordinate system**:
+
+```
+[out_n, out_p, out_a, out_g, out_f, out_t, out_h, out_d, is_met]
+```
+
+- `out_n`: Neutrons emitted (integer multiplicity)
+- `out_p`: Protons emitted (integer)
+- `out_a`: Alpha particles emitted (integer)
+- `out_g`: Gamma emission indicator (0/1)
+- `out_f`: Fission indicator (0/1)
+- `out_t`: Tritons (³H) emitted (integer)
+- `out_h`: Helions (³He) emitted (integer)
+- `out_d`: Deuterons emitted (integer)
+- `is_met`: Isomeric state indicator (0/1)
+
+**Benefits for ML:**
+- ✅ **Decision Trees**: Split on physical observables (`if out_n > 2`)
+- ✅ **Neural Networks**: Learn mass/charge conservation patterns
+- ✅ **Interpretability**: Feature importance maps to nuclear physics
+- ✅ **MT Preserved**: Original MT column kept for user queries (`df[df['MT']==102]`)
+
+**Example Mappings:**
+```python
+MT=2   (Elastic):   [1,0,0,0,0,0,0,0,0]  # 1 neutron out
+MT=18  (Fission):   [0,0,0,0,1,0,0,0,0]  # Fission indicator
+MT=102 (Capture):   [0,0,0,1,0,0,0,0,0]  # Gamma emission
+MT=103 (n,p):       [0,1,0,0,0,0,0,0,0]  # 1 proton out
+MT=16  (n,2n):      [2,0,0,0,0,0,0,0,0]  # 2 neutrons out
+MT=600+ (n,p iso):  [0,1,0,0,0,0,0,0,1]  # Proton + isomer
+```
 
 **Usage in Feature Generation:**
 
