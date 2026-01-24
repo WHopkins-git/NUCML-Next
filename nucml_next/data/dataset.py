@@ -227,9 +227,10 @@ class NucmlDataset(TorchDataset):
         """
         # Essential columns needed for NUCML-Next (column pruning optimization)
         # This can reduce read time by 50%+ for wide tables
+        # NOTE: Z, A, MT come from partition metadata (Hive partitioning), not data columns
+        # NOTE: AME columns (Mass_Excess_keV, etc.) are added later via on-demand enrichment
         essential_columns = [
-            'Entry', 'Z', 'A', 'N', 'MT', 'Energy', 'CrossSection',
-            'Uncertainty', 'Mass_Excess_keV', 'Binding_Energy_keV'
+            'Entry', 'N', 'Energy', 'CrossSection', 'Uncertainty'
         ]
 
         # Check if partitioned dataset (directory) or single file
@@ -517,28 +518,14 @@ class NucmlDataset(TorchDataset):
             print(f"  Found AME files in: {ame_dir}")
             enricher = AME2020DataEnricher(data_dir=ame_dir)
 
-            # Load only the files needed for requested tiers
-            tier_file_mapping = {
-                'B': ['mass'],           # Tier B: geometric (mass for radius calculation)
-                'C': ['mass', 'rct1'],   # Tier C: energetics
-                'D': ['nubase'],         # Tier D: topological
-                'E': ['rct1', 'rct2'],   # Tier E: Q-values
-            }
-
-            files_to_load = set()
-            for tier in tiers:
-                if tier in tier_file_mapping:
-                    files_to_load.update(tier_file_mapping[tier])
-
-            # Load required files
-            if 'mass' in files_to_load:
-                enricher.load_mass_file()
-            if 'rct1' in files_to_load:
-                enricher.load_rct1_file()
-            if 'rct2' in files_to_load:
-                enricher.load_rct2_file()
-            if 'nubase' in files_to_load:
-                enricher.load_nubase_file()
+            # Load all AME files into memory (they're tiny ~MBs vs GB for EXFOR)
+            # This is faster than conditional loading and ensures all data is available
+            print(f"  Loading all AME2020/NUBASE2020 files into memory...")
+            enricher.load_mass_file()      # mass_1.mas20.txt (~300 KB)
+            enricher.load_rct1_file()      # rct1.mas20.txt (~150 KB)
+            enricher.load_rct2_file()      # rct2_1.mas20.txt (~150 KB)
+            enricher.load_nubase_file()    # nubase_4.mas20.txt (~500 KB)
+            # Note: covariance file not needed for tier features
 
             # Get enrichment table
             enrichment_table = enricher.enrichment_table
