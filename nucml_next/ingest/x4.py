@@ -1,8 +1,24 @@
 """
-X4Pro SQLite Ingestor
-====================
+X4Pro SQLite Ingestor with Full AME2020/NUBASE2020 Enrichment
+=============================================================
 
-Clean, single-path ingestion from X4Pro SQLite database to Parquet.
+Production-ready ingestion pipeline: X4Pro SQLite → Parquet with ALL enrichment.
+
+Architecture: Pre-Enrichment Strategy
+--------------------------------------
+This ingestor implements a **pre-enrichment architecture**:
+
+1. Load ALL AME2020/NUBASE2020 files once during ingestion (5 files)
+2. Merge ALL enrichment columns into EXFOR dataframe
+3. Write to Parquet with complete enrichment schema
+4. Feature selection becomes simple column selection (no joins)
+
+Benefits:
+- AME2020 data is static (published every ~4 years) → load once
+- Parquet columnar format → only loads needed columns anyway
+- Consistent preprocessing → all users get same enrichment
+- Faster feature generation → no file I/O or joins needed
+- Production-ready → single data source with all features
 
 X4Pro Schema Assumptions:
 -------------------------
@@ -32,18 +48,51 @@ Pipeline:
 1. Connect to X4 SQLite database
 2. Extract point data with minimal metadata
 3. Normalize to DataFrame (Z, A, MT, Energy, CrossSection, Uncertainty)
-4. Enrich with AME2020 isotopic properties (optional)
-5. Write partitioned Parquet dataset
+4. Enrich with ALL AME2020/NUBASE2020 columns (mass, energetics, structure, Q-values)
+5. Write partitioned Parquet dataset with complete enrichment schema
+
+Output Schema (with full enrichment):
+-------------------------------------
+Core EXFOR columns:
+  - Entry, Z, A, N, MT, Energy, CrossSection, Uncertainty
+
+Tier B/C (mass_1.mas20.txt):
+  - Mass_Excess_keV, Binding_Energy_keV, Binding_Per_Nucleon_keV
+
+Tier C (rct1.mas20.txt + rct2_1.mas20.txt):
+  - S_1n, S_2n, S_1p, S_2p (separation energies)
+
+Tier D (nubase_4.mas20.txt):
+  - Spin, Parity, Isomer_Level, Half_Life_s
+
+Tier E (rct1.mas20.txt + rct2_1.mas20.txt):
+  - Q_alpha, Q_2beta_minus, Q_ep, Q_beta_n, Q_4beta_minus,
+    Q_d_alpha, Q_p_alpha, Q_n_alpha
 
 Usage:
 ------
     from nucml_next.ingest import X4Ingestor
 
+    # Basic ingestion (no enrichment)
     ingestor = X4Ingestor(
         x4_db_path='data/x4sqlite1.db',
         output_path='data/exfor_processed.parquet'
     )
     df = ingestor.ingest()
+
+    # Full enrichment (recommended - adds all tier columns)
+    ingestor = X4Ingestor(
+        x4_db_path='data/x4sqlite1.db',
+        output_path='data/exfor_enriched.parquet',
+        ame2020_dir='data/'  # Directory containing *.mas20.txt files
+    )
+    df = ingestor.ingest()
+
+    # Feature selection now just selects columns (no file I/O, no joins)
+    import pandas as pd
+    df_parquet = pd.read_parquet('data/exfor_enriched.parquet',
+                                  columns=['Z', 'A', 'Energy', 'CrossSection',
+                                          'Mass_Excess_keV', 'S_1n', 'Spin'])
 """
 
 import sqlite3
@@ -215,25 +264,37 @@ class X4Ingestor:
     - Connect to X4 SQLite database
     - Extract reaction point data
     - Normalize to standard schema
-    - Optionally enrich with AME2020
-    - Write partitioned Parquet output
+    - Enrich with AME2020/NUBASE2020 data (all 5 files)
+    - Write partitioned Parquet output with ALL enrichment columns
+
+    Architecture Philosophy:
+    - Pre-enrichment: Load AME2020/NUBASE2020 once during ingestion
+    - All enrichment columns added to Parquet schema
+    - Feature selection becomes simple column selection (no joins)
+    - Production-ready: Single preprocessing step, consistent data
     """
 
     def __init__(
         self,
         x4_db_path: str,
         output_path: str = 'data/exfor_processed.parquet',
-        ame2020_path: Optional[str] = None,
+        ame2020_dir: Optional[str] = None,
         partitioning: List[str] = ['Z', 'A', 'MT'],
         max_partitions: int = 10000,
     ):
         """
-        Initialize X4 ingestor.
+        Initialize X4 ingestor with full AME2020/NUBASE2020 enrichment.
 
         Args:
             x4_db_path: Path to X4Pro SQLite database (e.g., x4sqlite1.db)
             output_path: Output path for Parquet dataset
-            ame2020_path: Optional path to AME2020 file for enrichment
+            ame2020_dir: Optional directory containing AME2020/NUBASE2020 *.mas20.txt files
+                        If provided, all 5 files will be loaded:
+                        - mass_1.mas20.txt (Tier B, C)
+                        - rct1.mas20.txt (Tier C, E)
+                        - rct2_1.mas20.txt (Tier C, E)
+                        - nubase_4.mas20.txt (Tier D)
+                        - covariance.mas20.txt (optional)
             partitioning: Partition columns for Parquet output
             max_partitions: Maximum number of partitions allowed (default: 10000)
                            The full EXFOR database can have >1000 unique Z/A/MT combinations.
@@ -247,13 +308,19 @@ class X4Ingestor:
         if not self.x4_db_path.exists():
             raise FileNotFoundError(f"X4 database not found: {self.x4_db_path}")
 
-        # Load AME2020 if requested
-        if ame2020_path:
-            ame_loader = AME2020Loader(ame2020_path)
-            self.ame2020 = ame_loader.load()
+        # Load AME2020/NUBASE2020 enrichment if requested
+        if ame2020_dir:
+            from nucml_next.data.enrichment import AME2020DataEnricher
+
+            logger.info(f"Loading AME2020/NUBASE2020 from {ame2020_dir}")
+            self.ame_enricher = AME2020DataEnricher(data_dir=ame2020_dir)
+            self.ame_enricher.load_all()
+
+            available_tiers = self.ame_enricher.get_available_tiers()
+            logger.info(f"Available feature tiers: {available_tiers}")
         else:
             logger.info("No AME2020 enrichment requested")
-            self.ame2020 = None
+            self.ame_enricher = None
 
     def ingest(self) -> pd.DataFrame:
         """
@@ -690,26 +757,58 @@ class X4Ingestor:
 
     def _enrich_ame2020(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Enrich dataset with AME2020 isotopic properties.
+        Enrich dataset with ALL AME2020/NUBASE2020 properties.
+
+        This method adds all available enrichment columns to the EXFOR dataframe:
+        - Tier B/C: Mass excess, binding energy, binding per nucleon
+        - Tier C: Separation energies (S_1n, S_2n, S_1p, S_2p)
+        - Tier D: Spin, parity, isomer level, half-life
+        - Tier E: All reaction Q-values (Q_alpha, Q_2beta_minus, etc.)
+
+        Architecture Note:
+        - This is pre-enrichment: Add ALL columns now
+        - Feature selection happens later via column selection (no joins)
+        - Parquet columnar format only loads needed columns anyway
 
         Args:
             df: Normalized DataFrame (already has N column)
 
         Returns:
-            Enriched DataFrame with Mass_Excess_keV, Binding_Energy_keV
+            Enriched DataFrame with ALL available AME2020/NUBASE2020 columns
         """
-        if self.ame2020 is None:
+        if self.ame_enricher is None:
+            logger.info("No AME2020 enrichment requested - skipping")
             return df
 
-        # Select only AME2020 columns we need (avoid N duplication since df already has N)
-        ame_cols = ['Z', 'A', 'Mass_Excess_keV', 'Binding_Energy_keV']
-        ame_subset = self.ame2020[ame_cols].copy()
+        logger.info("Enriching with ALL AME2020/NUBASE2020 columns...")
 
+        # Get full enrichment table (all columns)
+        enrichment_table = self.ame_enricher.enrichment_table
+
+        if enrichment_table is None or len(enrichment_table) == 0:
+            logger.warning("Enrichment table is empty - skipping enrichment")
+            return df
+
+        # Merge ALL enrichment columns (except N which df already has)
+        # Select all columns except 'N' (df already has it)
+        enrich_cols = [col for col in enrichment_table.columns if col not in ['N']]
+        enrichment_data = enrichment_table[enrich_cols].copy()
+
+        # Merge with left join (keep all EXFOR data, add AME2020 where available)
         df_enriched = df.merge(
-            ame_subset,
+            enrichment_data,
             on=['Z', 'A'],
             how='left'
         )
+
+        # Report enrichment coverage
+        n_enriched = df_enriched['Mass_Excess_keV'].notna().sum() if 'Mass_Excess_keV' in df_enriched.columns else 0
+        coverage = 100 * n_enriched / len(df_enriched) if len(df_enriched) > 0 else 0
+        logger.info(f"Enriched {n_enriched:,} / {len(df_enriched):,} points ({coverage:.1f}% coverage)")
+
+        # Log which enrichment columns were added
+        added_cols = [col for col in df_enriched.columns if col not in df.columns]
+        logger.info(f"Added {len(added_cols)} enrichment columns: {', '.join(added_cols[:10])}{'...' if len(added_cols) > 10 else ''}")
 
         return df_enriched
 
@@ -745,18 +844,53 @@ class X4Ingestor:
         )
 
     def _print_summary(self, df: pd.DataFrame):
-        """Print dataset summary statistics."""
+        """Print dataset summary statistics with tier-based enrichment coverage."""
         logger.info("="*70)
         logger.info("Dataset Summary")
         logger.info("="*70)
-        logger.info(f"Total data points:     {len(df):,}")
-        logger.info(f"Unique isotopes:       {df[['Z', 'A']].drop_duplicates().shape[0]}")
-        logger.info(f"Unique reactions (MT): {df['MT'].nunique()}")
-        logger.info(f"Energy range:          {df['Energy'].min():.2e} - {df['Energy'].max():.2e} eV")
+        logger.info(f"Total data points:       {len(df):,}")
+        logger.info(f"Unique isotopes:         {df[['Z', 'A']].drop_duplicates().shape[0]}")
+        logger.info(f"Unique reactions (MT):   {df['MT'].nunique()}")
+        logger.info(f"Energy range:            {df['Energy'].min():.2e} - {df['Energy'].max():.2e} eV")
         logger.info(f"Points with uncertainty: {df['Uncertainty'].notna().sum():,}")
 
-        if 'Mass_Excess_keV' in df.columns:
-            logger.info(f"AME2020 enriched:      {df['Mass_Excess_keV'].notna().sum():,} points")
+        # Report enrichment coverage by tier
+        if self.ame_enricher is not None:
+            logger.info("-" * 70)
+            logger.info("AME2020/NUBASE2020 Enrichment Coverage")
+            logger.info("-" * 70)
+
+            # Tier B/C: Mass data
+            if 'Mass_Excess_keV' in df.columns:
+                coverage = df['Mass_Excess_keV'].notna().sum()
+                pct = 100 * coverage / len(df) if len(df) > 0 else 0
+                logger.info(f"Tier B/C (Mass):         {coverage:,} / {len(df):,} points ({pct:.1f}%)")
+
+            # Tier C: Separation energies
+            if 'S_1n' in df.columns:
+                coverage = df['S_1n'].notna().sum()
+                pct = 100 * coverage / len(df) if len(df) > 0 else 0
+                logger.info(f"Tier C (S_1n):           {coverage:,} / {len(df):,} points ({pct:.1f}%)")
+
+            # Tier D: Nuclear structure
+            if 'Spin' in df.columns:
+                coverage = df['Spin'].notna().sum()
+                pct = 100 * coverage / len(df) if len(df) > 0 else 0
+                logger.info(f"Tier D (Spin):           {coverage:,} / {len(df):,} points ({pct:.1f}%)")
+
+            if 'Half_Life_s' in df.columns:
+                coverage = df['Half_Life_s'].notna().sum()
+                pct = 100 * coverage / len(df) if len(df) > 0 else 0
+                logger.info(f"Tier D (Half-life):      {coverage:,} / {len(df):,} points ({pct:.1f}%)")
+
+            # Tier E: Q-values
+            if 'Q_alpha' in df.columns:
+                coverage = df['Q_alpha'].notna().sum()
+                pct = 100 * coverage / len(df) if len(df) > 0 else 0
+                logger.info(f"Tier E (Q_alpha):        {coverage:,} / {len(df):,} points ({pct:.1f}%)")
+
+            available_tiers = self.ame_enricher.get_available_tiers()
+            logger.info(f"Available tiers:         {available_tiers}")
 
         logger.info("="*70)
 
@@ -765,25 +899,40 @@ class X4Ingestor:
 def ingest_x4(
     x4_db_path: str,
     output_path: str = 'data/exfor_processed.parquet',
-    ame2020_path: Optional[str] = None,
+    ame2020_dir: Optional[str] = None,
     max_partitions: int = 10000,
 ) -> pd.DataFrame:
     """
-    Convenience function for X4 ingestion.
+    Convenience function for X4 ingestion with full AME2020/NUBASE2020 enrichment.
 
     Args:
         x4_db_path: Path to X4Pro SQLite database
         output_path: Output Parquet path
-        ame2020_path: Optional AME2020 file for enrichment
+        ame2020_dir: Optional directory containing AME2020/NUBASE2020 *.mas20.txt files
+                    If provided, all 5 files will be loaded and merged into Parquet:
+                    - mass_1.mas20.txt, rct1.mas20.txt, rct2_1.mas20.txt,
+                      nubase_4.mas20.txt, covariance.mas20.txt
         max_partitions: Maximum number of partitions (default: 10000 for full EXFOR)
 
     Returns:
-        Processed DataFrame
+        Processed DataFrame with all EXFOR data + AME2020/NUBASE2020 enrichment
+
+    Example:
+        >>> # Basic ingestion (no enrichment)
+        >>> df = ingest_x4('data/x4sqlite1.db', 'data/exfor.parquet')
+
+        >>> # Full enrichment (all tiers)
+        >>> df = ingest_x4(
+        ...     x4_db_path='data/x4sqlite1.db',
+        ...     output_path='data/exfor_enriched.parquet',
+        ...     ame2020_dir='data/'
+        ... )
+        >>> # Parquet now contains all enrichment columns for tier-based feature selection
     """
     ingestor = X4Ingestor(
         x4_db_path=x4_db_path,
         output_path=output_path,
-        ame2020_path=ame2020_path,
+        ame2020_dir=ame2020_dir,
         max_partitions=max_partitions,
     )
     return ingestor.ingest()

@@ -4,13 +4,32 @@ Tier-Based Feature Engineering for Nuclear Cross Sections
 
 Implements systematic feature hierarchy based on Valdez 2021 thesis.
 
+Architecture: Pre-Enrichment + Column Selection
+-----------------------------------------------
+This module is designed to work with **pre-enriched** Parquet data that already
+contains ALL AME2020/NUBASE2020 columns from ingestion.
+
+**Key Insight:**
+- Old approach: Load AME2020 files on every feature generation call (slow, redundant I/O)
+- New approach: All enrichment columns in Parquet, feature generation = column selection
+
+**Workflow:**
+1. Ingestion: X4Ingestor loads all AME2020/NUBASE2020 files, writes to Parquet
+2. Feature Generation: Select columns from Parquet (no file I/O, no joins)
+3. Compute derived features (valence, pairing, kR, etc.)
+
+**Benefits:**
+- Faster: No file parsing or joins during feature generation
+- Simpler: Just column selection from pre-enriched data
+- Consistent: All users get same enrichment from single Parquet source
+
 Tier System:
 ------------
-- Tier A (Core): Z, A, Energy, MT (4 features + particle-emission vector)
-- Tier B (Geometric): + Radius, Radius Ratio (6 features total)
-- Tier C (Energetics): + Mass Excess, Binding Energy, Separation Energies (14 features)
-- Tier D (Topological): + Spin, Parity, Valence, P-Factor, Isomeric States (20+ features)
-- Tier E (Complete): + All reaction Q-values (28+ features)
+- Tier A (Core): Z, A, Energy, MT (4 features + particle-emission vector) - 14 features
+- Tier B (Geometric): + Radius, kR parameter - 16 features
+- Tier C (Energetics): + Mass Excess, Binding Energy, Separation Energies - 23 features
+- Tier D (Topological): + Spin, Parity, Valence, P-Factor, Magic Numbers - 32 features
+- Tier E (Complete): + All reaction Q-values - 40 features
 
 Particle-Emission Vector (Valdez Table 4.15):
 ----------------------------------------------
@@ -53,7 +72,20 @@ class FeatureGenerator:
     """
     Generate tier-based features for nuclear cross-section data.
 
-    Integrates with AME2020DataEnricher to add nuclear structure properties.
+    **Pre-Enrichment Architecture:**
+    This class assumes the input DataFrame already contains AME2020/NUBASE2020
+    enrichment columns (loaded from pre-enriched Parquet). No file I/O or joins
+    are performed during feature generation.
+
+    **Usage:**
+    1. Ingest data with full enrichment: X4Ingestor(..., ame2020_dir='data/')
+    2. Load pre-enriched Parquet: pd.read_parquet('exfor_enriched.parquet')
+    3. Generate tier features: FeatureGenerator().generate_features(df, tiers=['C', 'D'])
+
+    **Backward Compatibility:**
+    For legacy code that still uses AME2020DataEnricher, the enricher parameter
+    is still supported (optional). However, the recommended approach is to use
+    pre-enriched Parquet data.
     """
 
     def __init__(self, enricher=None):
@@ -61,9 +93,13 @@ class FeatureGenerator:
         Initialize feature generator.
 
         Args:
-            enricher: Optional AME2020DataEnricher instance for Tiers B-E
+            enricher: [LEGACY] Optional AME2020DataEnricher for on-demand enrichment.
+                     Not needed if using pre-enriched Parquet data (recommended).
         """
         self.enricher = enricher
+        if enricher is not None:
+            logger.info("FeatureGenerator initialized with enricher (legacy mode)")
+            logger.info("Recommended: Use pre-enriched Parquet from X4Ingestor instead")
 
     def generate_features(
         self,
@@ -74,13 +110,33 @@ class FeatureGenerator:
         """
         Generate tier-based features for a dataset.
 
+        **Pre-Enrichment Mode (Recommended):**
+        If df already contains AME2020/NUBASE2020 columns (from pre-enriched Parquet),
+        this method will compute derived features only (no file I/O, no joins).
+
+        **Legacy Enrichment Mode:**
+        If enricher was provided and df lacks AME2020 columns, will fall back to
+        on-demand enrichment (slower, requires file I/O).
+
         Args:
             df: DataFrame with at minimum Z, A, Energy, MT columns
+                For Tiers B-E: Should contain AME2020/NUBASE2020 columns from Parquet
             tiers: List of tiers to include (e.g., ['A', 'B', 'C'])
             use_particle_emission: If True, use particle-emission vector instead of one-hot MT
 
         Returns:
             DataFrame with generated features
+
+        Example (Pre-Enriched):
+            >>> df = pd.read_parquet('exfor_enriched.parquet')  # Already has AME2020 columns
+            >>> gen = FeatureGenerator()
+            >>> features = gen.generate_features(df, tiers=['A', 'C', 'D'])
+
+        Example (Legacy):
+            >>> enricher = AME2020DataEnricher('data/')
+            >>> enricher.load_all()
+            >>> gen = FeatureGenerator(enricher=enricher)
+            >>> features = gen.generate_features(df, tiers=['C'])  # Will enrich on-demand
         """
         result = df.copy()
 
@@ -88,19 +144,19 @@ class FeatureGenerator:
         if 'A' in tiers or len(tiers) == 0:
             result = self._add_tier_a_features(result, use_particle_emission)
 
-        # Tier B: Geometric features
+        # Tier B: Geometric features (computed from Z, A)
         if 'B' in tiers:
             result = self._add_tier_b_features(result)
 
-        # Tier C: Energetics features
+        # Tier C: Energetics features (from AME2020 columns in Parquet)
         if 'C' in tiers:
             result = self._add_tier_c_features(result)
 
-        # Tier D: Topological features
+        # Tier D: Topological features (from NUBASE2020 columns in Parquet)
         if 'D' in tiers:
             result = self._add_tier_d_features(result)
 
-        # Tier E: Complete Q-values
+        # Tier E: Complete Q-values (from AME2020 rct1/rct2 columns in Parquet)
         if 'E' in tiers:
             result = self._add_tier_e_features(result)
 
@@ -177,27 +233,41 @@ class FeatureGenerator:
         """
         Add Tier C (Energetics) features.
 
-        Features from AME2020:
-        - Mass_Excess_keV: Mass excess in keV
-        - Binding_Energy_keV: Total binding energy in keV
-        - Binding_Per_Nucleon_keV: Binding energy per nucleon
-        - S_1n, S_2n: One- and two-neutron separation energies (keV)
-        - S_1p, S_2p: One- and two-proton separation energies (keV)
+        **Pre-Enrichment Mode (Recommended):**
+        Assumes df already contains AME2020 columns from pre-enriched Parquet:
+        - Mass_Excess_keV, Binding_Energy_keV, Binding_Per_Nucleon_keV
+        - S_1n, S_2n, S_1p, S_2p (separation energies)
+
+        This method just converts keV → MeV (no file I/O, no joins).
+
+        **Legacy Mode:**
+        If columns not present and enricher is available, falls back to on-demand enrichment.
 
         Args:
             df: Input dataframe with Z, A columns
+                (Should already have AME2020 columns if from pre-enriched Parquet)
 
         Returns:
-            DataFrame with Tier C features enriched from AME2020
+            DataFrame with Tier C features (energies converted keV → MeV)
         """
-        if self.enricher is None:
-            logger.warning("No enricher available. Tier C features require AME2020DataEnricher.")
-            return df
-
         result = df.copy()
 
-        # Enrich with AME2020 data (Tier C columns)
-        result = self.enricher.enrich_dataframe(result, tiers=['C'])
+        # Check if data is pre-enriched (has AME2020 columns)
+        tier_c_cols = ['Mass_Excess_keV', 'Binding_Energy_keV', 'S_1n']
+        has_enrichment = all(col in result.columns for col in tier_c_cols)
+
+        if not has_enrichment:
+            # Data not pre-enriched - try legacy enrichment if available
+            if self.enricher is None:
+                logger.warning(
+                    "Tier C features require AME2020 data. "
+                    "Options: (1) Use pre-enriched Parquet from X4Ingestor with ame2020_dir, "
+                    "or (2) Provide enricher to FeatureGenerator (legacy mode)."
+                )
+                return df
+            else:
+                logger.info("Using legacy enrichment mode (on-demand join)")
+                result = self.enricher.enrich_dataframe(result, tiers=['C'])
 
         # Convert keV to MeV for better numerical stability in ML
         energy_cols = [
@@ -216,30 +286,46 @@ class FeatureGenerator:
         """
         Add Tier D (Topological) features.
 
-        Features from NUBASE2020:
-        - Spin: Nuclear spin (J)
-        - Parity: Parity (+1 or -1)
-        - Isomer_Level: Isomeric state (0=ground, 1=first excited, ...)
-        - Valence_N: Valence neutrons (distance to nearest closed shell)
-        - Valence_P: Valence protons (distance to nearest closed shell)
-        - P_Factor: Pairing factor (even-even=1, even-odd/odd-even=0, odd-odd=-1)
-        - Shell_Closure_N: Nearest neutron magic number
-        - Shell_Closure_P: Nearest proton magic number
+        **Pre-Enrichment Mode (Recommended):**
+        Assumes df already contains NUBASE2020 columns from pre-enriched Parquet:
+        - Spin, Parity, Isomer_Level, Half_Life_s
+
+        This method computes derived topological features:
+        - Valence_N/P: Distance to nearest magic number
+        - P_Factor: Pairing factor (even-even/odd-odd)
+        - Shell_Closure_N/P: Nearest magic numbers
+
+        **Legacy Mode:**
+        If columns not present and enricher is available, falls back to on-demand enrichment.
 
         Args:
-            df: Input dataframe
+            df: Input dataframe with Z, A, N columns
+                (Should already have NUBASE2020 columns if from pre-enriched Parquet)
 
         Returns:
             DataFrame with Tier D features
         """
-        if self.enricher is None or self.enricher.nubase_data is None:
-            logger.warning("NUBASE2020 data not available. Tier D features unavailable.")
-            return df
-
         result = df.copy()
 
-        # Enrich with NUBASE data
-        result = self.enricher.enrich_dataframe(result, tiers=['D'])
+        # Check if data is pre-enriched (has NUBASE2020 columns)
+        tier_d_cols = ['Spin', 'Parity']
+        has_enrichment = all(col in result.columns for col in tier_d_cols)
+
+        if not has_enrichment:
+            # Data not pre-enriched - try legacy enrichment if available
+            if self.enricher is None:
+                logger.warning(
+                    "Tier D features require NUBASE2020 data. "
+                    "Options: (1) Use pre-enriched Parquet from X4Ingestor with ame2020_dir, "
+                    "or (2) Provide enricher to FeatureGenerator (legacy mode)."
+                )
+                return df
+            elif self.enricher.nubase_data is None:
+                logger.warning("NUBASE2020 data not loaded in enricher. Tier D features unavailable.")
+                return df
+            else:
+                logger.info("Using legacy enrichment mode (on-demand join)")
+                result = self.enricher.enrich_dataframe(result, tiers=['D'])
 
         # Compute valence nucleons (distance to nearest magic number)
         magic_numbers = [2, 8, 20, 28, 50, 82, 126]
@@ -284,26 +370,43 @@ class FeatureGenerator:
         """
         Add Tier E (Complete) features.
 
-        Features from AME2020 rct1 and rct2:
-        - All reaction Q-values from rct1: Q_alpha, Q_2beta_minus, Q_ep, Q_beta_n
-        - All reaction Q-values from rct2: Q_4beta_minus, Q_d_alpha, Q_p_alpha, Q_n_alpha
+        **Pre-Enrichment Mode (Recommended):**
+        Assumes df already contains AME2020 rct1/rct2 columns from pre-enriched Parquet:
+        - Q_alpha, Q_2beta_minus, Q_ep, Q_beta_n (from rct1.mas20.txt)
+        - Q_4beta_minus, Q_d_alpha, Q_p_alpha, Q_n_alpha (from rct2_1.mas20.txt)
+
+        This method just converts keV → MeV (no file I/O, no joins).
+
+        **Legacy Mode:**
+        If columns not present and enricher is available, falls back to on-demand enrichment.
 
         Args:
             df: Input dataframe
+                (Should already have AME2020 Q-value columns if from pre-enriched Parquet)
 
         Returns:
-            DataFrame with Tier E features
+            DataFrame with Tier E features (Q-values converted keV → MeV)
         """
-        if self.enricher is None:
-            logger.warning("No enricher available. Tier E features require AME2020DataEnricher.")
-            return df
-
         result = df.copy()
 
-        # Enrich with all Q-values
-        result = self.enricher.enrich_dataframe(result, tiers=['E'])
+        # Check if data is pre-enriched (has AME2020 Q-value columns)
+        tier_e_cols = ['Q_alpha', 'Q_n_alpha']
+        has_enrichment = any(col in result.columns for col in tier_e_cols)
 
-        # Convert keV to MeV
+        if not has_enrichment:
+            # Data not pre-enriched - try legacy enrichment if available
+            if self.enricher is None:
+                logger.warning(
+                    "Tier E features require AME2020 rct1/rct2 data. "
+                    "Options: (1) Use pre-enriched Parquet from X4Ingestor with ame2020_dir, "
+                    "or (2) Provide enricher to FeatureGenerator (legacy mode)."
+                )
+                return df
+            else:
+                logger.info("Using legacy enrichment mode (on-demand join)")
+                result = self.enricher.enrich_dataframe(result, tiers=['E'])
+
+        # Convert keV to MeV for better numerical stability
         q_value_cols = [
             'Q_alpha', 'Q_2beta_minus', 'Q_ep', 'Q_beta_n',
             'Q_4beta_minus', 'Q_d_alpha', 'Q_p_alpha', 'Q_n_alpha'

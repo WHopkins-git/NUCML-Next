@@ -87,9 +87,42 @@ Expected output:
 
 ## Step 3: Ingest EXFOR Data
 
-Convert X4Pro SQLite to Parquet format for efficient loading:
+Convert X4Pro SQLite to Parquet format with full AME2020/NUBASE2020 enrichment.
 
-### Basic Ingestion (No AME2020)
+### Pre-Enrichment Architecture (Recommended)
+
+**Key Insight:** Load ALL AME2020/NUBASE2020 files once during ingestion, not repeatedly during feature generation.
+
+```bash
+# Full enrichment - adds ALL tier columns to Parquet
+python scripts/ingest_exfor.py \
+    --x4-db data/x4sqlite1_sample.db \
+    --output data/exfor_enriched.parquet \
+    --ame2020-dir data/
+```
+
+**What This Does:**
+1. Loads ALL 5 AME2020/NUBASE2020 files from `data/` directory
+2. Merges all enrichment columns into EXFOR dataframe
+3. Writes complete enrichment schema to Parquet
+4. Feature generation becomes simple column selection (no file I/O, no joins)
+
+**Files Loaded:**
+- `mass_1.mas20.txt` → Mass_Excess_keV, Binding_Energy_keV, Binding_Per_Nucleon_keV
+- `rct1.mas20.txt` → S_2n, S_2p, Q_alpha, Q_2beta_minus, Q_ep, Q_beta_n
+- `rct2_1.mas20.txt` → S_1n, S_1p, Q_4beta_minus, Q_d_alpha, Q_p_alpha, Q_n_alpha
+- `nubase_4.mas20.txt` → Spin, Parity, Isomer_Level, Half_Life_s
+- `covariance.mas20.txt` → (optional, not yet implemented)
+
+**Benefits:**
+- ✅ Faster feature generation (no file parsing, no joins)
+- ✅ Consistent preprocessing (all users get same enrichment)
+- ✅ Production-ready (single data source)
+- ✅ Parquet columnar format (only loads needed columns)
+
+### Basic Ingestion (No Enrichment)
+
+If you don't need AME2020/NUBASE2020 features:
 
 ```bash
 python scripts/ingest_exfor.py \
@@ -97,40 +130,58 @@ python scripts/ingest_exfor.py \
     --output data/exfor_processed.parquet
 ```
 
-### With AME2020 Enrichment (Recommended)
-
-```bash
-python scripts/ingest_exfor.py \
-    --x4-db data/x4sqlite1_sample.db \
-    --output data/exfor_processed.parquet \
-    --ame2020 data/mass_1.mas20.txt
-```
-
-**Note:** During ingestion, only `mass_1.mas20.txt` is used for basic enrichment. All other AME2020/NUBASE2020 files are loaded on-demand during feature generation.
+This creates a minimal Parquet with only EXFOR data (Z, A, MT, Energy, CrossSection, Uncertainty).
 
 ---
 
 ## Step 4: Verify Setup
 
-Test that everything is working:
+Test that pre-enrichment worked correctly:
 
 ```python
-from nucml_next.data import NucmlDataset
-from nucml_next.data.enrichment import AME2020DataEnricher
+import pandas as pd
 
-# Test EXFOR data loading
-dataset = NucmlDataset(
-    data_path='data/exfor_processed.parquet',
-    mode='tabular'
-)
-print(f"✓ Loaded {len(dataset.df):,} EXFOR measurements")
+# Load pre-enriched Parquet
+df = pd.read_parquet('data/exfor_enriched.parquet')
 
-# Test AME2020/NUBASE2020 enrichment
-enricher = AME2020DataEnricher(data_dir='data/')
-enricher.load_all()
-print(f"✓ Available tiers: {enricher.get_available_tiers()}")
+print(f"✓ Loaded {len(df):,} EXFOR measurements")
+print(f"✓ Columns: {len(df.columns)} total")
 
-# Should show: ['A', 'B', 'C', 'D', 'E'] if all files present
+# Check which tier columns are present
+tier_columns = {
+    'Tier A': ['Z', 'A', 'N', 'Energy', 'MT'],
+    'Tier B/C': ['Mass_Excess_keV', 'Binding_Energy_keV', 'S_1n', 'S_2n'],
+    'Tier D': ['Spin', 'Parity', 'Half_Life_s'],
+    'Tier E': ['Q_alpha', 'Q_n_alpha']
+}
+
+for tier, cols in tier_columns.items():
+    present = [col for col in cols if col in df.columns]
+    print(f"✓ {tier}: {len(present)}/{len(cols)} columns present")
+
+# Check enrichment coverage
+if 'Mass_Excess_keV' in df.columns:
+    coverage = df['Mass_Excess_keV'].notna().sum() / len(df) * 100
+    print(f"✓ AME2020 coverage: {coverage:.1f}% of data points")
+
+# Feature generation is now just column selection (no file I/O!)
+from nucml_next.data.features import FeatureGenerator
+
+gen = FeatureGenerator()  # No enricher needed - data is pre-enriched!
+features = gen.generate_features(df, tiers=['A', 'C', 'D'])
+print(f"✓ Generated {features.shape[1]} features from Tier A+C+D")
+```
+
+**Expected Output (if all files present):**
+```
+✓ Loaded 123,456 EXFOR measurements
+✓ Columns: 25 total
+✓ Tier A: 5/5 columns present
+✓ Tier B/C: 4/4 columns present
+✓ Tier D: 3/3 columns present
+✓ Tier E: 2/2 columns present
+✓ AME2020 coverage: 94.3% of data points
+✓ Generated 32 features from Tier A+C+D
 ```
 
 ---
@@ -149,31 +200,37 @@ With all AME2020/NUBASE2020 files in place, you can use the full tier system:
 | **D** | + Topological | 32 | nubase_4.mas20.txt |
 | **E** | + Complete Q-values | 40 | rct1, rct2_1 |
 
-### Example Usage
+### Example Usage (Pre-Enriched Data)
 
 ```python
-from nucml_next.data import NucmlDataset
-from nucml_next.data.selection import DataSelection
+import pandas as pd
+from nucml_next.data.features import FeatureGenerator
 
-# Select features by tier
-selection = DataSelection(
-    projectile='neutron',
-    energy_min=1e-5,
-    energy_max=2e7,
-    mt_mode='all_physical',
-    tiers=['A', 'B', 'C', 'D']  # Use Tier D features
-)
+# Load pre-enriched Parquet (already has ALL tier columns)
+df = pd.read_parquet('data/exfor_enriched.parquet')
 
-dataset = NucmlDataset(
-    data_path='data/exfor_processed.parquet',
-    mode='tabular',
-    selection=selection
-)
+# Filter to neutron reactions in reactor energy range
+df_filtered = df[
+    (df['Energy'] >= 1e-5) &
+    (df['Energy'] <= 2e7)
+].copy()
 
-# Generate tier-based features (automatic AME2020 loading)
-df = dataset.to_tabular(mode='tier')
-print(f"Generated {df.shape[1]} features including Tier D topological features")
+# Generate tier-based features (just column selection, no file I/O!)
+gen = FeatureGenerator()  # No enricher needed!
+features = gen.generate_features(df_filtered, tiers=['A', 'C', 'D'])
+
+print(f"Generated {features.shape[1]} features including Tier D topological features")
+print(f"Available columns: {list(features.columns)}")
+
+# Feature generation is fast because:
+# - No AME2020 file parsing
+# - No dataframe joins
+# - Just column selection from pre-enriched Parquet
 ```
+
+**Key Differences from Legacy Approach:**
+- ✅ **Old:** `NucmlDataset` loads AME2020 files every time → slow, redundant I/O
+- ✅ **New:** AME2020 columns already in Parquet → fast column selection only
 
 ---
 

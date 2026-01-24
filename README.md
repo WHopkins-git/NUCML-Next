@@ -59,14 +59,26 @@ ls data/x4sqlite1_sample.db  # Contains subset for testing
 > **Note:** The full X4Pro database is NOT committed to GitHub due to size.
 > Only a small sample database (`data/x4sqlite1_sample.db`) is included.
 
-**Step 2: Ingest X4 to Parquet**
-```bash
-# Using sample database
-python scripts/ingest_exfor.py --x4-db data/x4sqlite1_sample.db --output data/exfor_processed.parquet
+**Step 2: Ingest X4 to Parquet (with Full AME2020/NUBASE2020 Enrichment)**
 
-# Using full database
-python scripts/ingest_exfor.py --x4-db /path/to/x4sqlite1.db --output data/exfor_processed.parquet
+```bash
+# Basic ingestion (no enrichment)
+python scripts/ingest_exfor.py \
+    --x4-db data/x4sqlite1_sample.db \
+    --output data/exfor_processed.parquet
+
+# Recommended: Full enrichment (all tier columns added to Parquet)
+python scripts/ingest_exfor.py \
+    --x4-db data/x4sqlite1_sample.db \
+    --output data/exfor_enriched.parquet \
+    --ame2020-dir data/
 ```
+
+**Pre-Enrichment Architecture:**
+- The `--ame2020-dir` option loads ALL 5 AME2020/NUBASE2020 files during ingestion
+- All enrichment columns (Tier B-E) are written to the Parquet file
+- Feature selection becomes simple column selection (no file I/O, no joins)
+- Parquet columnar format only loads needed columns anyway → fast and efficient
 
 **Step 3: Load in notebooks**
 ```python
@@ -245,18 +257,33 @@ df = dataset.to_tabular(mode='tier')
 # Returns DataFrame with 23 features including energetics from AME2020
 ```
 
-**Basic Ingestion (Legacy):**
+**Recommended: Pre-Enrichment During Ingestion**
 
-For basic ingestion with only mass excess and binding energy:
+For production use, enrich data during ingestion with all AME2020/NUBASE2020 files:
 
-```python
+```bash
+# Download all required files first
+cd data/
+wget https://www-nds.iaea.org/amdc/ame2020/mass_1.mas20.txt
+wget https://www-nds.iaea.org/amdc/ame2020/rct1.mas20.txt
+wget https://www-nds.iaea.org/amdc/ame2020/rct2_1.mas20.txt
+wget https://www-nds.iaea.org/amdc/ame2020/nubase_4.mas20.txt
+
+# Ingest with full enrichment
 python scripts/ingest_exfor.py \
     --x4-db data/x4sqlite1.db \
-    --output data/exfor_processed.parquet \
-    --ame2020 data/mass_1.mas20.txt
+    --output data/exfor_enriched.parquet \
+    --ame2020-dir data/
 ```
 
-If AME2020 files are not provided during ingestion, the system uses SEMF (Semi-Empirical Mass Formula) approximations for common isotopes. Full tier features are loaded on-demand during feature generation.
+**Architecture Benefits:**
+- ✅ Load AME2020 files once during ingestion (not every feature generation call)
+- ✅ All enrichment columns in Parquet → consistent preprocessing for all users
+- ✅ Feature generation = column selection → no file I/O, no joins, faster
+- ✅ Parquet columnar format → only loads needed columns anyway
+
+**Legacy Approach (Not Recommended):**
+If AME2020 files are not provided during ingestion, feature generation will load files on-demand (slower, redundant I/O). The recommended approach is pre-enrichment during ingestion.
 
 **Citations:**
 
