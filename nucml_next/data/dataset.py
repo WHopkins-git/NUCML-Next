@@ -609,19 +609,23 @@ class NucmlDataset(TorchDataset):
 
     def to_tabular(
         self,
-        mode: Literal['naive', 'physics'] = 'naive',
+        mode: Literal['naive', 'physics', 'tier'] = 'naive',
         reaction_types: Optional[List[int]] = None,
+        tiers: Optional[List[str]] = None,
     ) -> pd.DataFrame:
         """
         Project graph data to tabular format for classical ML.
 
-        This is the key method for the educational pathway:
+        Supports three projection strategies:
         - mode='naive': Legacy features [Z, A, E, MT] (one-hot encoded)
         - mode='physics': Graph-derived features [Z, A, E, Q, Threshold, ΔZ, ΔA]
+        - mode='tier': Tier-based features using Valdez 2021 hierarchy
 
         Args:
             mode: Projection strategy
             reaction_types: Filter to specific MT codes (None = all reactions)
+            tiers: List of feature tiers to include (e.g., ['A', 'C', 'E'])
+                   Only used when mode='tier'. If None, uses selection.tiers.
 
         Returns:
             DataFrame ready for XGBoost/Decision Trees
@@ -634,8 +638,46 @@ class NucmlDataset(TorchDataset):
             >>> # Physics-aware approach (better, but still not smooth)
             >>> df_physics = dataset.to_tabular(mode='physics')
             >>> xgb.fit(df_physics[['Z', 'A', 'Energy', 'Q_Value', 'Threshold']], ...)
+            >>>
+            >>> # Tier-based approach (Valdez 2021 hierarchy)
+            >>> df_tier_c = dataset.to_tabular(mode='tier', tiers=['A', 'B', 'C'])
+            >>> # Features include: Z, A, N, Energy, particle emission, radius, energetics
         """
-        return self.tabular_projector.project(mode=mode, reaction_types=reaction_types)
+        if mode == 'tier':
+            # Use FeatureGenerator for tier-based features
+            from nucml_next.data.enrichment import AME2020DataEnricher
+            from nucml_next.data.features import FeatureGenerator
+
+            # Initialize enricher if needed for Tiers B+
+            if tiers is None:
+                # Use tiers from DataSelection if available
+                if self.selection is not None:
+                    tiers = self.selection.tiers
+                else:
+                    tiers = ['A']  # Default to core features
+
+            # Check if we need enrichment (Tiers B, C, D, E)
+            needs_enrichment = any(tier in tiers for tier in ['B', 'C', 'D', 'E'])
+
+            if needs_enrichment:
+                # Load AME2020 data
+                enricher = AME2020DataEnricher(data_dir='data/')
+                enricher.load_all()
+                generator = FeatureGenerator(enricher=enricher)
+            else:
+                # No enrichment needed for Tier A only
+                generator = FeatureGenerator(enricher=None)
+
+            # Generate tier-based features
+            df = self.df.copy()
+            if reaction_types is not None:
+                df = df[df['MT'].isin(reaction_types)]
+
+            return generator.generate_features(df, tiers=tiers)
+
+        else:
+            # Use legacy TabularProjector for 'naive' and 'physics' modes
+            return self.tabular_projector.project(mode=mode, reaction_types=reaction_types)
 
     def get_isotope_graph(self, Z: int, A: int) -> Data:
         """

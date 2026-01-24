@@ -82,20 +82,28 @@ class DataSelection:
         holdout_isotopes: List of (Z,A) tuples to exclude from training.
                          Use for measuring true extrapolation capability.
                          Default: None (no holdouts)
+        tiers: List of feature tiers to include (e.g., ['A', 'C']). Options:
+            - 'A': Core features (Z, A, Energy, particle emission)
+            - 'B': + Geometric features (nuclear radius, kR)
+            - 'C': + Energetics (mass excess, binding energy, separation energies)
+            - 'D': + Topological (spin, parity, valence, magic numbers)
+            - 'E': + Complete Q-values (all reaction energetics)
+                         Default: ['A'] (core features only, equivalent to 'naive' mode)
 
     Example:
-        >>> # Default: reactor physics, neutrons only
+        >>> # Default: reactor physics, neutrons only, Tier A features
         >>> selection = DataSelection()
 
-        >>> # Custom: threshold reactions, wide energy range
+        >>> # Tier C features (Energetics): includes mass excess, binding energy, separation energies
         >>> selection = DataSelection(
-        ...     mt_mode='threshold_only',
-        ...     energy_min=1e-3,
-        ...     energy_max=1e8
+        ...     tiers=['A', 'B', 'C'],
+        ...     energy_min=1e-5,
+        ...     energy_max=2e7
         ... )
 
-        >>> # Holdout U-235 and Cl-35 for evaluation
+        >>> # Holdout U-235 and Cl-35 for evaluation with Tier E features
         >>> selection = DataSelection(
+        ...     tiers=['A', 'C', 'E'],
         ...     holdout_isotopes=[(92, 235), (17, 35)]
         ... )
     """
@@ -120,6 +128,9 @@ class DataSelection:
     # Evaluation controls
     holdout_isotopes: Optional[List[Tuple[int, int]]] = None  # [(Z, A), ...] to exclude
 
+    # Feature tier selection (Valdez 2021 hierarchy)
+    tiers: List[str] = field(default_factory=lambda: ['A'])  # Default: Core features only
+
     def __post_init__(self):
         """Validate configuration after initialization."""
         # Validate projectile
@@ -140,6 +151,16 @@ class DataSelection:
         # Validate custom_mt_codes
         if self.mt_mode == 'custom' and not self.custom_mt_codes:
             raise ValueError("custom_mt_codes must be provided when mt_mode='custom'")
+
+        # Validate tiers
+        valid_tiers = ['A', 'B', 'C', 'D', 'E']
+        for tier in self.tiers:
+            if tier not in valid_tiers:
+                raise ValueError(f"Invalid tier '{tier}'. Must be one of {valid_tiers}")
+
+        # Ensure Tier A is always included (base features required)
+        if 'A' not in self.tiers and len(self.tiers) > 0:
+            self.tiers = ['A'] + self.tiers
 
     def get_mt_codes(self) -> List[int]:
         """
@@ -215,6 +236,9 @@ class DataSelection:
             lines.append(f"  MT codes: {sorted(mt_codes)[:10]}{'...' if len(mt_codes) > 10 else ''} ({len(mt_codes)} total)")
         else:
             lines.append(f"  MT codes: all physical (< 9000)")
+
+        # Show tier selection
+        lines.append(f"  Feature tiers: {self.tiers}")
 
         if self.holdout_isotopes:
             lines.append(f"  Holdout isotopes: {self.holdout_isotopes}")
