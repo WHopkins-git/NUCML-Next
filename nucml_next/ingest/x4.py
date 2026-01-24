@@ -1,24 +1,28 @@
 """
-X4Pro SQLite Ingestor with Full AME2020/NUBASE2020 Enrichment
-=============================================================
+X4Pro SQLite Ingestor - Lean EXFOR Data Extraction
+===================================================
 
-Production-ready ingestion pipeline: X4Pro SQLite → Parquet with ALL enrichment.
+Production-ready ingestion pipeline: X4Pro SQLite → Parquet (EXFOR data only).
 
-Architecture: Pre-Enrichment Strategy
---------------------------------------
-This ingestor implements a **pre-enrichment architecture**:
+Architecture: Lean Ingestion + On-Demand Enrichment
+----------------------------------------------------
+This ingestor extracts ONLY EXFOR experimental data:
 
-1. Load ALL AME2020/NUBASE2020 files once during ingestion (5 files)
-2. Merge ALL enrichment columns into EXFOR dataframe
-3. Write to Parquet with complete enrichment schema
-4. Feature selection becomes simple column selection (no joins)
+1. Extract cross-section measurements from X4 SQLite database
+2. Normalize to standard schema (Z, A, N, MT, Energy, CrossSection, Uncertainty)
+3. Write lean Parquet file (no AME data duplication)
+
+AME2020/NUBASE2020 enrichment happens during feature generation:
+- AME files are small (~MB) and loaded once when needed
+- Joined on-the-fly during feature generation based on (Z, A)
+- No data duplication in Parquet
+- Faster ingestion and smaller file size
 
 Benefits:
-- AME2020 data is static (published every ~4 years) → load once
-- Parquet columnar format → only loads needed columns anyway
-- Consistent preprocessing → all users get same enrichment
-- Faster feature generation → no file I/O or joins needed
-- Production-ready → single data source with all features
+- Lean Parquet: ~10x smaller without redundant AME data
+- Fast ingestion: No AME joins during ingest
+- Flexible: Users can choose enrichment tiers at runtime
+- Same enrichment: AME enricher ensures consistency
 
 X4Pro Schema Assumptions:
 -------------------------
@@ -283,22 +287,26 @@ class X4Ingestor:
         max_partitions: int = 10000,
     ):
         """
-        Initialize X4 ingestor with full AME2020/NUBASE2020 enrichment.
+        Initialize X4 ingestor - extracts lean EXFOR data only.
 
         Args:
             x4_db_path: Path to X4Pro SQLite database (e.g., x4sqlite1.db)
-            output_path: Output path for Parquet dataset
-            ame2020_dir: Optional directory containing AME2020/NUBASE2020 *.mas20.txt files
-                        If provided, all 5 files will be loaded:
-                        - mass_1.mas20.txt (Tier B, C)
-                        - rct1.mas20.txt (Tier C, E)
-                        - rct2_1.mas20.txt (Tier C, E)
-                        - nubase_4.mas20.txt (Tier D)
-                        - covariance.mas20.txt (optional)
-            partitioning: Partition columns for Parquet output
+            output_path: Output path for Parquet dataset (default: data/exfor_processed.parquet)
+            ame2020_dir: DEPRECATED - AME enrichment now happens during feature generation.
+                        This parameter is kept for backward compatibility but ignored.
+                        AME files are loaded on-demand by NucmlDataset during feature generation.
+            partitioning: Partition columns for Parquet output (default: ['Z', 'A', 'MT'])
             max_partitions: Maximum number of partitions allowed (default: 10000)
                            The full EXFOR database can have >1000 unique Z/A/MT combinations.
                            PyArrow's default limit is 1024, which is insufficient for full EXFOR.
+
+        Note:
+            This ingestor now produces LEAN Parquet files containing only EXFOR measurements.
+            AME2020/NUBASE2020 enrichment is handled during feature generation to:
+            - Reduce Parquet file size (~10x smaller)
+            - Speed up ingestion
+            - Avoid data duplication
+            - Enable flexible tier selection at runtime
         """
         self.x4_db_path = Path(x4_db_path)
         self.output_path = Path(output_path)
@@ -308,19 +316,15 @@ class X4Ingestor:
         if not self.x4_db_path.exists():
             raise FileNotFoundError(f"X4 database not found: {self.x4_db_path}")
 
-        # Load AME2020/NUBASE2020 enrichment if requested
+        # AME enrichment has been moved to feature generation time
+        # Keep this for backward compatibility (parameter is ignored)
         if ame2020_dir:
-            from nucml_next.data.enrichment import AME2020DataEnricher
-
-            logger.info(f"Loading AME2020/NUBASE2020 from {ame2020_dir}")
-            self.ame_enricher = AME2020DataEnricher(data_dir=ame2020_dir)
-            self.ame_enricher.load_all()
-
-            available_tiers = self.ame_enricher.get_available_tiers()
-            logger.info(f"Available feature tiers: {available_tiers}")
-        else:
-            logger.info("No AME2020 enrichment requested")
-            self.ame_enricher = None
+            logger.warning(
+                "⚠️  ame2020_dir parameter is deprecated and will be ignored.\n"
+                "   AME enrichment now happens during feature generation for better performance.\n"
+                "   The lean Parquet file will not include AME columns.\n"
+                "   NucmlDataset will load AME files automatically when needed."
+            )
 
     def ingest(self) -> pd.DataFrame:
         """
@@ -348,12 +352,8 @@ class X4Ingestor:
             df = self._normalize(df)
             logger.info(f"Normalized to standard schema")
 
-            # Enrich with AME2020/NUBASE2020 if available
-            if self.ame_enricher is not None:
-                df = self._enrich_ame2020(df)
-                logger.info(f"Enriched with AME2020/NUBASE2020 data")
-
-            # Write to Parquet
+            # Write lean Parquet (EXFOR data only)
+            # AME enrichment now happens during feature generation
             self._write_parquet(df)
             logger.info(f"Saved to {self.output_path}")
 
