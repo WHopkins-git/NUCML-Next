@@ -33,7 +33,7 @@ Usage:
 """
 
 import logging
-from typing import Optional, List, Dict, Any, Union
+from typing import Optional, List, Dict, Any, Union, Tuple
 from pathlib import Path
 
 import numpy as np
@@ -396,10 +396,6 @@ class AME2020DataEnricher:
 
         Returns:
             DataFrame with Z, A, and above columns
-
-        Note:
-            This file is currently unavailable in the repository.
-            Returns None until file is obtained.
         """
         filepath = self.data_dir / 'nubase_4.mas20.txt'
 
@@ -408,10 +404,192 @@ class AME2020DataEnricher:
             return None
 
         logger.info("Loading nubase_4.mas20.txt...")
-        # TODO: Implement NUBASE parser when file becomes available
-        # NUBASE format is more complex and requires special handling
+        records = []
 
-        return None
+        with open(filepath, 'r') as f:
+            for line in f:
+                # Skip comments and header lines
+                if line.startswith('#') or not line.strip():
+                    continue
+
+                try:
+                    # Fixed-width NUBASE format
+                    # Columns (1-indexed):
+                    #   1-3: AAA (mass number)
+                    #   5-8: ZZZi (atomic number + isomer state)
+                    #   12-16: A El (element symbol)
+                    #   17: s (isomer marker: m, n, p, q, r, i, j)
+                    #   19-31: Mass excess (keV)
+                    #   70-78: Half-life
+                    #   79-80: Half-life unit
+                    #   89-102: J^π (spin and parity)
+
+                    if len(line) < 102:
+                        continue
+
+                    # Parse A (mass number) - columns 1-3 (0-indexed: 0-3)
+                    a_str = line[0:3].strip()
+                    if not a_str:
+                        continue
+                    A = int(a_str)
+
+                    # Parse ZZZi (atomic number + isomer) - columns 5-8 (0-indexed: 4-8)
+                    zzzi_str = line[4:8].strip()
+                    if not zzzi_str:
+                        continue
+
+                    # Extract Z and isomer level
+                    # Format: ZZZi where i = 0 (ground), 1,2 (isomers), etc.
+                    if len(zzzi_str) >= 3:
+                        Z = int(zzzi_str[:3])
+                        isomer_char = zzzi_str[3] if len(zzzi_str) > 3 else '0'
+                        isomer_level = int(isomer_char) if isomer_char.isdigit() else 0
+                    else:
+                        continue
+
+                    # Only use ground states for now (isomer_level == 0)
+                    # This avoids duplicate (Z, A) entries
+                    if isomer_level != 0:
+                        continue
+
+                    # Parse J^π (spin and parity) - columns 89-102 (0-indexed: 88-102)
+                    jpi_str = line[88:102].strip()
+
+                    # Parse spin and parity from strings like "1/2+*", "0+", "3/2-", etc.
+                    spin, parity = self._parse_spin_parity(jpi_str)
+
+                    # Parse half-life - columns 70-78 (0-indexed: 69-78)
+                    halflife_str = line[69:78].strip()
+                    halflife_unit = line[78:80].strip()
+                    half_life_s = self._parse_half_life(halflife_str, halflife_unit)
+
+                    records.append({
+                        'Z': Z,
+                        'A': A,
+                        'Spin': spin,
+                        'Parity': parity,
+                        'Isomer_Level': isomer_level,
+                        'Half_Life_s': half_life_s,
+                    })
+
+                except (ValueError, IndexError) as e:
+                    continue
+
+        df = pd.DataFrame(records)
+        logger.info(f"Loaded {len(df)} ground-state isotopes from nubase_4.mas20.txt")
+        return df
+
+    def _parse_spin_parity(self, jpi_str: str) -> Tuple[Optional[float], Optional[int]]:
+        """
+        Parse spin and parity from NUBASE J^π string.
+
+        Examples:
+            "1/2+*"  → (0.5, +1)
+            "0+"     → (0.0, +1)
+            "3/2-"   → (1.5, -1)
+            "(5/2+)" → (2.5, +1)  # uncertain
+            "T=1"    → (None, None)  # isospin, no J^π
+
+        Args:
+            jpi_str: NUBASE spin-parity string
+
+        Returns:
+            Tuple of (spin, parity) where parity is +1 or -1, or (None, None) if unparseable
+        """
+        if not jpi_str or jpi_str == '':
+            return (None, None)
+
+        # Remove special markers: *, #, T=, parentheses, spaces
+        cleaned = jpi_str.replace('*', '').replace('#', '').replace('(', '').replace(')', '').strip()
+
+        # Skip isospin entries (T=...)
+        if 'T=' in cleaned or cleaned == '':
+            return (None, None)
+
+        # Determine parity
+        if '+' in cleaned:
+            parity = +1
+            cleaned = cleaned.replace('+', '')
+        elif '-' in cleaned:
+            parity = -1
+            cleaned = cleaned.replace('-', '')
+        else:
+            parity = None
+
+        # Parse spin
+        try:
+            if '/' in cleaned:
+                # Fractional spin like "1/2" or "3/2"
+                parts = cleaned.split('/')
+                if len(parts) == 2:
+                    spin = float(parts[0]) / float(parts[1])
+                else:
+                    spin = None
+            elif cleaned.replace('.', '').isdigit():
+                # Integer or decimal spin
+                spin = float(cleaned)
+            else:
+                spin = None
+        except (ValueError, ZeroDivisionError):
+            spin = None
+
+        return (spin, parity)
+
+    def _parse_half_life(self, halflife_str: str, unit_str: str) -> Optional[float]:
+        """
+        Parse half-life to seconds.
+
+        Args:
+            halflife_str: Half-life value string
+            unit_str: Unit string (ys, zs, as, ns, us, ms, s, m, h, d, y)
+
+        Returns:
+            Half-life in seconds, or None if stable/unparseable
+        """
+        # Handle special cases
+        if 'stbl' in halflife_str or 'stable' in halflife_str:
+            return np.inf  # Stable
+        if 'p-unst' in halflife_str:
+            return 0.0  # Particle unstable (essentially immediate)
+
+        # Parse numeric value
+        try:
+            # Remove '#' (systematic estimate marker)
+            value_str = halflife_str.replace('#', '').strip()
+            if not value_str:
+                return None
+            value = float(value_str)
+        except ValueError:
+            return None
+
+        # Convert to seconds based on unit
+        unit_conversions = {
+            'ys': 1e-24,  # yoctosecond
+            'zs': 1e-21,  # zeptosecond
+            'as': 1e-18,  # attosecond
+            'fs': 1e-15,  # femtosecond
+            'ps': 1e-12,  # picosecond
+            'ns': 1e-9,   # nanosecond
+            'us': 1e-6,   # microsecond
+            'ms': 1e-3,   # millisecond
+            's':  1.0,    # second
+            'm':  60.0,   # minute
+            'h':  3600.0, # hour
+            'd':  86400.0,  # day
+            'y':  31557600.0,  # year (365.25 days)
+            'ky': 31557600.0 * 1e3,  # kiloyear (1000 years)
+            'My': 31557600.0 * 1e6,  # megayear (1 million years)
+            'Gy': 31557600.0 * 1e9,  # gigayear (1 billion years)
+            'Ty': 31557600.0 * 1e12, # terayear (1 trillion years)
+            'Py': 31557600.0 * 1e15, # petayear (1 quadrillion years)
+            'Ey': 31557600.0 * 1e18, # exayear (1 quintillion years)
+        }
+
+        unit = unit_str.strip()
+        if unit in unit_conversions:
+            return value * unit_conversions[unit]
+        else:
+            return None
 
     def _merge_enrichment_table(self):
         """
