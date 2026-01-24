@@ -148,20 +148,23 @@ class FeatureGenerator:
     """
     Generate tier-based features for nuclear cross-section data.
 
-    **Pre-Enrichment Architecture:**
-    This class assumes the input DataFrame already contains AME2020/NUBASE2020
-    enrichment columns (loaded from pre-enriched Parquet). No file I/O or joins
-    are performed during feature generation.
+    **On-Demand Enrichment Architecture:**
+    AME2020/NUBASE2020 enrichment happens automatically in NucmlDataset when needed.
+    This class assumes the input DataFrame already contains AME enrichment columns
+    (merged by NucmlDataset based on requested tiers). No file I/O or joins are
+    performed during feature generation.
 
     **Usage:**
-    1. Ingest data with full enrichment: X4Ingestor(..., ame2020_dir='data/')
-    2. Load pre-enriched Parquet: pd.read_parquet('exfor_enriched.parquet')
+    1. Ingest lean EXFOR data: python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db
+    2. Load with tier selection: dataset = NucmlDataset('exfor_processed.parquet', selection=DataSelection(tiers=['C', 'D']))
+       → NucmlDataset automatically loads AME files and enriches self.df
     3. Generate tier features: FeatureGenerator().generate_features(df, tiers=['C', 'D'])
+       → AME columns already present in df, just compute derived features
 
-    **Backward Compatibility:**
-    For legacy code that still uses AME2020DataEnricher, the enricher parameter
-    is still supported (optional). However, the recommended approach is to use
-    pre-enriched Parquet data.
+    **Benefits:**
+    - Lean Parquet files (~10x smaller without AME duplication)
+    - AME loaded once per NucmlDataset instance (not duplicated in file)
+    - Flexible tier selection at runtime
     """
 
     def __init__(self, enricher=None):
@@ -169,13 +172,12 @@ class FeatureGenerator:
         Initialize feature generator.
 
         Args:
-            enricher: [LEGACY] Optional AME2020DataEnricher for on-demand enrichment.
-                     Not needed if using pre-enriched Parquet data (recommended).
+            enricher: [DEPRECATED] Optional AME2020DataEnricher for on-demand enrichment.
+                     No longer needed. NucmlDataset handles AME enrichment automatically.
         """
         self.enricher = enricher
         if enricher is not None:
-            logger.info("FeatureGenerator initialized with enricher (legacy mode)")
-            logger.info("Recommended: Use pre-enriched Parquet from X4Ingestor instead")
+            logger.warning("enricher parameter is deprecated. NucmlDataset handles AME enrichment automatically.")
 
     def generate_features(
         self,
@@ -186,33 +188,28 @@ class FeatureGenerator:
         """
         Generate tier-based features for a dataset.
 
-        **Pre-Enrichment Mode (Recommended):**
-        If df already contains AME2020/NUBASE2020 columns (from pre-enriched Parquet),
-        this method will compute derived features only (no file I/O, no joins).
-
-        **Legacy Enrichment Mode:**
-        If enricher was provided and df lacks AME2020 columns, will fall back to
-        on-demand enrichment (slower, requires file I/O).
+        **On-Demand Enrichment Mode:**
+        Assumes df already contains AME2020/NUBASE2020 columns (added by NucmlDataset).
+        This method only computes derived features - no file I/O or joins needed.
 
         Args:
             df: DataFrame with at minimum Z, A, Energy, MT columns
-                For Tiers B-E: Should contain AME2020/NUBASE2020 columns from Parquet
+                For Tiers B-E: Should contain AME2020/NUBASE2020 columns (added by NucmlDataset)
             tiers: List of tiers to include (e.g., ['A', 'B', 'C'])
             use_particle_emission: If True, use particle-emission vector instead of one-hot MT
 
         Returns:
             DataFrame with generated features
 
-        Example (Pre-Enriched):
-            >>> df = pd.read_parquet('exfor_enriched.parquet')  # Already has AME2020 columns
+        Example:
+            >>> # NucmlDataset automatically enriches based on requested tiers
+            >>> dataset = NucmlDataset(
+            ...     'exfor_processed.parquet',
+            ...     selection=DataSelection(tiers=['A', 'C', 'D'])
+            ... )
+            >>> # dataset.df already has AME columns merged in
             >>> gen = FeatureGenerator()
-            >>> features = gen.generate_features(df, tiers=['A', 'C', 'D'])
-
-        Example (Legacy):
-            >>> enricher = AME2020DataEnricher('data/')
-            >>> enricher.load_all()
-            >>> gen = FeatureGenerator(enricher=enricher)
-            >>> features = gen.generate_features(df, tiers=['C'])  # Will enrich on-demand
+            >>> features = gen.generate_features(dataset.df, tiers=['A', 'C', 'D'])
         """
         result = df.copy()
 
@@ -224,15 +221,15 @@ class FeatureGenerator:
         if 'B' in tiers:
             result = self._add_tier_b_features(result)
 
-        # Tier C: Energetics features (from AME2020 columns in Parquet)
+        # Tier C: Energetics features (from AME2020 columns added by NucmlDataset)
         if 'C' in tiers:
             result = self._add_tier_c_features(result)
 
-        # Tier D: Topological features (from NUBASE2020 columns in Parquet)
+        # Tier D: Topological features (from NUBASE2020 columns added by NucmlDataset)
         if 'D' in tiers:
             result = self._add_tier_d_features(result)
 
-        # Tier E: Complete Q-values (from AME2020 rct1/rct2 columns in Parquet)
+        # Tier E: Complete Q-values (from AME2020 rct1/rct2 columns added by NucmlDataset)
         if 'E' in tiers:
             result = self._add_tier_e_features(result)
 

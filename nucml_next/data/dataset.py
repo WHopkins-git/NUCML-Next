@@ -172,6 +172,10 @@ class NucmlDataset(TorchDataset):
         self.df = self._load_parquet_data(self.data_path, self.selection, self.filters, lazy_load)
         print(f"✓ Loaded {len(self.df):,} EXFOR data points from {self.data_path}")
 
+        # Apply on-demand AME enrichment if needed (based on requested tiers)
+        if self.selection and self.selection.tiers:
+            self._enrich_with_ame_if_needed(self.selection.tiers)
+
         # Initialize graph builder (only for graph mode) and tabular projector
         if self.mode == 'graph':
             # Lazy import GraphBuilder (requires torch)
@@ -441,6 +445,128 @@ class NucmlDataset(TorchDataset):
                 print(f"  Summary: {initial_rows:,} → {final_rows:,} ({100 * final_rows / initial_rows:.1f}% retained)\n")
 
         return df
+
+    def _enrich_with_ame_if_needed(self, tiers: List[str]) -> None:
+        """
+        Apply on-demand AME2020/NUBASE2020 enrichment if requested tiers require it.
+
+        Architecture: Lean Parquet + On-Demand Enrichment
+        --------------------------------------------------
+        Instead of pre-enriching during ingestion (which duplicates AME data for every
+        EXFOR measurement), we:
+        1. Load lean Parquet (EXFOR data only)
+        2. Check if requested tiers need AME data (B, C, D, or E)
+        3. Load AME files once from data/ directory
+        4. Merge AME data into self.df on (Z, A)
+
+        Benefits:
+        - Lean Parquet files (~10x smaller)
+        - Faster ingestion
+        - AME loaded once per dataset instance (not duplicated in file)
+        - Same enrichment capabilities
+
+        Args:
+            tiers: List of requested tiers (e.g., ['A', 'C', 'D'])
+        """
+        # Tier A only needs basic features (Z, A, N, Energy, MT) - no AME needed
+        needs_ame = any(tier in ['B', 'C', 'D', 'E'] for tier in tiers)
+
+        if not needs_ame:
+            return
+
+        # Check if already enriched (avoid double enrichment)
+        ame_indicator_columns = ['Mass_Excess_keV', 'Binding_Energy_keV', 'Spin', 'Q_alpha_keV']
+        already_enriched = any(col in self.df.columns for col in ame_indicator_columns)
+
+        if already_enriched:
+            print("  ℹ️  AME enrichment columns already present in Parquet")
+            return
+
+        # Load AME enricher from data/ directory
+        print(f"\n  Loading AME2020/NUBASE2020 data for tiers {tiers}...")
+
+        # Try to find AME files in common locations
+        from pathlib import Path
+        ame_search_paths = [
+            Path('data'),           # Current working directory/data
+            Path('../data'),        # Parent directory/data (notebooks)
+            Path(__file__).parent.parent.parent / 'data',  # Repository root/data
+        ]
+
+        ame_dir = None
+        for search_path in ame_search_paths:
+            if search_path.exists() and (search_path / 'mass_1.mas20.txt').exists():
+                ame_dir = str(search_path)
+                break
+
+        if ame_dir is None:
+            print("\n  ⚠️  WARNING: AME2020 files not found in common locations:")
+            for path in ame_search_paths:
+                print(f"      - {path.absolute()}")
+            print("\n  Continuing without AME enrichment. To enable:")
+            print("      1. Download: wget https://www-nds.iaea.org/amdc/ame2020/*.mas20.txt")
+            print("      2. Place *.mas20.txt files in data/ directory")
+            print("\n  Required files: mass_1.mas20.txt, rct1.mas20.txt, rct2_1.mas20.txt")
+            print("                  nubase_4.mas20.txt, covariance.mas20.txt\n")
+            return
+
+        # Load AME enricher
+        try:
+            from nucml_next.data.enrichment import AME2020DataEnricher
+
+            print(f"  Found AME files in: {ame_dir}")
+            enricher = AME2020DataEnricher(data_dir=ame_dir)
+
+            # Load only the files needed for requested tiers
+            tier_file_mapping = {
+                'B': ['mass'],           # Tier B: geometric (mass for radius calculation)
+                'C': ['mass', 'rct1'],   # Tier C: energetics
+                'D': ['nubase'],         # Tier D: topological
+                'E': ['rct1', 'rct2'],   # Tier E: Q-values
+            }
+
+            files_to_load = set()
+            for tier in tiers:
+                if tier in tier_file_mapping:
+                    files_to_load.update(tier_file_mapping[tier])
+
+            # Load required files
+            if 'mass' in files_to_load:
+                enricher.load_mass_file()
+            if 'rct1' in files_to_load:
+                enricher.load_rct1_file()
+            if 'rct2' in files_to_load:
+                enricher.load_rct2_file()
+            if 'nubase' in files_to_load:
+                enricher.load_nubase_file()
+
+            # Get enrichment table
+            enrichment_table = enricher.enrichment_table
+
+            if enrichment_table is None or len(enrichment_table) == 0:
+                print("  ⚠️  AME enrichment table is empty - skipping enrichment")
+                return
+
+            # Merge AME data into self.df (left join on Z, A)
+            print(f"  Merging AME data with EXFOR measurements...")
+            enrich_cols = [col for col in enrichment_table.columns if col not in ['N']]
+            enrichment_data = enrichment_table[enrich_cols].copy()
+
+            initial_cols = len(self.df.columns)
+            self.df = self.df.merge(enrichment_data, on=['Z', 'A'], how='left')
+            added_cols = len(self.df.columns) - initial_cols
+
+            # Report coverage
+            n_enriched = self.df['Mass_Excess_keV'].notna().sum() if 'Mass_Excess_keV' in self.df.columns else 0
+            coverage = 100 * n_enriched / len(self.df) if len(self.df) > 0 else 0
+
+            print(f"  ✓ Added {added_cols} AME enrichment columns")
+            print(f"  ✓ Coverage: {n_enriched:,} / {len(self.df):,} ({coverage:.1f}%) measurements enriched\n")
+
+        except Exception as e:
+            print(f"\n  ⚠️  WARNING: Failed to load AME enrichment: {e}")
+            print("      Continuing without AME enrichment\n")
+            return
 
     @staticmethod
     def _build_filters(filters: Dict[str, List]) -> Optional[List]:
