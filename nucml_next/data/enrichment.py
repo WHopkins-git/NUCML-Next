@@ -188,13 +188,20 @@ class AME2020DataEnricher:
         Returns:
             DataFrame with Z, A, N, Mass_Excess_keV, Binding_Energy_keV, Binding_Per_Nucleon_keV
         """
-        filepath = self.data_dir / 'mass_1.mas20.txt'
+        # Try cleaned version first, fall back to original
+        filepath_clean = self.data_dir / 'mass_1_clean.mas20.txt'
+        filepath_orig = self.data_dir / 'mass_1.mas20.txt'
 
-        if not filepath.exists():
-            logger.warning(f"mass_1.mas20.txt not found at {filepath}")
+        if filepath_clean.exists():
+            filepath = filepath_clean
+            logger.info("Loading mass_1_clean.mas20.txt...")
+        elif filepath_orig.exists():
+            filepath = filepath_orig
+            logger.info("Loading mass_1.mas20.txt...")
+        else:
+            logger.warning(f"mass_1.mas20.txt not found at {filepath_orig}")
             return None
 
-        logger.info("Loading mass_1.mas20.txt...")
         records = []
 
         with open(filepath, 'r') as f:
@@ -244,13 +251,15 @@ class AME2020DataEnricher:
                     A = int(a_str)
 
                     # Extract mass excess (cols 29-42)
-                    mass_excess_str = line[28:42].strip().replace('#', '').replace('*', '')
+                    # NOTE: '#' in AME files indicates estimated (non-experimental) decimal point
+                    # e.g., "12345#67" means "12345.67" (estimated), so we replace '#' with '.'
+                    mass_excess_str = line[28:42].strip().replace('#', '.').replace('*', '')
                     if not mass_excess_str:
                         continue
                     mass_excess = float(mass_excess_str)
 
                     # Extract binding energy (cols 55-67)
-                    binding_str = line[54:67].strip().replace('#', '').replace('*', '')
+                    binding_str = line[54:67].strip().replace('#', '.').replace('*', '')
                     if binding_str:
                         binding = float(binding_str)
                     else:
@@ -287,13 +296,20 @@ class AME2020DataEnricher:
         Returns:
             DataFrame with Z, A, and above columns
         """
-        filepath = self.data_dir / 'rct1.mas20.txt'
+        # Try cleaned version first, fall back to original
+        filepath_clean = self.data_dir / 'rct1_clean.mas20.txt'
+        filepath_orig = self.data_dir / 'rct1.mas20.txt'
 
-        if not filepath.exists():
-            logger.warning(f"rct1.mas20.txt not found at {filepath}")
+        if filepath_clean.exists():
+            filepath = filepath_clean
+            logger.info("Loading rct1_clean.mas20.txt...")
+        elif filepath_orig.exists():
+            filepath = filepath_orig
+            logger.info("Loading rct1.mas20.txt...")
+        else:
+            logger.warning(f"rct1.mas20.txt not found at {filepath_orig}")
             return None
 
-        logger.info("Loading rct1.mas20.txt...")
         records = []
 
         with open(filepath, 'r') as f:
@@ -343,13 +359,14 @@ class AME2020DataEnricher:
 
                     # Parse 6 reaction energy values
                     # Each pair: value (12 chars) + uncertainty (10 chars) = 22 chars total
+                    # NOTE: '#' in AME files indicates estimated decimal point
                     values = []
                     pos = 12  # Start after Z field and space (0-indexed)
                     for i in range(6):
                         if pos + 12 > len(line):
                             values.append(np.nan)
                         else:
-                            val_str = line[pos:pos+12].strip().replace('#', '').replace('*', '')
+                            val_str = line[pos:pos+12].strip().replace('#', '.').replace('*', '')
                             if val_str:
                                 try:
                                     values.append(float(val_str))
@@ -392,13 +409,20 @@ class AME2020DataEnricher:
         Returns:
             DataFrame with Z, A, and above columns
         """
-        filepath = self.data_dir / 'rct2_1.mas20.txt'
+        # Try cleaned version first, fall back to original
+        filepath_clean = self.data_dir / 'rct2_1_clean.mas20.txt'
+        filepath_orig = self.data_dir / 'rct2_1.mas20.txt'
 
-        if not filepath.exists():
-            logger.warning(f"rct2_1.mas20.txt not found at {filepath}")
+        if filepath_clean.exists():
+            filepath = filepath_clean
+            logger.info("Loading rct2_1_clean.mas20.txt...")
+        elif filepath_orig.exists():
+            filepath = filepath_orig
+            logger.info("Loading rct2_1.mas20.txt...")
+        else:
+            logger.warning(f"rct2_1.mas20.txt not found at {filepath_orig}")
             return None
 
-        logger.info("Loading rct2_1.mas20.txt...")
         records = []
 
         with open(filepath, 'r') as f:
@@ -436,13 +460,14 @@ class AME2020DataEnricher:
                     Z = int(z_str)
 
                     # Parse 6 reaction energy values
+                    # NOTE: '#' in AME files indicates estimated decimal point
                     values = []
                     pos = 12  # Start after Z field and space
                     for i in range(6):
                         if pos + 12 > len(line):
                             values.append(np.nan)
                         else:
-                            val_str = line[pos:pos+12].strip().replace('#', '').replace('*', '')
+                            val_str = line[pos:pos+12].strip().replace('#', '.').replace('*', '')
                             if val_str:
                                 try:
                                     values.append(float(val_str))
@@ -484,13 +509,20 @@ class AME2020DataEnricher:
         Returns:
             DataFrame with Z, A, and above columns
         """
-        filepath = self.data_dir / 'nubase_4.mas20.txt'
+        # Try cleaned version first, fall back to original
+        filepath_clean = self.data_dir / 'nubase_4_clean.mas20.txt'
+        filepath_orig = self.data_dir / 'nubase_4.mas20.txt'
 
-        if not filepath.exists():
+        if filepath_clean.exists():
+            filepath = filepath_clean
+            logger.info("Loading nubase_4_clean.mas20.txt...")
+        elif filepath_orig.exists():
+            filepath = filepath_orig
+            logger.info("Loading nubase_4.mas20.txt...")
+        else:
             logger.warning(f"nubase_4.mas20.txt not found - Tier D features unavailable")
             return None
 
-        logger.info("Loading nubase_4.mas20.txt...")
         records = []
 
         with open(filepath, 'r') as f:

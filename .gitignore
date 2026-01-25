@@ -38,6 +38,9 @@ data/*.db
 data/AME2020/
 data/EXFOR*/
 
+# Generated AME cleaned files (can be regenerated with scripts/clean_ame_files.py)
+data/*_clean.mas20.txt
+
 # Testing
 .pytest_cache/
 .tox/
