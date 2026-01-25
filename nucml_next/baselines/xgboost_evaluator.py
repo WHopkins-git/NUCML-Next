@@ -1,25 +1,26 @@
 """
-XGBoost Evaluator
-=================
+XGBoost Evaluator - Research Baseline
+======================================
 
-Enhanced baseline using gradient boosting.
+Production-grade XGBoost baseline with full pipeline integration.
 
-Compared to Decision Trees:
-    - Better accuracy (ensemble of trees)
-    - Still exhibits staircase effect (milder)
-    - Still poor extrapolation
-    - Can't learn smooth resonance curves
+Features:
+- TransformationPipeline integration with configurable scalers
+- Automatic particle emission vector handling (MT codes → 9 features)
+- Hyperparameter optimization via Bayesian optimization
+- GPU support and early stopping
+- Robust handling of AME-enriched data
 
 Educational Purpose:
-    Show that even state-of-the-art classical ML can't match
-    physics-informed deep learning for smooth predictions.
+    Shows that gradient boosting is smoother than decision trees but
+    still can't match physics-informed deep learning for smooth predictions.
 """
 
-from typing import Dict, Any, Optional, Tuple, Callable
+from typing import Dict, Any, Optional
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split, cross_val_score
-from sklearn.metrics import mean_squared_error, mean_absolute_error
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 import xgboost as xgb
 import joblib
 
@@ -29,15 +30,31 @@ try:
 except ImportError:
     HYPEROPT_AVAILABLE = False
 
+from nucml_next.data.transformations import TransformationPipeline
+from nucml_next.data.selection import TransformationConfig
+
 
 class XGBoostEvaluator:
     """
-    XGBoost baseline for cross-section prediction.
+    XGBoost baseline for nuclear cross-section prediction.
 
-    Better than Decision Trees but still fundamentally limited:
-    - Ensemble smooths out some steps
-    - Feature importance reveals physics insights
-    - But still can't guarantee smoothness or physical constraints
+    Integrates with NUCML-Next TransformationPipeline for:
+    - Configurable log transforms (log₁₀, ln, log₂)
+    - Multiple scaler types (standard, minmax, robust, none)
+    - Automatic particle emission vector handling (MT → 9 features)
+    - Reversible transformations for predictions
+
+    Example:
+        >>> from nucml_next.data import NucmlDataset, DataSelection
+        >>>
+        >>> # Load data with optimal configuration
+        >>> selection = DataSelection(tiers=['A', 'B', 'C', 'D'])
+        >>> dataset = NucmlDataset('data.parquet', selection=selection)
+        >>> df = dataset.to_tabular(mode='tier')  # MT codes → particle vectors
+        >>>
+        >>> # Train with automatic transformation
+        >>> evaluator = XGBoostEvaluator()
+        >>> metrics = evaluator.train(df, pipeline=dataset.get_transformation_pipeline())
     """
 
     def __init__(
@@ -62,10 +79,10 @@ class XGBoostEvaluator:
             learning_rate: Learning rate (eta)
             subsample: Subsample ratio of training instances
             colsample_bytree: Subsample ratio of features
-            gamma: Minimum loss reduction for split (regularization)
-            reg_alpha: L1 regularization term on weights
-            reg_lambda: L2 regularization term on weights
-            min_child_weight: Minimum sum of instance weight needed in child
+            gamma: Minimum loss reduction for split
+            reg_alpha: L1 regularization
+            reg_lambda: L2 regularization
+            min_child_weight: Minimum sum of instance weight in child
             random_state: Random seed
         """
         self.params = {
@@ -80,57 +97,49 @@ class XGBoostEvaluator:
             'min_child_weight': min_child_weight,
             'random_state': random_state,
             'objective': 'reg:squarederror',
-            'tree_method': 'hist',  # Fast histogram-based method
+            'tree_method': 'hist',
         }
 
         self.model = xgb.XGBRegressor(**self.params)
         self.is_trained = False
         self.feature_columns = None
+        self.pipeline = None
         self.metrics = {}
 
     def optimize_hyperparameters(
         self,
         df: pd.DataFrame,
         target_column: str = 'CrossSection',
+        energy_column: str = 'Energy',
         exclude_columns: Optional[list] = None,
+        pipeline: Optional[TransformationPipeline] = None,
+        transformation_config: Optional[TransformationConfig] = None,
         max_evals: int = 100,
         cv_folds: int = 3,
         test_size: float = 0.2,
         verbose: bool = True,
     ) -> Dict[str, Any]:
         """
-        Optimize hyperparameters using Bayesian optimization (hyperopt).
-
-        This finds the optimal n_estimators, max_depth, learning_rate, and other
-        XGBoost parameters for the given dataset.
+        Optimize hyperparameters using Bayesian optimization.
 
         Args:
             df: Training data (from NucmlDataset.to_tabular())
-            target_column: Name of target column
+            target_column: Target column name
+            energy_column: Energy column name
             exclude_columns: Columns to exclude from features
-            max_evals: Maximum number of hyperparameter evaluations
-            cv_folds: Number of cross-validation folds
-            test_size: Fraction of data for final test set
-            verbose: Print optimization progress
+            pipeline: Pre-configured TransformationPipeline (recommended)
+            transformation_config: Config for new pipeline (if pipeline=None)
+            max_evals: Maximum optimization iterations
+            cv_folds: Cross-validation folds
+            test_size: Test set fraction
+            verbose: Print progress
 
         Returns:
-            Dictionary with:
-                - best_params: Optimized hyperparameters
-                - best_score: Best cross-validation score
-                - trials: Hyperopt trials object for analysis
-
-        Example:
-            >>> xgb_model = XGBoostEvaluator()
-            >>> result = xgb_model.optimize_hyperparameters(df_train, max_evals=50)
-            >>> print(f"Optimal trees: {result['best_params']['n_estimators']}")
-            >>> # Now create new model with optimal params
-            >>> xgb_optimal = XGBoostEvaluator(**result['best_params'])
-            >>> xgb_optimal.train(df_train)
+            Dictionary with best_params, best_cv_score, test_mse, trials
         """
         if not HYPEROPT_AVAILABLE:
             raise ImportError(
-                "hyperopt is required for hyperparameter optimization.\n"
-                "Install with: pip install hyperopt"
+                "hyperopt required for optimization. Install: pip install hyperopt"
             )
 
         if verbose:
@@ -142,40 +151,60 @@ class XGBoostEvaluator:
             print(f"Cross-validation folds: {cv_folds}")
             print()
 
-        # Prepare features and target
+        # Prepare features
         if exclude_columns is None:
-            exclude_columns = [target_column, 'Isotope', 'Reaction']
+            exclude_columns = [target_column, 'Uncertainty', 'Entry', 'MT']
 
-        numeric_columns = df.select_dtypes(include=[np.number, pd.SparseDtype]).columns
-        feature_columns = [col for col in numeric_columns if col not in exclude_columns]
+        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        sparse_cols = [col for col in df.columns if isinstance(df[col].dtype, pd.SparseDtype)]
+        all_numeric = list(set(numeric_cols + sparse_cols))
+        feature_columns = [col for col in all_numeric if col not in exclude_columns]
 
-        # Handle sparse DataFrames
-        X_df = df[feature_columns]
-        sparse_columns = [col for col in X_df.columns if isinstance(X_df[col].dtype, pd.SparseDtype)]
+        if energy_column in feature_columns:
+            feature_columns.remove(energy_column)
 
-        if len(sparse_columns) > 0:
-            import scipy.sparse as sp
-            try:
-                if len(sparse_columns) == len(X_df.columns):
-                    X = sp.csr_matrix(X_df.sparse.to_coo())
-                else:
-                    X = X_df.values
-            except (AttributeError, ValueError):
-                X = X_df.values
-        else:
-            X = X_df.values
+        non_numeric = [col for col in df.columns if col not in all_numeric and col not in exclude_columns]
+        if len(non_numeric) > 0 and verbose:
+            print(f"⚠️  Excluding {len(non_numeric)} non-numeric columns:")
+            for col in non_numeric[:5]:
+                print(f"    - {col} (dtype: {df[col].dtype})")
+            if len(non_numeric) > 5:
+                print(f"    ... and {len(non_numeric) - 5} more")
+            print()
 
-        y = df[target_column].values
+        X_features = df[feature_columns]
+        y = df[target_column]
+        energy = df[energy_column] if energy_column in df.columns else None
 
-        # Log-transform target
-        y_log = np.log10(y + 1e-10)
+        # Create or use pipeline
+        if pipeline is None:
+            if transformation_config is None:
+                transformation_config = TransformationConfig()
+            pipeline = TransformationPipeline(config=transformation_config)
+            pipeline.fit(X_features, y, energy, feature_columns=feature_columns)
 
-        # Split into train/test
+        # Transform data
+        X_transformed = pipeline.transform(X_features, energy)
+        y_transformed = pipeline.transform_target(y)
+
+        # Handle inf/NaN
+        X_arr = X_transformed[feature_columns].values
+        y_arr = y_transformed.values
+
+        finite_mask = np.isfinite(X_arr).all(axis=1) & np.isfinite(y_arr)
+        if not finite_mask.all():
+            n_invalid = (~finite_mask).sum()
+            if verbose:
+                print(f"⚠️  Removing {n_invalid:,} rows with inf/NaN ({n_invalid/len(X_arr)*100:.2f}%)")
+            X_arr = X_arr[finite_mask]
+            y_arr = y_arr[finite_mask]
+
+        # Split data
         X_train, X_test, y_train, y_test = train_test_split(
-            X, y_log, test_size=test_size, random_state=42
+            X_arr, y_arr, test_size=test_size, random_state=42
         )
 
-        # Define hyperparameter search space
+        # Hyperparameter search space
         space = {
             'n_estimators': hp.quniform('n_estimators', 50, 500, 50),
             'max_depth': hp.quniform('max_depth', 3, 15, 1),
@@ -188,14 +217,11 @@ class XGBoostEvaluator:
             'min_child_weight': hp.quniform('min_child_weight', 1, 10, 1),
         }
 
-        # Define objective function for hyperopt
         def objective(params):
-            # Convert float hyperparameters to int where needed
             params['n_estimators'] = int(params['n_estimators'])
             params['max_depth'] = int(params['max_depth'])
             params['min_child_weight'] = int(params['min_child_weight'])
 
-            # Create model with these hyperparameters
             model = xgb.XGBRegressor(
                 n_estimators=params['n_estimators'],
                 max_depth=params['max_depth'],
@@ -213,7 +239,6 @@ class XGBoostEvaluator:
                 verbosity=0,
             )
 
-            # Cross-validation score (negative MSE, since hyperopt minimizes)
             cv_scores = cross_val_score(
                 model, X_train, y_train,
                 cv=cv_folds,
@@ -221,16 +246,9 @@ class XGBoostEvaluator:
                 n_jobs=1  # XGBoost already uses n_jobs=-1
             )
 
-            # Return mean CV score
-            mean_cv_score = -cv_scores.mean()
+            return {'loss': -cv_scores.mean(), 'status': STATUS_OK, 'params': params}
 
-            return {
-                'loss': mean_cv_score,
-                'status': STATUS_OK,
-                'params': params,
-            }
-
-        # Run Bayesian optimization
+        # Run optimization
         trials = Trials()
         if verbose:
             print("Starting Bayesian optimization...")
@@ -246,18 +264,13 @@ class XGBoostEvaluator:
             rstate=np.random.default_rng(42),
         )
 
-        # Convert best parameters to correct types
         best_params = space_eval(space, best)
         best_params['n_estimators'] = int(best_params['n_estimators'])
         best_params['max_depth'] = int(best_params['max_depth'])
         best_params['min_child_weight'] = int(best_params['min_child_weight'])
         best_params['random_state'] = 42
 
-        # Get best score from trials
-        best_trial = trials.best_trial
-        best_cv_score = -best_trial['result']['loss']
-
-        # Train final model with best params and evaluate on test set
+        # Evaluate on test set
         final_model = xgb.XGBRegressor(
             **best_params,
             objective='reg:squarederror',
@@ -268,17 +281,23 @@ class XGBoostEvaluator:
         final_model.fit(X_train, y_train, verbose=False)
         y_test_pred = final_model.predict(X_test)
 
-        # Convert from log space
-        y_test_pred = 10 ** y_test_pred
-        y_test_orig = 10 ** y_test
+        # Inverse transform if using log
+        if pipeline.config.log_target:
+            y_test_pred = pipeline.inverse_transform_target(pd.Series(y_test_pred)).values
+            y_test_orig = pipeline.inverse_transform_target(pd.Series(y_test)).values
+        else:
+            y_test_pred = y_test_pred
+            y_test_orig = y_test
+
         test_mse = mean_squared_error(y_test_orig, y_test_pred)
+        best_cv_score = -trials.best_trial['result']['loss']
 
         if verbose:
             print("\n" + "=" * 80)
             print("OPTIMIZATION COMPLETE")
             print("=" * 80)
-            print(f"Best cross-validation MSE (log): {best_cv_score:.6f}")
-            print(f"Test set MSE (original): {test_mse:.4e}")
+            print(f"Best CV MSE (transformed space): {best_cv_score:.6f}")
+            print(f"Test MSE (original space): {test_mse:.4e}")
             print()
             print("Optimal Hyperparameters:")
             for key, value in best_params.items():
@@ -300,77 +319,80 @@ class XGBoostEvaluator:
         self,
         df: pd.DataFrame,
         target_column: str = 'CrossSection',
+        energy_column: str = 'Energy',
         test_size: float = 0.2,
         exclude_columns: Optional[list] = None,
+        pipeline: Optional[TransformationPipeline] = None,
+        transformation_config: Optional[TransformationConfig] = None,
         early_stopping_rounds: Optional[int] = 10,
     ) -> Dict[str, float]:
         """
-        Train the XGBoost model.
+        Train the XGBoost model with full pipeline integration.
 
         Args:
-            df: Training data (from NucmlDataset.to_tabular())
-            target_column: Name of target column
-            test_size: Fraction of data for testing
-            exclude_columns: Columns to exclude from features
-            early_stopping_rounds: Enable early stopping
+            df: Training data with particle emission vectors (from to_tabular())
+            target_column: Target column name
+            energy_column: Energy column name
+            test_size: Test set fraction
+            exclude_columns: Columns to exclude
+            pipeline: Pre-configured pipeline (recommended)
+            transformation_config: Config for new pipeline (if pipeline=None)
+            early_stopping_rounds: Early stopping rounds (None to disable)
 
         Returns:
-            Dictionary of training metrics
+            Training metrics dictionary
         """
-        # Prepare features and target
+        # Prepare features
         if exclude_columns is None:
-            exclude_columns = [target_column, 'Isotope', 'Reaction']
+            exclude_columns = [target_column, 'Uncertainty', 'Entry', 'MT']
 
-        # Filter out non-numeric columns (includes pandas sparse arrays)
-        numeric_columns = df.select_dtypes(include=[np.number, pd.SparseDtype]).columns
-        self.feature_columns = [
-            col for col in numeric_columns
-            if col not in exclude_columns
-        ]
+        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        sparse_cols = [col for col in df.columns if isinstance(df[col].dtype, pd.SparseDtype)]
+        all_numeric = list(set(numeric_cols + sparse_cols))
+        self.feature_columns = [col for col in all_numeric if col not in exclude_columns]
 
-        # Handle sparse DataFrames efficiently (avoid memory explosion)
-        X_df = df[self.feature_columns]
+        if energy_column in self.feature_columns:
+            self.feature_columns.remove(energy_column)
 
-        # Check if DataFrame contains sparse arrays
-        sparse_columns = [col for col in X_df.columns if isinstance(X_df[col].dtype, pd.SparseDtype)]
+        X_features = df[self.feature_columns]
+        y = df[target_column]
+        energy = df[energy_column] if energy_column in df.columns else None
 
-        if len(sparse_columns) > 0:
-            # Convert to scipy sparse matrix (memory efficient)
-            import scipy.sparse as sp
+        # Create or use pipeline
+        if pipeline is None:
+            if transformation_config is None:
+                transformation_config = TransformationConfig()
+            pipeline = TransformationPipeline(config=transformation_config)
+            pipeline.fit(X_features, y, energy, feature_columns=self.feature_columns)
 
-            try:
-                # Try to convert sparse columns to scipy sparse matrix
-                if len(sparse_columns) == len(X_df.columns):
-                    # All columns are sparse - use sparse accessor
-                    X = sp.csr_matrix(X_df.sparse.to_coo())
-                    print(f"  → Using sparse matrix format (memory efficient)")
-                else:
-                    # Mixed sparse/dense - convert to dense
-                    print(f"  → Converting {len(sparse_columns)} sparse columns to dense (mixed DataFrame)")
-                    X = X_df.values
-            except (AttributeError, ValueError) as e:
-                # Fallback to dense if sparse conversion fails
-                print(f"  → Sparse conversion failed, using dense format")
-                X = X_df.values
-        else:
-            X = X_df.values
+        self.pipeline = pipeline
 
-        y = df[target_column].values
+        # Transform data
+        X_transformed = pipeline.transform(X_features, energy)
+        y_transformed = pipeline.transform_target(y)
 
-        # Log-transform target for better numerical stability
-        y_log = np.log10(y + 1e-10)
+        # Extract arrays
+        X_arr = X_transformed[self.feature_columns].values
+        y_arr = y_transformed.values
+
+        # Handle inf/NaN
+        finite_mask = np.isfinite(X_arr).all(axis=1) & np.isfinite(y_arr)
+        if not finite_mask.all():
+            n_invalid = (~finite_mask).sum()
+            print(f"  ⚠️  Removing {n_invalid:,} rows with inf/NaN ({n_invalid/len(X_arr)*100:.2f}%)")
+            X_arr = X_arr[finite_mask]
+            y_arr = y_arr[finite_mask]
 
         # Split data
         X_train, X_test, y_train, y_test = train_test_split(
-            X, y_log, test_size=test_size, random_state=self.params['random_state']
+            X_arr, y_arr, test_size=test_size, random_state=self.params['random_state']
         )
 
-        # Train model with optional early stopping
+        # Train model
         print(f"Training XGBoost ({self.params['n_estimators']} trees, "
               f"max_depth={self.params['max_depth']})...")
 
         eval_set = [(X_test, y_test)]
-
         self.model.fit(
             X_train,
             y_train,
@@ -378,26 +400,27 @@ class XGBoostEvaluator:
             verbose=False,
         )
 
-        # Evaluate
+        # Predictions
         y_train_pred = self.model.predict(X_train)
         y_test_pred = self.model.predict(X_test)
 
-        # Convert back from log space
-        y_train_pred = 10 ** y_train_pred
-        y_test_pred = 10 ** y_test_pred
-        y_train_orig = 10 ** y_train
-        y_test_orig = 10 ** y_test
+        # Inverse transform if using log
+        if self.pipeline.config.log_target:
+            y_train_pred = self.pipeline.inverse_transform_target(pd.Series(y_train_pred)).values
+            y_test_pred = self.pipeline.inverse_transform_target(pd.Series(y_test_pred)).values
+            y_train_orig = self.pipeline.inverse_transform_target(pd.Series(y_train)).values
+            y_test_orig = self.pipeline.inverse_transform_target(pd.Series(y_test)).values
+        else:
+            y_train_orig = y_train
+            y_test_orig = y_test
 
+        # Metrics
         train_mse = mean_squared_error(y_train_orig, y_train_pred)
         test_mse = mean_squared_error(y_test_orig, y_test_pred)
         train_mae = mean_absolute_error(y_train_orig, y_train_pred)
         test_mae = mean_absolute_error(y_test_orig, y_test_pred)
-
-        # Calculate R² score
-        train_r2 = 1 - (np.sum((y_train_orig - y_train_pred) ** 2) /
-                        np.sum((y_train_orig - y_train_orig.mean()) ** 2))
-        test_r2 = 1 - (np.sum((y_test_orig - y_test_pred) ** 2) /
-                       np.sum((y_test_orig - y_test_orig.mean()) ** 2))
+        train_r2 = r2_score(y_train_orig, y_train_pred)
+        test_r2 = r2_score(y_test_orig, y_test_pred)
 
         self.metrics = {
             'train_mse': train_mse,
@@ -418,64 +441,59 @@ class XGBoostEvaluator:
 
         return self.metrics
 
-    def predict(self, df: pd.DataFrame) -> np.ndarray:
+    def predict(self, df: pd.DataFrame, energy_column: str = 'Energy') -> np.ndarray:
         """
-        Make predictions on new data.
+        Predict cross-sections with automatic transformation.
 
         Args:
-            df: Input features (same format as training)
+            df: Input features (must match training format)
+            energy_column: Energy column name
 
         Returns:
-            Predicted cross sections
+            Predicted cross-sections in original scale
         """
-        if not self.is_trained:
+        if not self.is_trained or self.pipeline is None:
             raise RuntimeError("Model must be trained before prediction")
 
-        # Handle sparse DataFrames efficiently
-        X_df = df[self.feature_columns]
-        is_sparse = any(isinstance(dtype, pd.SparseDtype) for dtype in X_df.dtypes)
+        X_features = df[self.feature_columns]
+        energy = df[energy_column] if energy_column in df.columns else None
 
-        if is_sparse:
-            # Convert to scipy sparse matrix
-            import scipy.sparse as sp
-            X = sp.csr_matrix(X_df.sparse.to_coo())
+        # Transform
+        X_transformed = self.pipeline.transform(X_features, energy)
+        X_arr = X_transformed[self.feature_columns].values
+
+        # Predict in transformed space
+        y_pred_transformed = self.model.predict(X_arr)
+
+        # Inverse transform
+        if self.pipeline.config.log_target:
+            y_pred = self.pipeline.inverse_transform_target(pd.Series(y_pred_transformed)).values
         else:
-            X = X_df.values
-
-        y_pred_log = self.model.predict(X)
-        y_pred = 10 ** y_pred_log
+            y_pred = y_pred_transformed
 
         return y_pred
 
     def get_feature_importance(self, importance_type: str = 'gain') -> pd.DataFrame:
         """
-        Get feature importance from the trained model.
+        Get feature importance scores.
 
         Args:
             importance_type: 'gain', 'weight', or 'cover'
-                - gain: Average gain across all splits (recommended)
-                - weight: Number of times feature is used
-                - cover: Average coverage of splits
 
         Returns:
-            DataFrame with feature importances
+            DataFrame with features and importance scores
 
-        Educational Note:
-            Compare this with physics intuition:
-            - Energy should be highly important
-            - Q-value and threshold should matter for physics mode
-            - If Z/A dominate, model is just memorizing isotopes!
+        Note:
+            Particle emission features (out_n, out_p, etc.) will appear
+            instead of raw MT codes, showing physics-informed encoding.
         """
         if not self.is_trained:
             raise RuntimeError("Model must be trained first")
 
-        # Get importance scores
         importance_dict = self.model.get_booster().get_score(importance_type=importance_type)
 
-        # Map to feature names
         feature_importance = []
         for i, feat_name in enumerate(self.feature_columns):
-            # XGBoost uses 'f0', 'f1', ... as feature names internally
             xgb_feat_name = f'f{i}'
             importance = importance_dict.get(xgb_feat_name, 0.0)
             feature_importance.append({'Feature': feat_name, 'Importance': importance})
@@ -484,80 +502,14 @@ class XGBoostEvaluator:
 
         return df_importance
 
-    def predict_resonance_region(
-        self,
-        Z: int,
-        A: int,
-        mt_code: int,
-        energy_range: Tuple[float, float],
-        num_points: int = 1000,
-        mode: str = 'naive',
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Predict cross section in a resonance region.
-
-        Shows that XGBoost is smoother than Decision Tree
-        but still not physics-compliant.
-
-        Args:
-            Z: Atomic number
-            A: Mass number
-            mt_code: Reaction type
-            energy_range: (E_min, E_max) in eV
-            num_points: Number of energy points
-            mode: Feature mode ('naive' or 'physics')
-
-        Returns:
-            (energies, predictions)
-        """
-        energies = np.linspace(energy_range[0], energy_range[1], num_points)
-
-        # Build feature matrix
-        if mode == 'naive':
-            # One-hot encoding
-            features = []
-            for energy in energies:
-                feat_dict = {'Z': Z, 'A': A, 'Energy': energy}
-                # Add MT one-hot
-                for mt in [2, 16, 18, 102]:
-                    feat_dict[f'MT_{mt}'] = 1.0 if mt == mt_code else 0.0
-                features.append(feat_dict)
-            df = pd.DataFrame(features)
-
-        else:  # physics mode
-            features = []
-            for energy in energies:
-                feat_dict = {
-                    'Z': Z,
-                    'A': A,
-                    'N': A - Z,
-                    'Energy': np.log10(energy + 1.0),
-                    'Q_Value': 0.0,
-                    'Threshold': 0.0,
-                    'Delta_Z': 0,
-                    'Delta_A': 0,
-                    'MT': mt_code / 100.0,
-                }
-                features.append(feat_dict)
-            df = pd.DataFrame(features)
-
-        # Ensure all training features are present
-        for col in self.feature_columns:
-            if col not in df.columns:
-                df[col] = 0.0
-
-        # Predict
-        predictions = self.predict(df)
-
-        return energies, predictions
-
     def save(self, filepath: str) -> None:
-        """Save model to disk."""
+        """Save model and pipeline to disk."""
         if not self.is_trained:
             raise RuntimeError("Cannot save untrained model")
 
         model_data = {
             'model': self.model,
+            'pipeline': self.pipeline,
             'feature_columns': self.feature_columns,
             'metrics': self.metrics,
             'params': self.params,
@@ -566,59 +518,12 @@ class XGBoostEvaluator:
         print(f"✓ Model saved to {filepath}")
 
     def load(self, filepath: str) -> None:
-        """Load model from disk."""
+        """Load model and pipeline from disk."""
         model_data = joblib.load(filepath)
         self.model = model_data['model']
+        self.pipeline = model_data['pipeline']
         self.feature_columns = model_data['feature_columns']
         self.metrics = model_data['metrics']
         self.params = model_data['params']
         self.is_trained = True
         print(f"✓ Model loaded from {filepath}")
-
-    def analyze_predictions(
-        self,
-        df: pd.DataFrame,
-        target_column: str = 'CrossSection',
-    ) -> Dict[str, Any]:
-        """
-        Analyze prediction quality across different regimes.
-
-        Args:
-            df: Test data with ground truth
-            target_column: Name of target column
-
-        Returns:
-            Dictionary with analysis results
-
-        Educational Analysis:
-            - Low energy (thermal): XGBoost usually good
-            - Resonance region: May show artifacts
-            - High energy (fast): Extrapolation poor
-        """
-        predictions = self.predict(df)
-        y_true = df[target_column].values
-
-        # Split into energy regimes
-        thermal_mask = df['Energy'] < 1.0  # < 1 eV
-        resonance_mask = (df['Energy'] >= 1.0) & (df['Energy'] < 1e3)  # 1 eV - 1 keV
-        fast_mask = df['Energy'] >= 1e3  # > 1 keV
-
-        analysis = {}
-
-        for name, mask in [('thermal', thermal_mask), ('resonance', resonance_mask), ('fast', fast_mask)]:
-            if mask.sum() > 0:
-                y_true_regime = y_true[mask]
-                y_pred_regime = predictions[mask]
-
-                mse = mean_squared_error(y_true_regime, y_pred_regime)
-                mae = mean_absolute_error(y_true_regime, y_pred_regime)
-                max_error = np.max(np.abs(y_true_regime - y_pred_regime))
-
-                analysis[name] = {
-                    'mse': mse,
-                    'mae': mae,
-                    'max_error': max_error,
-                    'num_points': mask.sum(),
-                }
-
-        return analysis
