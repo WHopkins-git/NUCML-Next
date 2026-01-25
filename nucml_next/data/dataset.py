@@ -10,11 +10,14 @@ This solves the data engineering challenge: one Parquet file, multiple views.
 """
 
 from typing import Optional, Literal, List, Dict, Any
+import logging
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 # Optional PyTorch imports (only required for graph mode)
 try:
@@ -32,6 +35,7 @@ except ImportError:
 # from nucml_next.data.graph_builder import GraphBuilder  # Moved to lazy import in __init__
 from nucml_next.data.tabular_projector import TabularProjector
 from nucml_next.data.selection import DataSelection, default_selection
+from nucml_next.data.transformations import TransformationPipeline
 
 
 class NucmlDataset(TorchDataset):
@@ -840,3 +844,196 @@ class NucmlDataset(TorchDataset):
             })
 
         return stats
+
+    def get_transformation_pipeline(
+        self,
+        feature_columns: Optional[List[str]] = None,
+        auto_detect_tiers: bool = True
+    ) -> TransformationPipeline:
+        """
+        Create and fit a transformation pipeline for ML training.
+
+        Implements reversible transformations:
+        1. Log-scaling for cross-sections: σ' = log₁₀(σ + 10⁻¹⁰)
+        2. Log-scaling for energies: E' = log₁₀(E)
+        3. StandardScaler for features: X' = (X - μ) / σ
+
+        Args:
+            feature_columns: List of columns to standardize.
+                           If None and auto_detect_tiers=True, automatically
+                           detects tier-based features from self.df columns.
+            auto_detect_tiers: Automatically detect standardizable features
+                             based on tier column names (Z, A, N, R_fm, etc.)
+
+        Returns:
+            Fitted TransformationPipeline ready for transform()
+
+        Example:
+            >>> # Get tier-based features
+            >>> df = dataset.to_tabular(mode='tier', tiers=['A', 'B', 'C'])
+            >>>
+            >>> # Create and fit transformation pipeline
+            >>> pipeline = dataset.get_transformation_pipeline()
+            >>>
+            >>> # Transform features and target
+            >>> X = df.drop(columns=['CrossSection', 'Uncertainty', 'Entry', 'MT'])
+            >>> y = df['CrossSection']
+            >>> energy = df['Energy']
+            >>>
+            >>> X_t, y_t = pipeline.fit_transform(X, y, energy)
+            >>>
+            >>> # Train model on transformed data
+            >>> model.fit(X_t, y_t)
+            >>>
+            >>> # Make predictions and inverse transform
+            >>> y_pred_log = model.predict(X_test_t)
+            >>> y_pred = pipeline.inverse_transform_target(pd.Series(y_pred_log))
+        """
+        if feature_columns is None and auto_detect_tiers:
+            # Auto-detect standardizable features based on tier system
+            # These are continuous numerical features that benefit from standardization
+            tier_features = [
+                # Tier A (Core) - standardize Z, A, N (not particle vector or Energy)
+                'Z', 'A', 'N',
+                # Tier B (Geometric)
+                'R_fm', 'kR',
+                # Tier C (Energetics)
+                'Mass_Excess_MeV', 'Binding_Energy_MeV', 'Binding_Per_Nucleon_MeV',
+                'S_1n_MeV', 'S_2n_MeV', 'S_1p_MeV', 'S_2p_MeV',
+                # Tier D (Topological) - only continuous features
+                'Spin', 'Valence_N', 'Valence_P', 'P_Factor',
+                'Shell_Closure_N', 'Shell_Closure_P',
+                # Tier E (Q-values)
+                'Q_alpha_MeV', 'Q_2beta_minus_MeV', 'Q_ep_MeV', 'Q_beta_n_MeV',
+                'Q_4beta_minus_MeV', 'Q_d_alpha_MeV', 'Q_p_alpha_MeV', 'Q_n_alpha_MeV'
+            ]
+
+            # Filter to columns actually present in self.df
+            feature_columns = [col for col in tier_features if col in self.df.columns]
+
+            logger.info(f"Auto-detected {len(feature_columns)} standardizable features")
+            logger.info(f"  Features: {feature_columns[:5]}...")
+
+        # Create pipeline
+        pipeline = TransformationPipeline()
+
+        # Fit on current dataset
+        # Note: User should split train/test BEFORE fitting to avoid data leakage
+        logger.info("Fitting transformation pipeline on dataset...")
+        logger.warning(
+            "⚠️  Pipeline fitted on entire dataset. "
+            "For proper ML workflow, fit only on training split!"
+        )
+
+        pipeline.fit(
+            self.df,
+            y=self.df['CrossSection'] if 'CrossSection' in self.df.columns else None,
+            energy=self.df['Energy'] if 'Energy' in self.df.columns else None,
+            feature_columns=feature_columns
+        )
+
+        return pipeline
+
+    def to_tabular_transformed(
+        self,
+        mode: Literal['naive', 'physics', 'tier'] = 'tier',
+        tiers: Optional[List[str]] = None,
+        fit_pipeline: bool = True,
+        pipeline: Optional[TransformationPipeline] = None,
+        return_pipeline: bool = False
+    ) -> pd.DataFrame:
+        """
+        Get transformed tabular data ready for ML training.
+
+        Combines to_tabular() with automatic transformation pipeline:
+        1. Generate tier-based features
+        2. Apply log-scaling to Energy and CrossSection
+        3. Apply StandardScaler to features
+
+        Args:
+            mode: Projection strategy ('tier' recommended)
+            tiers: Feature tiers to include (e.g., ['A', 'B', 'C'])
+            fit_pipeline: If True, fit new pipeline on this data
+                        If False, must provide pre-fitted pipeline
+            pipeline: Pre-fitted TransformationPipeline (optional)
+                     If None and fit_pipeline=True, creates new pipeline
+            return_pipeline: If True, returns (df_transformed, pipeline)
+                           If False, returns only df_transformed
+
+        Returns:
+            Transformed DataFrame ready for model.fit()
+            If return_pipeline=True: Tuple of (df_transformed, pipeline)
+
+        Warning:
+            For proper ML workflow, split your data BEFORE calling this method,
+            then fit pipeline only on training data:
+
+            >>> # Split data first
+            >>> train_dataset = NucmlDataset(..., selection=train_selection)
+            >>> test_dataset = NucmlDataset(..., selection=test_selection)
+            >>>
+            >>> # Fit pipeline on training data
+            >>> train_df, pipeline = train_dataset.to_tabular_transformed(
+            ...     mode='tier', tiers=['A', 'C'], return_pipeline=True
+            ... )
+            >>>
+            >>> # Transform test data with same pipeline (no fitting!)
+            >>> test_df = test_dataset.to_tabular_transformed(
+            ...     mode='tier', tiers=['A', 'C'], fit_pipeline=False,
+            ...     pipeline=pipeline
+            ... )
+
+        Example:
+            >>> # Quick start (single dataset, proper split needed)
+            >>> df_transformed = dataset.to_tabular_transformed(
+            ...     mode='tier', tiers=['A', 'B', 'C']
+            ... )
+            >>> X = df_transformed.drop(columns=['CrossSection_log', 'Entry', 'MT'])
+            >>> y = df_transformed['CrossSection_log']
+            >>> model.fit(X, y)
+        """
+        # Get tabular features
+        df = self.to_tabular(mode=mode, tiers=tiers)
+
+        # Create or use existing pipeline
+        if pipeline is None:
+            if not fit_pipeline:
+                raise ValueError(
+                    "Must provide pipeline if fit_pipeline=False. "
+                    "Either set fit_pipeline=True or pass a pre-fitted pipeline."
+                )
+
+            # Create and fit new pipeline
+            pipeline = self.get_transformation_pipeline()
+
+        # Separate features and target
+        feature_cols = [col for col in df.columns
+                       if col not in ['CrossSection', 'Uncertainty', 'Entry', 'MT']]
+        X = df[feature_cols]
+        y = df['CrossSection'] if 'CrossSection' in df.columns else None
+        energy = df['Energy'] if 'Energy' in df.columns else None
+
+        # Apply transformations
+        if fit_pipeline:
+            X_transformed, y_transformed = pipeline.fit_transform(X, y, energy)
+        else:
+            X_transformed = pipeline.transform(X, energy)
+            y_transformed = pipeline.transform_target(y) if y is not None else None
+
+        # Combine into single DataFrame
+        df_transformed = X_transformed.copy()
+        if y_transformed is not None:
+            df_transformed['CrossSection_log'] = y_transformed
+
+        # Keep metadata columns
+        if 'Entry' in df.columns:
+            df_transformed['Entry'] = df['Entry']
+        if 'MT' in df.columns:
+            df_transformed['MT'] = df['MT']
+        if 'Uncertainty' in df.columns:
+            df_transformed['Uncertainty'] = df['Uncertainty']
+
+        if return_pipeline:
+            return df_transformed, pipeline
+        else:
+            return df_transformed

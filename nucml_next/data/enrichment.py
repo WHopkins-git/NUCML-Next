@@ -566,10 +566,8 @@ class AME2020DataEnricher:
                     else:
                         continue
 
-                    # Only use ground states for now (isomer_level == 0)
-                    # This avoids duplicate (Z, A) entries
-                    if isomer_level != 0:
-                        continue
+                    # Load both ground states and isomeric states
+                    # Isomer fallback will be applied later in _merge_enrichment_table
 
                     # Parse J^π (spin and parity) - columns 89-102 (0-indexed: 88-102)
                     jpi_str = line[88:102].strip()
@@ -715,13 +713,15 @@ class AME2020DataEnricher:
         Merge all loaded data into single enrichment table.
 
         Uses left joins on (Z, A) starting from mass_1 data as base.
+        Implements isomer fallback: If an isomeric state from NUBASE is missing
+        AME properties, inherit values from the ground-state entry.
         """
         if self.mass_data is None:
             logger.error("Cannot create enrichment table: mass_1.mas20.txt not loaded")
             self.enrichment_table = pd.DataFrame()
             return
 
-        # Start with mass data as base
+        # Start with mass data as base (ground states only, Z/A unique)
         merged = self.mass_data.copy()
 
         # Merge rct1 data
@@ -732,9 +732,49 @@ class AME2020DataEnricher:
         if self.rct2_data is not None:
             merged = merged.merge(self.rct2_data, on=['Z', 'A'], how='left')
 
-        # Merge nubase data (when available)
+        # Merge nubase data (includes both ground states and isomers)
         if self.nubase_data is not None:
-            merged = merged.merge(self.nubase_data, on=['Z', 'A'], how='left')
+            # Separate ground states and isomers from NUBASE
+            nubase_ground = self.nubase_data[self.nubase_data['Isomer_Level'] == 0].copy()
+            nubase_isomers = self.nubase_data[self.nubase_data['Isomer_Level'] > 0].copy()
+
+            # Merge ground state NUBASE data (replaces/updates existing data)
+            merged = merged.merge(nubase_ground, on=['Z', 'A'], how='left', suffixes=('', '_nubase'))
+
+            # Clean up duplicate columns from merge
+            for col in merged.columns:
+                if col.endswith('_nubase'):
+                    base_col = col.replace('_nubase', '')
+                    # Prefer NUBASE value if available
+                    merged[base_col] = merged[col].fillna(merged[base_col])
+                    merged = merged.drop(columns=[col])
+
+            # Apply isomer fallback: Add isomer entries with AME properties inherited from ground state
+            if len(nubase_isomers) > 0:
+                isomer_enriched = []
+                for _, isomer_row in nubase_isomers.iterrows():
+                    z, a = isomer_row['Z'], isomer_row['A']
+
+                    # Find corresponding ground state in merged table
+                    ground_state = merged[(merged['Z'] == z) & (merged['A'] == a)]
+
+                    if len(ground_state) > 0:
+                        # Create isomer entry by inheriting AME properties from ground state
+                        isomer_entry = ground_state.iloc[0].copy()
+
+                        # Override with isomer-specific NUBASE properties
+                        isomer_entry['Spin'] = isomer_row['Spin']
+                        isomer_entry['Parity'] = isomer_row['Parity']
+                        isomer_entry['Isomer_Level'] = isomer_row['Isomer_Level']
+                        isomer_entry['Half_Life_s'] = isomer_row['Half_Life_s']
+
+                        isomer_enriched.append(isomer_entry)
+
+                # Append isomer entries to main table
+                if isomer_enriched:
+                    isomer_df = pd.DataFrame(isomer_enriched)
+                    merged = pd.concat([merged, isomer_df], ignore_index=True)
+                    logger.info(f"Applied isomer fallback: Added {len(isomer_enriched)} isomeric states with inherited AME properties")
 
         self.enrichment_table = merged
 

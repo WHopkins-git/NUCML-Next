@@ -497,20 +497,27 @@ class FeatureGenerator:
         result['Valence_N'] = result['N'].apply(lambda n: get_valence(n, magic_numbers))
         result['Valence_P'] = result['Z'].apply(lambda z: get_valence(z, magic_numbers))
 
-        # Pairing factor
-        def pairing_factor(n, z):
-            """Compute pairing factor: 1 (even-even), 0 (mixed), -1 (odd-odd)."""
-            n_even = (n % 2 == 0)
-            z_even = (z % 2 == 0)
-            if n_even and z_even:
-                return 1
-            elif not n_even and not z_even:
-                return -1
+        # Promiscuity Factor: P = N_p * N_n / (N_p + N_n)
+        # Uses valence nucleon numbers to measure coupling between proton and neutron systems
+        def promiscuity_factor(valence_n, valence_p):
+            """
+            Compute promiscuity factor from valence nucleons.
+
+            P = N_p * N_n / (N_p + N_n)
+
+            Measures the degree of coupling between proton and neutron valence shells.
+            High P indicates balanced valence systems (both far from closure).
+            Low P indicates one shell near closure (shell effects dominate).
+            """
+            if valence_n == 0 and valence_p == 0:
+                return 0.0  # Doubly magic nucleus
+            elif valence_n + valence_p == 0:
+                return 0.0  # Edge case
             else:
-                return 0
+                return (valence_n * valence_p) / (valence_n + valence_p)
 
         result['P_Factor'] = result.apply(
-            lambda row: pairing_factor(row['N'], row['Z']),
+            lambda row: promiscuity_factor(row['Valence_N'], row['Valence_P']),
             axis=1
         )
 
