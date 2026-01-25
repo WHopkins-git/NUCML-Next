@@ -74,10 +74,12 @@ class DataSelection:
             - 'reactor_core': Essential for reactor physics (MT 2,4,16,18,102,103,107)
             - 'threshold_only': Reactions with energy thresholds (MT 16,17,103-107)
             - 'fission_details': Fission breakdown (MT 18,19,20,21,38)
-            - 'all_physical': All MT codes (bookkeeping removed by exclude_bookkeeping)
+            - 'all_physical': All MT codes (including bookkeeping if exclude_bookkeeping=False)
             - 'custom': Use custom_mt_codes list
         custom_mt_codes: Custom MT code list (used when mt_mode='custom')
         exclude_bookkeeping: Exclude MT 0,1 and MT >= 9000. Default: True
+                            When False with mt_mode='all_physical', includes all MT codes
+                            including bookkeeping (MT 0, 1, and >=9000)
         drop_invalid: Drop NaN or non-positive cross-sections. Default: True
         holdout_isotopes: List of (Z,A) tuples to exclude from training.
                          Use for measuring true extrapolation capability.
@@ -232,7 +234,10 @@ class DataSelection:
         if mt_codes is not None:
             lines.append(f"  MT codes: {sorted(mt_codes)[:10]}{'...' if len(mt_codes) > 10 else ''} ({len(mt_codes)} total)")
         else:
-            lines.append(f"  MT codes: all physical (< 9000)")
+            if self.exclude_bookkeeping:
+                lines.append(f"  MT codes: all physical (excluding MT 0, 1, >=9000)")
+            else:
+                lines.append(f"  MT codes: all physical (including MT 0, 1, >=9000)")
 
         # Show tier selection
         lines.append(f"  Feature tiers: {self.tiers}")
