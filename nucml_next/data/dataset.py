@@ -406,7 +406,8 @@ class NucmlDataset(TorchDataset):
             initial_rows = len(df)
             print(f"\nApplying post-load filters...")
 
-            # 1. Projectile filtering (neutrons only - based on MT codes)
+            # 1. Projectile filtering (neutrons only)
+            # Prefer explicit Projectile column if available, otherwise use MT codes
             # NOTE: Skip if already filtered at fragment level (mt_mode='all_physical' + projectile='neutron')
             # In that case, predicate pushdown already filtered to neutron MT codes
             needs_projectile_filter = (
@@ -414,13 +415,23 @@ class NucmlDataset(TorchDataset):
                 not (selection.mt_mode == 'all_physical')  # Already filtered at fragment level
             )
             if needs_projectile_filter:
-                projectile_mt = selection.get_projectile_mt_filter()
-                if projectile_mt is not None:
-                    before = len(df)
-                    df = df[df['MT'].isin(projectile_mt)]
+                before = len(df)
+
+                # Method 1: Use explicit Projectile column if available (most accurate)
+                if 'Projectile' in df.columns and df['Projectile'].notna().any():
+                    df = df[df['Projectile'] == 'n']  # 'n' = neutron in EXFOR
                     removed = before - len(df)
                     if removed > 0:
-                        print(f"  ✓ Projectile filter (neutrons): Removed {removed:,} non-neutron reactions")
+                        print(f"  ✓ Projectile filter (neutrons): Removed {removed:,} non-neutron reactions (using explicit Projectile column)")
+
+                # Method 2: Fall back to MT code filtering (for legacy data without Projectile)
+                else:
+                    projectile_mt = selection.get_projectile_mt_filter()
+                    if projectile_mt is not None:
+                        df = df[df['MT'].isin(projectile_mt)]
+                        removed = before - len(df)
+                        if removed > 0:
+                            print(f"  ✓ Projectile filter (neutrons): Removed {removed:,} non-neutron reactions (inferred from MT codes)")
 
             # 2. Holdout isotopes (exclude specific Z/A pairs for evaluation)
             if selection.holdout_isotopes:

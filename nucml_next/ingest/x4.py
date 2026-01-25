@@ -58,7 +58,7 @@ Pipeline:
 Output Schema (with full enrichment):
 -------------------------------------
 Core EXFOR columns:
-  - Entry, Z, A, N, MT, Energy, CrossSection, Uncertainty
+  - Entry, Z, A, N, Projectile, MT, Energy, CrossSection, Uncertainty
 
 Tier B/C (mass_1.mas20.txt):
   - Mass_Excess_keV, Binding_Energy_keV, Binding_Per_Nucleon_keV
@@ -485,11 +485,13 @@ class X4Ingestor:
 
         # Query to get dataset metadata and JSON data
         # IMPORTANT: DatasetID is a string (e.g., "30649005S"), so quote properly
+        # Extract Proj (projectile) column for explicit neutron/charged particle filtering
         query = """
             SELECT
                 ds.DatasetID,
                 ds.zTarg1 as Z,
                 ds.Targ1 as Target,
+                ds.Proj as Projectile,
                 ds.MT,
                 x5.jx5z
             FROM x4pro_ds ds
@@ -507,7 +509,7 @@ class X4Ingestor:
         # Parse JSON and extract data points
         all_points = []
 
-        for dataset_id, z, target, mt, jx5z_str in rows:
+        for dataset_id, z, target, projectile, mt, jx5z_str in rows:
             if not jx5z_str:
                 continue
 
@@ -553,6 +555,7 @@ class X4Ingestor:
                         'DatasetID': dataset_id,
                         'Z': z,
                         'A': a,
+                        'Projectile': projectile,  # Add projectile for explicit filtering
                         'MT': mt,
                         'En': energies[i],
                         'Data': cross_sections[i],
@@ -588,11 +591,13 @@ class X4Ingestor:
 
         # INNER JOIN between metadata and data tables
         # DatasetID must be quoted as it's a string
+        # Extract Proj (projectile) for explicit neutron/charged particle filtering
         query = """
             SELECT
                 ds.DatasetID,
                 ds.zTarg1 as Z,
                 ds.Targ1 as Target,
+                ds.Proj as Projectile,
                 ds.MT,
                 dat.x1 as En,
                 dat.y as Data,
@@ -657,6 +662,11 @@ class X4Ingestor:
             'mt': 'MT',
             'mt_code': 'MT',
 
+            # Projectile (X4Pro: Proj → Projectile)
+            'proj': 'Projectile',
+            'projectile': 'Projectile',
+            'particle': 'Projectile',
+
             # Data (including X4Pro naming conventions)
             'energy': 'Energy',
             'energy_value': 'Energy',
@@ -697,8 +707,13 @@ class X4Ingestor:
         if 'Uncertainty' not in df_norm.columns:
             df_norm['Uncertainty'] = np.nan
 
+        # Add Projectile if missing (legacy data may not have it)
+        if 'Projectile' not in df_norm.columns:
+            logger.warning("Projectile column not found in source data - will rely on MT codes for filtering")
+            df_norm['Projectile'] = None  # Will be inferred from MT codes if needed
+
         # Select and order final columns
-        final_cols = ['Entry', 'Z', 'A', 'MT', 'Energy', 'CrossSection', 'Uncertainty']
+        final_cols = ['Entry', 'Z', 'A', 'Projectile', 'MT', 'Energy', 'CrossSection', 'Uncertainty']
         df_norm = df_norm[final_cols]
 
         # Clean data

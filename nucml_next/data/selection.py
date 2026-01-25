@@ -25,25 +25,41 @@ import numpy as np
 # MT Code Categories (based on ENDF-6 format manual)
 # Reference: https://www.oecd-nea.org/dbdata/data/manual-endf/endf102.pdf
 
-# Neutron-induced reactions (MT codes strongly associated with neutron projectiles)
-NEUTRON_MT_CODES = {
-    2,    # Elastic scattering
-    4,    # Inelastic scattering
-    16,   # (n,2n)
-    17,   # (n,3n)
-    18,   # Fission
-    19,   # (n,f) - first chance fission
-    20,   # (n,nf) - second chance fission
-    21,   # (n,2nf) - third chance fission
-    38,   # (n,4nf) - fourth chance fission
-    102,  # (n,γ) - radiative capture
-    103,  # (n,p)
-    104,  # (n,d)
-    105,  # (n,t)
-    106,  # (n,³He)
-    107,  # (n,α)
-    # Add more as needed - these are the most common
-}
+# Neutron-induced reactions (MT codes for neutron projectiles)
+# Comprehensive list based on ENDF-6 format manual
+# NOTE: In EXFOR, most reactions are neutron-induced. This list covers all standard
+# neutron reaction MT codes from the ENDF-6 specification.
+NEUTRON_MT_CODES = set(
+    # Fundamental cross sections (1-5)
+    list(range(1, 6)) +  # 1=Total, 2=Elastic, 3=Nonelastic, 4=Inelastic, 5=Misc
+
+    # Particle emission reactions (10-45)
+    list(range(10, 46)) +  # (n,continuum), (n,2n), (n,3n), (n,f), (n,nα), (n,np), etc.
+
+    # Inelastic scattering to discrete levels (50-91)
+    list(range(50, 92)) +  # (n,n₀), (n,n₁), ..., (n,n₄₀), (n,n_continuum)
+
+    # Capture and charged particle emission (102-117)
+    list(range(102, 118)) +  # (n,γ), (n,p), (n,d), (n,t), (n,³He), (n,α), etc.
+
+    # Total absorption and production (200-207)
+    list(range(201, 208)) +  # Total absorption, capture, (n,Xp), (n,Xd), etc.
+
+    # Heating and damage (301, 444)
+    [301, 444] +  # KERMA heating, damage energy
+
+    # Fission product yields and energy release (454-459)
+    list(range(454, 460)) +  # ν̄, Q̄, energy release in fragments/photons
+
+    # Photon production from neutron reactions (500-572)
+    list(range(500, 573)) +  # Total photon, (n,γ) γ, (n,n') γ, etc.
+
+    # Production cross sections to specific states (600-849)
+    list(range(600, 850)) +  # (n,p₀), (n,p₁), (n,d₀), (n,α₀), etc.
+
+    # Covariance and residual production data (9000-9999)
+    list(range(9000, 10000))  # MT-9000+: lumped covariance, residual production
+)
 
 # Reactor core essential reactions (for criticality, burnup, shielding)
 REACTOR_CORE_MT = [2, 4, 16, 18, 102, 103, 107]
@@ -54,8 +70,10 @@ THRESHOLD_MT = [16, 17, 103, 104, 105, 106, 107]
 # Fission details (breakdown of fission channels)
 FISSION_DETAILS_MT = [18, 19, 20, 21, 38]
 
-# Bookkeeping codes to exclude (totals, derived quantities)
-BOOKKEEPING_MT = {0, 1}  # MT=1 is total cross-section, MT=0 is undefined
+# Bookkeeping codes that may be excluded for certain applications
+# NOTE: MT=1 (total cross section) is NOT bookkeeping - it's a fundamental measurement!
+# MT=0 is undefined/unspecified and may represent non-standard data
+BOOKKEEPING_MT = {0}  # Only MT=0 is truly undefined/non-standard
 
 
 @dataclass
@@ -77,9 +95,10 @@ class DataSelection:
             - 'all_physical': All MT codes (including bookkeeping if exclude_bookkeeping=False)
             - 'custom': Use custom_mt_codes list
         custom_mt_codes: Custom MT code list (used when mt_mode='custom')
-        exclude_bookkeeping: Exclude MT 0,1 and MT >= 9000. Default: True
-                            When False with mt_mode='all_physical', includes all MT codes
-                            including bookkeeping (MT 0, 1, and >=9000)
+        exclude_bookkeeping: Exclude MT 0 (undefined/non-standard data). Default: True
+                            When False with mt_mode='all_physical', includes MT 0.
+                            NOTE: MT 1 (total XS) and MT 9000+ (covariance/residual)
+                            are valid physics data, not bookkeeping!
         drop_invalid: Drop NaN or non-positive cross-sections. Default: True
         holdout_isotopes: List of (Z,A) tuples to exclude from training.
                          Use for measuring true extrapolation capability.
@@ -122,7 +141,7 @@ class DataSelection:
     custom_mt_codes: Optional[List[int]] = None
 
     # Exclusion rules
-    exclude_bookkeeping: bool = True  # Exclude MT 0,1 and MT >= 9000
+    exclude_bookkeeping: bool = True  # Exclude MT 0 (undefined/non-standard data only)
 
     # Data validity
     drop_invalid: bool = True  # Drop NaN or non-positive cross-sections
@@ -189,8 +208,9 @@ class DataSelection:
 
         # Apply bookkeeping exclusions if requested
         # This is the ONLY place where bookkeeping codes are filtered
+        # NOTE: MT >= 9000 are valid neutron covariance/residual data, not bookkeeping
         if self.exclude_bookkeeping and mt_codes is not None:
-            mt_codes = [mt for mt in mt_codes if mt not in BOOKKEEPING_MT and mt < 9000]
+            mt_codes = [mt for mt in mt_codes if mt not in BOOKKEEPING_MT]
 
         return mt_codes
 
@@ -235,9 +255,9 @@ class DataSelection:
             lines.append(f"  MT codes: {sorted(mt_codes)[:10]}{'...' if len(mt_codes) > 10 else ''} ({len(mt_codes)} total)")
         else:
             if self.exclude_bookkeeping:
-                lines.append(f"  MT codes: all physical (excluding MT 0, 1, >=9000)")
+                lines.append(f"  MT codes: all physical (excluding MT 0 undefined)")
             else:
-                lines.append(f"  MT codes: all physical (including MT 0, 1, >=9000)")
+                lines.append(f"  MT codes: all physical (including MT 0 undefined)")
 
         # Show tier selection
         lines.append(f"  Feature tiers: {self.tiers}")
