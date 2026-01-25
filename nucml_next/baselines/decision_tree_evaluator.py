@@ -141,8 +141,28 @@ class DecisionTreeEvaluator:
 
         feature_columns = [col for col in df.columns if col not in exclude_columns]
 
-        # Handle sparse DataFrames
+        # CRITICAL: Filter out non-numeric columns automatically
+        # This prevents "could not convert string to float" errors
+        # Includes pandas sparse arrays (common for one-hot encoded MT codes)
+        numeric_columns = df.select_dtypes(include=[np.number, pd.SparseDtype]).columns
+        feature_columns = [col for col in numeric_columns if col not in exclude_columns]
+
+        # Report excluded non-numeric columns if any
+        all_candidate_columns = [col for col in df.columns if col not in exclude_columns]
+        non_numeric_columns = [col for col in all_candidate_columns if col not in feature_columns]
+
+        if len(non_numeric_columns) > 0 and verbose:
+            print(f"⚠️  Excluding {len(non_numeric_columns)} non-numeric columns:")
+            for col in non_numeric_columns[:5]:  # Show first 5
+                print(f"    - {col} (dtype: {df[col].dtype})")
+            if len(non_numeric_columns) > 5:
+                print(f"    ... and {len(non_numeric_columns) - 5} more")
+            print()
+
+        # Get the feature DataFrame
         X_df = df[feature_columns]
+
+        # Handle sparse DataFrames
         sparse_columns = [col for col in X_df.columns if isinstance(X_df[col].dtype, pd.SparseDtype)]
 
         if len(sparse_columns) > 0:
@@ -290,10 +310,26 @@ class DecisionTreeEvaluator:
         if exclude_columns is None:
             exclude_columns = [target_column, 'Isotope', 'Reaction']
 
+        # CRITICAL: Filter out non-numeric columns automatically
+        # This prevents "could not convert string to float" errors
+        # Includes pandas sparse arrays (common for one-hot encoded MT codes)
+        numeric_columns = df.select_dtypes(include=[np.number, pd.SparseDtype]).columns
         self.feature_columns = [
-            col for col in df.columns
+            col for col in numeric_columns
             if col not in exclude_columns
         ]
+
+        # Report excluded non-numeric columns if any
+        all_candidate_columns = [col for col in df.columns if col not in exclude_columns]
+        non_numeric_columns = [col for col in all_candidate_columns if col not in self.feature_columns]
+
+        if len(non_numeric_columns) > 0:
+            print(f"  ⚠️  Excluding {len(non_numeric_columns)} non-numeric columns:")
+            for col in non_numeric_columns[:5]:  # Show first 5
+                print(f"      - {col} (dtype: {df[col].dtype})")
+            if len(non_numeric_columns) > 5:
+                print(f"      ... and {len(non_numeric_columns) - 5} more")
+            print()
 
         # Handle sparse DataFrames efficiently (avoid memory explosion)
         # Pandas sparse arrays are common with one-hot encoded MT codes
