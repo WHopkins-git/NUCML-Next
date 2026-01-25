@@ -144,8 +144,16 @@ class DecisionTreeEvaluator:
         # CRITICAL: Filter out non-numeric columns automatically
         # This prevents "could not convert string to float" errors
         # Includes pandas sparse arrays (common for one-hot encoded MT codes)
-        numeric_columns = df.select_dtypes(include=[np.number, pd.SparseDtype]).columns
-        feature_columns = [col for col in numeric_columns if col not in exclude_columns]
+
+        # Get numeric columns (standard numeric types)
+        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+
+        # Also include sparse columns (pandas sparse arrays for one-hot encoded data)
+        sparse_cols = [col for col in df.columns if isinstance(df[col].dtype, pd.SparseDtype)]
+
+        # Combine and remove duplicates
+        all_numeric_cols = list(set(numeric_cols + sparse_cols))
+        feature_columns = [col for col in all_numeric_cols if col not in exclude_columns]
 
         # Report excluded non-numeric columns if any
         all_candidate_columns = [col for col in df.columns if col not in exclude_columns]
@@ -181,6 +189,19 @@ class DecisionTreeEvaluator:
 
         # Log-transform target
         y_log = np.log10(y + 1e-10)
+
+        # CRITICAL: Remove inf/NaN values that cause sklearn to fail
+        # This can happen with AME enrichment data for unstable isotopes
+        if isinstance(X, np.ndarray):
+            # For dense arrays, check for inf/NaN
+            finite_mask = np.isfinite(X).all(axis=1) & np.isfinite(y_log)
+            if not finite_mask.all():
+                n_invalid = (~finite_mask).sum()
+                if verbose:
+                    print(f"⚠️  Removing {n_invalid:,} rows with inf/NaN values ({n_invalid/len(X)*100:.2f}%)")
+                X = X[finite_mask]
+                y_log = y_log[finite_mask]
+        # Note: scipy sparse matrices handle this differently, typically don't contain inf
 
         # Split into train/test (hyperopt will use train for CV)
         X_train, X_test, y_train, y_test = train_test_split(
@@ -313,11 +334,16 @@ class DecisionTreeEvaluator:
         # CRITICAL: Filter out non-numeric columns automatically
         # This prevents "could not convert string to float" errors
         # Includes pandas sparse arrays (common for one-hot encoded MT codes)
-        numeric_columns = df.select_dtypes(include=[np.number, pd.SparseDtype]).columns
-        self.feature_columns = [
-            col for col in numeric_columns
-            if col not in exclude_columns
-        ]
+
+        # Get numeric columns (standard numeric types)
+        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+
+        # Also include sparse columns (pandas sparse arrays for one-hot encoded data)
+        sparse_cols = [col for col in df.columns if isinstance(df[col].dtype, pd.SparseDtype)]
+
+        # Combine and remove duplicates
+        all_numeric_cols = list(set(numeric_cols + sparse_cols))
+        self.feature_columns = [col for col in all_numeric_cols if col not in exclude_columns]
 
         # Report excluded non-numeric columns if any
         all_candidate_columns = [col for col in df.columns if col not in exclude_columns]
@@ -366,6 +392,18 @@ class DecisionTreeEvaluator:
 
         # Log-transform target for better numerical stability
         y_log = np.log10(y + 1e-10)
+
+        # CRITICAL: Remove inf/NaN values that cause sklearn to fail
+        # This can happen with AME enrichment data for unstable isotopes
+        if isinstance(X, np.ndarray):
+            # For dense arrays, check for inf/NaN
+            finite_mask = np.isfinite(X).all(axis=1) & np.isfinite(y_log)
+            if not finite_mask.all():
+                n_invalid = (~finite_mask).sum()
+                print(f"  ⚠️  Removing {n_invalid:,} rows with inf/NaN values ({n_invalid/len(X)*100:.2f}%)")
+                X = X[finite_mask]
+                y_log = y_log[finite_mask]
+        # Note: scipy sparse matrices handle this differently, typically don't contain inf
 
         # Split data
         X_train, X_test, y_train, y_test = train_test_split(
