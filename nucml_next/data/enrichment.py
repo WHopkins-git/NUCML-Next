@@ -1,0 +1,927 @@
+"""
+AME2020/NUBASE2020 Data Enrichment
+====================================
+
+Comprehensive loader for AME2020 and NUBASE2020 nuclear data tables.
+Supports tier-based feature enrichment following Valdez 2021 thesis.
+
+Data Files Required:
+--------------------
+All files available from: https://www-nds.iaea.org/amdc/
+
+1. mass_1.mas20.txt (462 KB)
+   - Mass excess in keV
+   - Binding energy in keV
+   - Binding energy per nucleon
+   - Source: AME2020 Atomic Mass Evaluation
+   - Coverage: 3,558 isotopes
+
+2. rct1.mas20.txt (500 KB)
+   - S(2n): Two-neutron separation energy
+   - S(2p): Two-proton separation energy
+   - Q(α): Alpha decay Q-value
+   - Q(2β⁻): Double beta-minus Q-value
+   - Q(ep): Electron capture + positron Q-value
+   - Q(β⁻n): Beta-delayed neutron Q-value
+   - Source: AME2020 reaction energies (part 1)
+
+3. rct2_1.mas20.txt (499 KB)
+   - S(1n): One-neutron separation energy
+   - S(1p): One-proton separation energy
+   - Q(4β⁻): Quadruple beta-minus Q-value
+   - Q(d,α): (d,α) reaction Q-value
+   - Q(p,α): (p,α) reaction Q-value
+   - Q(n,α): (n,α) reaction Q-value
+   - Source: AME2020 reaction energies (part 2)
+
+4. nubase_4.mas20.txt (5,868 lines)
+   - Nuclear spin (J)
+   - Parity (±1)
+   - Isomeric state levels
+   - Half-life (all time units: ys to Ey)
+   - Decay modes
+   - Source: NUBASE2020 nuclear structure evaluation
+   - Coverage: 3,558 ground states
+
+5. covariance.mas20.txt (24 MB) - OPTIONAL
+   - Mass uncertainty correlations
+   - Variance-covariance matrix
+   - Source: AME2020 statistical evaluation
+
+Download Instructions:
+-----------------------
+    cd data/
+    wget https://www-nds.iaea.org/amdc/ame2020/mass_1.mas20.txt
+    wget https://www-nds.iaea.org/amdc/ame2020/rct1.mas20.txt
+    wget https://www-nds.iaea.org/amdc/ame2020/rct2_1.mas20.txt
+    wget https://www-nds.iaea.org/amdc/ame2020/nubase_4.mas20.txt
+    wget https://www-nds.iaea.org/amdc/ame2020/covariance.mas20.txt  # optional
+
+File-to-Tier Mapping:
+---------------------
+- Tier A: Z, A, Energy, MT (no enrichment needed) - 14 features
+- Tier B: + Nuclear radius, kR (requires mass_1) - 16 features
+- Tier C: + Mass excess, binding, separation energies (requires mass_1, rct1, rct2_1) - 23 features
+- Tier D: + Spin, parity, valence, magic numbers (requires nubase_4) - 32 features
+- Tier E: + All reaction Q-values (requires rct1, rct2_1) - 40 features
+
+Tier Hierarchy:
+---------------
+- Tier A (Core): Z, A, Energy + particle-emission vector [n, p, d, t, He3, α]
+- Tier B (Geometric): + Nuclear radius (R = 1.25×A^(1/3) fm), kR parameter
+- Tier C (Energetics): + Mass excess, binding energy, separation energies (S_1n, S_2n, S_1p, S_2p)
+- Tier D (Topological): + Spin, parity, valence nucleons, pairing factor, magic numbers
+- Tier E (Complete): + All reaction Q-values from rct1 and rct2_1 tables
+
+Data Coverage:
+--------------
+- Total isotopes: 3,558 ground states
+- Spin coverage: 93.2% (3,316 isotopes)
+- Parity coverage: 94.2% (3,350 isotopes)
+- Half-life coverage: 94.8% (3,374 isotopes)
+- Energetics coverage: 90-100% (varies by quantity)
+
+Usage:
+------
+    from nucml_next.data.enrichment import AME2020DataEnricher
+
+    # Load all AME2020/NUBASE2020 data files
+    enricher = AME2020DataEnricher(data_dir='data/')
+    enricher.load_all()
+
+    # Check available tiers
+    print(enricher.get_available_tiers())  # ['A', 'B', 'C', 'D', 'E']
+
+    # Get enriched data for specific isotope
+    u235_data = enricher.get_isotope_data(Z=92, A=235, tiers=['B', 'C'])
+
+    # Enrich DataFrame with tier-based features
+    import pandas as pd
+    df = pd.DataFrame({'Z': [92, 94], 'A': [235, 239]})
+    enriched = enricher.enrich_dataframe(df, tiers=['C', 'D'])
+
+Citations:
+----------
+If you use AME2020 or NUBASE2020 data, please cite:
+
+    AME2020:
+    W.J. Huang, M. Wang, F.G. Kondev, G. Audi, and S. Naimi,
+    "The AME 2020 atomic mass evaluation (I). Evaluation of input data,
+    and adjustment procedures," Chinese Phys. C 45, 030002 (2021).
+
+    M. Wang, W.J. Huang, F.G. Kondev, G. Audi, and S. Naimi,
+    "The AME 2020 atomic mass evaluation (II). Tables, graphs and references,"
+    Chinese Phys. C 45, 030003 (2021).
+
+    NUBASE2020:
+    F.G. Kondev, M. Wang, W.J. Huang, S. Naimi, and G. Audi,
+    "The NUBASE2020 evaluation of nuclear physics properties,"
+    Chinese Phys. C 45, 030001 (2021).
+"""
+
+import logging
+from typing import Optional, List, Dict, Any, Union, Tuple
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+logger = logging.getLogger(__name__)
+
+
+class AME2020DataEnricher:
+    """
+    Comprehensive enricher for AME2020 and NUBASE2020 nuclear data.
+
+    Loads multiple AME2020 data files and provides enrichment for tier-based
+    feature hierarchy system.
+    """
+
+    def __init__(self, data_dir: str = 'data/'):
+        """
+        Initialize AME2020 data enricher.
+
+        Args:
+            data_dir: Directory containing AME2020/NUBASE2020 *.mas20.txt files
+        """
+        self.data_dir = Path(data_dir)
+
+        # Data storage for each file
+        self.mass_data: Optional[pd.DataFrame] = None  # mass_1.mas20
+        self.rct1_data: Optional[pd.DataFrame] = None  # rct1.mas20
+        self.rct2_data: Optional[pd.DataFrame] = None  # rct2_1.mas20
+        self.nubase_data: Optional[pd.DataFrame] = None  # nubase_4.mas20
+
+        # Merged enrichment table (all isotopes with all available data)
+        self.enrichment_table: Optional[pd.DataFrame] = None
+
+    def load_all(self) -> pd.DataFrame:
+        """
+        Load all available AME2020/NUBASE2020 data files.
+
+        Returns:
+            Merged enrichment table with all available data
+        """
+        logger.info("Loading AME2020/NUBASE2020 data files...")
+
+        # Load each file if available
+        self.mass_data = self._load_mass_1()
+        self.rct1_data = self._load_rct1()
+        self.rct2_data = self._load_rct2_1()
+        self.nubase_data = self._load_nubase_4()
+
+        # Merge all data into single enrichment table
+        self._merge_enrichment_table()
+
+        logger.info(f"Loaded {len(self.enrichment_table)} isotopes with enrichment data")
+        return self.enrichment_table
+
+    def _load_mass_1(self) -> Optional[pd.DataFrame]:
+        """
+        Load mass_1.mas20.txt (Mass Excess and Binding Energy).
+
+        Provides:
+        - Mass_Excess_keV: Mass excess in keV
+        - Binding_Energy_keV: Total binding energy in keV
+        - Binding_Per_Nucleon_keV: Binding energy per nucleon
+
+        Returns:
+            DataFrame with Z, A, N, Mass_Excess_keV, Binding_Energy_keV, Binding_Per_Nucleon_keV
+        """
+        # Try cleaned version first, fall back to original
+        filepath_clean = self.data_dir / 'mass_1_clean.mas20.txt'
+        filepath_orig = self.data_dir / 'mass_1.mas20.txt'
+
+        if filepath_clean.exists():
+            filepath = filepath_clean
+            logger.info("Loading mass_1_clean.mas20.txt...")
+        elif filepath_orig.exists():
+            filepath = filepath_orig
+            logger.info("Loading mass_1.mas20.txt...")
+        else:
+            logger.warning(f"mass_1.mas20.txt not found at {filepath_orig}")
+            return None
+
+        records = []
+
+        with open(filepath, 'r') as f:
+            for line in f:
+                # Skip empty lines
+                if not line.strip():
+                    continue
+
+                # Skip header lines (lines starting with 1 in first column = page break)
+                # Lines starting with 0 or space are data lines
+                if line[0] == '1':
+                    continue
+
+                # Skip comment/header sections
+                if 'ATOMIC' in line or 'A =' in line or '****' in line:
+                    continue
+                if 'format' in line or 'Warnings' in line or 'cc' in line:
+                    continue
+                if '....+' in line:  # Column markers
+                    continue
+
+                try:
+                    # Fixed-width format: a1,i3,i5,i5,i5,1x,a3,a4,1x,f14.6,f12.6,f13.5,...
+                    # Columns (1-indexed Fortran style):
+                    #   1: control character
+                    #   2-4: N-Z
+                    #   5-9: N
+                    #   10-14: Z
+                    #   15-19: A
+                    #   21-23: Element
+                    #   29-42: Mass excess (keV)
+                    #   55-67: Binding energy (keV)
+
+                    if len(line) < 67:
+                        continue
+
+                    # Extract N, Z, A (using 0-indexed Python slicing)
+                    n_str = line[4:9].strip()
+                    z_str = line[9:14].strip()
+                    a_str = line[14:19].strip()
+
+                    if not n_str or not z_str or not a_str:
+                        continue
+
+                    N = int(n_str)
+                    Z = int(z_str)
+                    A = int(a_str)
+
+                    # Extract mass excess (cols 29-42)
+                    # NOTE: '#' in AME files indicates estimated (non-experimental) decimal point
+                    # e.g., "12345#67" means "12345.67" (estimated), so we replace '#' with '.'
+                    mass_excess_str = line[28:42].strip().replace('#', '.').replace('*', '')
+                    if not mass_excess_str:
+                        continue
+                    mass_excess = float(mass_excess_str)
+
+                    # Extract binding energy (cols 55-67)
+                    binding_str = line[54:67].strip().replace('#', '.').replace('*', '')
+                    if binding_str:
+                        binding = float(binding_str)
+                    else:
+                        binding = np.nan
+
+                    records.append({
+                        'Z': Z,
+                        'A': A,
+                        'N': N,
+                        'Mass_Excess_keV': mass_excess,
+                        'Binding_Energy_keV': binding,
+                        'Binding_Per_Nucleon_keV': binding / A if not np.isnan(binding) and A > 0 else np.nan,
+                    })
+
+                except (ValueError, IndexError) as e:
+                    continue
+
+        df = pd.DataFrame(records)
+        logger.info(f"Loaded {len(df)} isotopes from mass_1.mas20.txt")
+        return df
+
+    def _load_rct1(self) -> Optional[pd.DataFrame]:
+        """
+        Load rct1.mas20.txt (Separation Energies and Q-values, Part 1).
+
+        Provides:
+        - S_2n: Two-neutron separation energy (keV)
+        - S_2p: Two-proton separation energy (keV)
+        - Q_alpha: Alpha decay Q-value (keV)
+        - Q_2beta_minus: Double beta-minus Q-value (keV)
+        - Q_ep: Electron capture + positron Q-value (keV)
+        - Q_beta_n: Beta-delayed neutron Q-value (keV)
+
+        Returns:
+            DataFrame with Z, A, and above columns
+        """
+        # Try cleaned version first, fall back to original
+        filepath_clean = self.data_dir / 'rct1_clean.mas20.txt'
+        filepath_orig = self.data_dir / 'rct1.mas20.txt'
+
+        if filepath_clean.exists():
+            filepath = filepath_clean
+            logger.info("Loading rct1_clean.mas20.txt...")
+        elif filepath_orig.exists():
+            filepath = filepath_orig
+            logger.info("Loading rct1.mas20.txt...")
+        else:
+            logger.warning(f"rct1.mas20.txt not found at {filepath_orig}")
+            return None
+
+        records = []
+
+        with open(filepath, 'r') as f:
+            for line in f:
+                # Skip empty lines
+                if not line.strip():
+                    continue
+
+                # Skip page breaks and header lines
+                if line[0] == '1':
+                    continue
+
+                # Skip comment/header sections
+                if 'ATOMIC' in line or 'A =' in line or '****' in line:
+                    continue
+                if 'format' in line or 'Warnings' in line or 'cc' in line:
+                    continue
+                if '....+' in line or 'LINEAR' in line:
+                    continue
+
+                try:
+                    # Fixed-width format: a1,i3,1x,a3,i3,1x,6(f12.4,f10.4)
+                    # Columns (1-indexed):
+                    #   1: control
+                    #   2-4: A
+                    #   5: space
+                    #   6-8: Element
+                    #   9-11: Z
+                    #   12: space
+                    #   13-24: S(2n) value
+                    #   25-34: S(2n) unc
+                    #   35-46: S(2p) value
+                    #   ... (6 pairs total)
+
+                    if len(line) < 50:
+                        continue
+
+                    # Parse A and Z (0-indexed Python)
+                    a_str = line[1:4].strip()
+                    z_str = line[8:11].strip()
+
+                    if not a_str or not z_str:
+                        continue
+
+                    A = int(a_str)
+                    Z = int(z_str)
+
+                    # Parse 6 reaction energy values
+                    # Each pair: value (12 chars) + uncertainty (10 chars) = 22 chars total
+                    # NOTE: '#' in AME files indicates estimated decimal point
+                    values = []
+                    pos = 12  # Start after Z field and space (0-indexed)
+                    for i in range(6):
+                        if pos + 12 > len(line):
+                            values.append(np.nan)
+                        else:
+                            val_str = line[pos:pos+12].strip().replace('#', '.').replace('*', '')
+                            if val_str:
+                                try:
+                                    values.append(float(val_str))
+                                except ValueError:
+                                    values.append(np.nan)
+                            else:
+                                values.append(np.nan)
+                        pos += 22  # Next pair
+
+                    records.append({
+                        'Z': Z,
+                        'A': A,
+                        'S_2n': values[0],
+                        'S_2p': values[1],
+                        'Q_alpha': values[2],
+                        'Q_2beta_minus': values[3],
+                        'Q_ep': values[4],
+                        'Q_beta_n': values[5],
+                    })
+
+                except (ValueError, IndexError):
+                    continue
+
+        df = pd.DataFrame(records)
+        logger.info(f"Loaded {len(df)} isotopes from rct1.mas20.txt")
+        return df
+
+    def _load_rct2_1(self) -> Optional[pd.DataFrame]:
+        """
+        Load rct2_1.mas20.txt (Separation Energies and Q-values, Part 2).
+
+        Provides:
+        - S_1n: One-neutron separation energy (keV)
+        - S_1p: One-proton separation energy (keV)
+        - Q_4beta_minus: Quadruple beta-minus Q-value (keV)
+        - Q_d_alpha: (d,alpha) reaction Q-value (keV)
+        - Q_p_alpha: (p,alpha) reaction Q-value (keV)
+        - Q_n_alpha: (n,alpha) reaction Q-value (keV)
+
+        Returns:
+            DataFrame with Z, A, and above columns
+        """
+        # Try cleaned version first, fall back to original
+        filepath_clean = self.data_dir / 'rct2_1_clean.mas20.txt'
+        filepath_orig = self.data_dir / 'rct2_1.mas20.txt'
+
+        if filepath_clean.exists():
+            filepath = filepath_clean
+            logger.info("Loading rct2_1_clean.mas20.txt...")
+        elif filepath_orig.exists():
+            filepath = filepath_orig
+            logger.info("Loading rct2_1.mas20.txt...")
+        else:
+            logger.warning(f"rct2_1.mas20.txt not found at {filepath_orig}")
+            return None
+
+        records = []
+
+        with open(filepath, 'r') as f:
+            for line in f:
+                # Skip empty lines
+                if not line.strip():
+                    continue
+
+                # Skip page breaks and header lines
+                if line[0] == '1':
+                    continue
+
+                # Skip comment/header sections
+                if 'ATOMIC' in line or 'A =' in line or '****' in line:
+                    continue
+                if 'format' in line or 'Warnings' in line or 'cc' in line:
+                    continue
+                if '....+' in line or 'LINEAR' in line:
+                    continue
+
+                try:
+                    # Same fixed-width format as rct1: a1,i3,1x,a3,i3,1x,6(f12.4,f10.4)
+
+                    if len(line) < 50:
+                        continue
+
+                    # Parse A and Z (0-indexed Python)
+                    a_str = line[1:4].strip()
+                    z_str = line[8:11].strip()
+
+                    if not a_str or not z_str:
+                        continue
+
+                    A = int(a_str)
+                    Z = int(z_str)
+
+                    # Parse 6 reaction energy values
+                    # NOTE: '#' in AME files indicates estimated decimal point
+                    values = []
+                    pos = 12  # Start after Z field and space
+                    for i in range(6):
+                        if pos + 12 > len(line):
+                            values.append(np.nan)
+                        else:
+                            val_str = line[pos:pos+12].strip().replace('#', '.').replace('*', '')
+                            if val_str:
+                                try:
+                                    values.append(float(val_str))
+                                except ValueError:
+                                    values.append(np.nan)
+                            else:
+                                values.append(np.nan)
+                        pos += 22
+
+                    records.append({
+                        'Z': Z,
+                        'A': A,
+                        'S_1n': values[0],
+                        'S_1p': values[1],
+                        'Q_4beta_minus': values[2],
+                        'Q_d_alpha': values[3],
+                        'Q_p_alpha': values[4],
+                        'Q_n_alpha': values[5],
+                    })
+
+                except (ValueError, IndexError):
+                    continue
+
+        df = pd.DataFrame(records)
+        logger.info(f"Loaded {len(df)} isotopes from rct2_1.mas20.txt")
+        return df
+
+    def _load_nubase_4(self) -> Optional[pd.DataFrame]:
+        """
+        Load nubase_4.mas20.txt (Nuclear Structure Properties).
+
+        Provides:
+        - Spin: Nuclear spin (J)
+        - Parity: Parity (+1 or -1)
+        - Isomer_Level: Isomeric state level (0=ground, 1=first excited, etc.)
+        - Half_Life_s: Half-life in seconds
+        - Decay_Mode: Primary decay mode
+
+        Returns:
+            DataFrame with Z, A, and above columns
+        """
+        # Try cleaned version first, fall back to original
+        filepath_clean = self.data_dir / 'nubase_4_clean.mas20.txt'
+        filepath_orig = self.data_dir / 'nubase_4.mas20.txt'
+
+        if filepath_clean.exists():
+            filepath = filepath_clean
+            logger.info("Loading nubase_4_clean.mas20.txt...")
+        elif filepath_orig.exists():
+            filepath = filepath_orig
+            logger.info("Loading nubase_4.mas20.txt...")
+        else:
+            logger.warning(f"nubase_4.mas20.txt not found - Tier D features unavailable")
+            return None
+
+        records = []
+
+        with open(filepath, 'r') as f:
+            for line in f:
+                # Skip comments and header lines
+                if line.startswith('#') or not line.strip():
+                    continue
+
+                try:
+                    # Fixed-width NUBASE format
+                    # Columns (1-indexed):
+                    #   1-3: AAA (mass number)
+                    #   5-8: ZZZi (atomic number + isomer state)
+                    #   12-16: A El (element symbol)
+                    #   17: s (isomer marker: m, n, p, q, r, i, j)
+                    #   19-31: Mass excess (keV)
+                    #   70-78: Half-life
+                    #   79-80: Half-life unit
+                    #   89-102: J^π (spin and parity)
+
+                    if len(line) < 102:
+                        continue
+
+                    # Parse A (mass number) - columns 1-3 (0-indexed: 0-3)
+                    a_str = line[0:3].strip()
+                    if not a_str:
+                        continue
+                    A = int(a_str)
+
+                    # Parse ZZZi (atomic number + isomer) - columns 5-8 (0-indexed: 4-8)
+                    zzzi_str = line[4:8].strip()
+                    if not zzzi_str:
+                        continue
+
+                    # Extract Z and isomer level
+                    # Format: ZZZi where i = 0 (ground), 1,2 (isomers), etc.
+                    if len(zzzi_str) >= 3:
+                        Z = int(zzzi_str[:3])
+                        isomer_char = zzzi_str[3] if len(zzzi_str) > 3 else '0'
+                        isomer_level = int(isomer_char) if isomer_char.isdigit() else 0
+                    else:
+                        continue
+
+                    # Load both ground states and isomeric states
+                    # Isomer fallback will be applied later in _merge_enrichment_table
+
+                    # Parse J^π (spin and parity) - columns 89-102 (0-indexed: 88-102)
+                    jpi_str = line[88:102].strip()
+
+                    # Parse spin and parity from strings like "1/2+*", "0+", "3/2-", etc.
+                    spin, parity = self._parse_spin_parity(jpi_str)
+
+                    # Parse half-life - columns 70-78 (0-indexed: 69-78)
+                    halflife_str = line[69:78].strip()
+                    halflife_unit = line[78:80].strip()
+                    half_life_s = self._parse_half_life(halflife_str, halflife_unit)
+
+                    records.append({
+                        'Z': Z,
+                        'A': A,
+                        'Spin': spin,
+                        'Parity': parity,
+                        'Isomer_Level': isomer_level,
+                        'Half_Life_s': half_life_s,
+                    })
+
+                except (ValueError, IndexError) as e:
+                    continue
+
+        df = pd.DataFrame(records)
+        logger.info(f"Loaded {len(df)} ground-state isotopes from nubase_4.mas20.txt")
+        return df
+
+    def _parse_spin_parity(self, jpi_str: str) -> Tuple[Optional[float], Optional[int]]:
+        """
+        Parse spin and parity from NUBASE J^π string.
+
+        Examples:
+            "1/2+*"  → (0.5, +1)
+            "0+"     → (0.0, +1)
+            "3/2-"   → (1.5, -1)
+            "(5/2+)" → (2.5, +1)  # uncertain
+            "T=1"    → (None, None)  # isospin, no J^π
+
+        Args:
+            jpi_str: NUBASE spin-parity string
+
+        Returns:
+            Tuple of (spin, parity) where parity is +1 or -1, or (None, None) if unparseable
+        """
+        if not jpi_str or jpi_str == '':
+            return (None, None)
+
+        # Remove special markers: *, #, T=, parentheses, spaces
+        cleaned = jpi_str.replace('*', '').replace('#', '').replace('(', '').replace(')', '').strip()
+
+        # Skip isospin entries (T=...)
+        if 'T=' in cleaned or cleaned == '':
+            return (None, None)
+
+        # Determine parity
+        if '+' in cleaned:
+            parity = +1
+            cleaned = cleaned.replace('+', '')
+        elif '-' in cleaned:
+            parity = -1
+            cleaned = cleaned.replace('-', '')
+        else:
+            parity = None
+
+        # Parse spin
+        try:
+            if '/' in cleaned:
+                # Fractional spin like "1/2" or "3/2"
+                parts = cleaned.split('/')
+                if len(parts) == 2:
+                    spin = float(parts[0]) / float(parts[1])
+                else:
+                    spin = None
+            elif cleaned.replace('.', '').isdigit():
+                # Integer or decimal spin
+                spin = float(cleaned)
+            else:
+                spin = None
+        except (ValueError, ZeroDivisionError):
+            spin = None
+
+        return (spin, parity)
+
+    def _parse_half_life(self, halflife_str: str, unit_str: str) -> Optional[float]:
+        """
+        Parse half-life to seconds.
+
+        Args:
+            halflife_str: Half-life value string
+            unit_str: Unit string (ys, zs, as, ns, us, ms, s, m, h, d, y)
+
+        Returns:
+            Half-life in seconds, or None if stable/unparseable
+        """
+        # Handle special cases
+        if 'stbl' in halflife_str or 'stable' in halflife_str:
+            return np.inf  # Stable
+        if 'p-unst' in halflife_str:
+            return 0.0  # Particle unstable (essentially immediate)
+
+        # Parse numeric value
+        try:
+            # Remove '#' (systematic estimate marker)
+            value_str = halflife_str.replace('#', '').strip()
+            if not value_str:
+                return None
+            value = float(value_str)
+        except ValueError:
+            return None
+
+        # Convert to seconds based on unit
+        unit_conversions = {
+            'ys': 1e-24,  # yoctosecond
+            'zs': 1e-21,  # zeptosecond
+            'as': 1e-18,  # attosecond
+            'fs': 1e-15,  # femtosecond
+            'ps': 1e-12,  # picosecond
+            'ns': 1e-9,   # nanosecond
+            'us': 1e-6,   # microsecond
+            'ms': 1e-3,   # millisecond
+            's':  1.0,    # second
+            'm':  60.0,   # minute
+            'h':  3600.0, # hour
+            'd':  86400.0,  # day
+            'y':  31557600.0,  # year (365.25 days)
+            'ky': 31557600.0 * 1e3,  # kiloyear (1000 years)
+            'My': 31557600.0 * 1e6,  # megayear (1 million years)
+            'Gy': 31557600.0 * 1e9,  # gigayear (1 billion years)
+            'Ty': 31557600.0 * 1e12, # terayear (1 trillion years)
+            'Py': 31557600.0 * 1e15, # petayear (1 quadrillion years)
+            'Ey': 31557600.0 * 1e18, # exayear (1 quintillion years)
+        }
+
+        unit = unit_str.strip()
+        if unit in unit_conversions:
+            return value * unit_conversions[unit]
+        else:
+            return None
+
+    def _merge_enrichment_table(self):
+        """
+        Merge all loaded data into single enrichment table.
+
+        Uses left joins on (Z, A) starting from mass_1 data as base.
+        Implements isomer fallback: If an isomeric state from NUBASE is missing
+        AME properties, inherit values from the ground-state entry.
+        """
+        if self.mass_data is None:
+            logger.error("Cannot create enrichment table: mass_1.mas20.txt not loaded")
+            self.enrichment_table = pd.DataFrame()
+            return
+
+        # Start with mass data as base (ground states only, Z/A unique)
+        merged = self.mass_data.copy()
+
+        # Merge rct1 data
+        if self.rct1_data is not None:
+            merged = merged.merge(self.rct1_data, on=['Z', 'A'], how='left')
+
+        # Merge rct2 data
+        if self.rct2_data is not None:
+            merged = merged.merge(self.rct2_data, on=['Z', 'A'], how='left')
+
+        # Merge nubase data (includes both ground states and isomers)
+        if self.nubase_data is not None:
+            # Separate ground states and isomers from NUBASE
+            nubase_ground = self.nubase_data[self.nubase_data['Isomer_Level'] == 0].copy()
+            nubase_isomers = self.nubase_data[self.nubase_data['Isomer_Level'] > 0].copy()
+
+            # Merge ground state NUBASE data (replaces/updates existing data)
+            merged = merged.merge(nubase_ground, on=['Z', 'A'], how='left', suffixes=('', '_nubase'))
+
+            # Clean up duplicate columns from merge
+            for col in merged.columns:
+                if col.endswith('_nubase'):
+                    base_col = col.replace('_nubase', '')
+                    # Prefer NUBASE value if available
+                    merged[base_col] = merged[col].fillna(merged[base_col])
+                    merged = merged.drop(columns=[col])
+
+            # Apply isomer fallback: Add isomer entries with AME properties inherited from ground state
+            if len(nubase_isomers) > 0:
+                isomer_enriched = []
+                for _, isomer_row in nubase_isomers.iterrows():
+                    z, a = isomer_row['Z'], isomer_row['A']
+
+                    # Find corresponding ground state in merged table
+                    ground_state = merged[(merged['Z'] == z) & (merged['A'] == a)]
+
+                    if len(ground_state) > 0:
+                        # Create isomer entry by inheriting AME properties from ground state
+                        isomer_entry = ground_state.iloc[0].copy()
+
+                        # Override with isomer-specific NUBASE properties
+                        isomer_entry['Spin'] = isomer_row['Spin']
+                        isomer_entry['Parity'] = isomer_row['Parity']
+                        isomer_entry['Isomer_Level'] = isomer_row['Isomer_Level']
+                        isomer_entry['Half_Life_s'] = isomer_row['Half_Life_s']
+
+                        isomer_enriched.append(isomer_entry)
+
+                # Append isomer entries to main table
+                if isomer_enriched:
+                    isomer_df = pd.DataFrame(isomer_enriched)
+                    merged = pd.concat([merged, isomer_df], ignore_index=True)
+                    logger.info(f"Applied isomer fallback: Added {len(isomer_enriched)} isomeric states with inherited AME properties")
+
+        self.enrichment_table = merged
+
+    def get_isotope_data(
+        self,
+        Z: int,
+        A: int,
+        tiers: Optional[List[str]] = None
+    ) -> Dict[str, Any]:
+        """
+        Get enriched data for a specific isotope.
+
+        Args:
+            Z: Atomic number
+            A: Mass number
+            tiers: List of tiers to include (e.g., ['B', 'C', 'E'])
+                  If None, returns all available data
+
+        Returns:
+            Dictionary of enriched features for the isotope
+            Returns empty dict if isotope not found
+        """
+        if self.enrichment_table is None:
+            logger.error("Enrichment table not loaded. Call load_all() first.")
+            return {}
+
+        # Find isotope
+        mask = (self.enrichment_table['Z'] == Z) & (self.enrichment_table['A'] == A)
+        isotope_data = self.enrichment_table[mask]
+
+        if len(isotope_data) == 0:
+            logger.warning(f"Isotope Z={Z}, A={A} not found in enrichment table")
+            return {}
+
+        # Convert to dict
+        data_dict = isotope_data.iloc[0].to_dict()
+
+        # Filter by tiers if specified
+        if tiers is not None:
+            filtered_data = {}
+            tier_columns = self._get_tier_columns(tiers)
+            for col in tier_columns:
+                if col in data_dict:
+                    filtered_data[col] = data_dict[col]
+            return filtered_data
+
+        return data_dict
+
+    def enrich_dataframe(
+        self,
+        df: pd.DataFrame,
+        tiers: Optional[List[str]] = None
+    ) -> pd.DataFrame:
+        """
+        Enrich a dataframe with AME2020 data.
+
+        Args:
+            df: DataFrame with Z and A columns
+            tiers: List of tiers to include (e.g., ['B', 'C', 'E'])
+                  If None, adds all available enrichment data
+
+        Returns:
+            Enriched DataFrame with additional columns from AME2020
+        """
+        if self.enrichment_table is None:
+            logger.error("Enrichment table not loaded. Call load_all() first.")
+            return df
+
+        # Determine which columns to add
+        if tiers is None:
+            # Add all columns except Z, A, N (already in df or will be computed)
+            enrich_cols = [col for col in self.enrichment_table.columns
+                          if col not in ['Z', 'A', 'N']]
+        else:
+            # Add only tier-specific columns
+            tier_cols = self._get_tier_columns(tiers)
+            # Filter to columns that exist in enrichment table
+            # Exclude Z, A (merge keys) and N (will be computed separately)
+            enrich_cols = [col for col in tier_cols
+                          if col in self.enrichment_table.columns and col not in ['Z', 'A', 'N']]
+
+        # Select enrichment columns (include Z, A for merge)
+        cols_to_select = ['Z', 'A'] + enrich_cols
+        enrich_data = self.enrichment_table[cols_to_select].copy()
+
+        # Merge with input dataframe (creates no duplicate columns)
+        enriched = df.merge(enrich_data, on=['Z', 'A'], how='left', suffixes=('', '_ame'))
+
+        return enriched
+
+    def _get_tier_columns(self, tiers: List[str]) -> List[str]:
+        """
+        Get column names for specified tiers.
+
+        Args:
+            tiers: List of tier identifiers (e.g., ['B', 'C'])
+
+        Returns:
+            List of column names to include
+        """
+        columns = ['Z', 'A', 'N']  # Always include these
+
+        if 'B' in tiers or 'C' in tiers:
+            # Tier B and C both need mass and binding energy
+            columns.extend([
+                'Mass_Excess_keV',
+                'Binding_Energy_keV',
+                'Binding_Per_Nucleon_keV'
+            ])
+
+        if 'C' in tiers:
+            # Tier C adds separation energies
+            columns.extend([
+                'S_1n', 'S_2n', 'S_1p', 'S_2p'
+            ])
+
+        if 'D' in tiers:
+            # Tier D adds nuclear structure properties
+            columns.extend([
+                'Spin', 'Parity', 'Isomer_Level', 'Half_Life_s'
+            ])
+
+        if 'E' in tiers:
+            # Tier E adds all Q-values
+            columns.extend([
+                'Q_alpha', 'Q_2beta_minus', 'Q_ep', 'Q_beta_n',
+                'Q_4beta_minus', 'Q_d_alpha', 'Q_p_alpha', 'Q_n_alpha'
+            ])
+
+        return columns
+
+    def get_available_tiers(self) -> List[str]:
+        """
+        Get list of tiers that can be implemented with available data.
+
+        Returns:
+            List of available tier identifiers (e.g., ['A', 'B', 'C', 'E'])
+        """
+        available = ['A']  # Tier A always available (Z, A, Energy, MT)
+
+        if self.mass_data is not None:
+            available.extend(['B', 'C'])  # Both need mass data
+
+        if self.nubase_data is not None:
+            available.append('D')  # Tier D needs NUBASE
+
+        if self.rct2_data is not None:
+            available.append('E')  # Tier E needs reaction Q-values
+
+        return sorted(set(available))
