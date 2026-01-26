@@ -875,8 +875,8 @@ class NucmlDataset(TorchDataset):
             Fitted TransformationPipeline ready for transform()
 
         Example:
-            >>> # Get tier-based features
-            >>> df = dataset.to_tabular(mode='tier', tiers=['A', 'B', 'C'])
+            >>> # Get tier-based features (particle emission vectors by default)
+            >>> df = dataset.to_tabular(tiers=['A', 'B', 'C'])
             >>>
             >>> # Create and fit transformation pipeline
             >>> pipeline = dataset.get_transformation_pipeline()
@@ -945,7 +945,6 @@ class NucmlDataset(TorchDataset):
 
     def to_tabular_transformed(
         self,
-        mode: Literal['naive', 'physics', 'tier'] = 'tier',
         tiers: Optional[List[str]] = None,
         fit_pipeline: bool = True,
         pipeline: Optional[TransformationPipeline] = None,
@@ -955,12 +954,11 @@ class NucmlDataset(TorchDataset):
         Get transformed tabular data ready for ML training.
 
         Combines to_tabular() with automatic transformation pipeline:
-        1. Generate tier-based features
+        1. Generate tier-based features (particle emission vectors by default)
         2. Apply log-scaling to Energy and CrossSection
         3. Apply StandardScaler to features
 
         Args:
-            mode: Projection strategy ('tier' recommended)
             tiers: Feature tiers to include (e.g., ['A', 'B', 'C'])
             fit_pipeline: If True, fit new pipeline on this data
                         If False, must provide pre-fitted pipeline
@@ -983,26 +981,26 @@ class NucmlDataset(TorchDataset):
             >>>
             >>> # Fit pipeline on training data
             >>> train_df, pipeline = train_dataset.to_tabular_transformed(
-            ...     mode='tier', tiers=['A', 'C'], return_pipeline=True
+            ...     tiers=['A', 'C'], return_pipeline=True
             ... )
             >>>
             >>> # Transform test data with same pipeline (no fitting!)
             >>> test_df = test_dataset.to_tabular_transformed(
-            ...     mode='tier', tiers=['A', 'C'], fit_pipeline=False,
+            ...     tiers=['A', 'C'], fit_pipeline=False,
             ...     pipeline=pipeline
             ... )
 
         Example:
             >>> # Quick start (single dataset, proper split needed)
             >>> df_transformed = dataset.to_tabular_transformed(
-            ...     mode='tier', tiers=['A', 'B', 'C']
+            ...     tiers=['A', 'B', 'C']
             ... )
             >>> X = df_transformed.drop(columns=['CrossSection_log', 'Entry', 'MT'])
             >>> y = df_transformed['CrossSection_log']
             >>> model.fit(X, y)
         """
-        # Get tabular features
-        df = self.to_tabular(mode=mode, tiers=tiers)
+        # Get tabular features (uses particle emission vectors by default)
+        df = self.to_tabular(tiers=tiers)
 
         # Create or use existing pipeline
         if pipeline is None:
