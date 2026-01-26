@@ -172,9 +172,64 @@ class XGBoostEvaluator:
                 print(f"    ... and {len(non_numeric) - 5} more")
             print()
 
+        # ============================================================================
+        # CRITICAL: Drop rows with NaN in features BEFORE pipeline fitting
+        # ============================================================================
         X_features = df[feature_columns]
         y = df[target_column]
         energy = df[energy_column] if energy_column in df.columns else None
+
+        # Check for NaN in features (before transformation)
+        initial_size = len(df)
+        nan_mask_features = X_features.isna().any(axis=1)
+        nan_mask_target = y.isna()
+        nan_mask_energy = energy.isna() if energy is not None else pd.Series(False, index=df.index)
+        nan_mask = nan_mask_features | nan_mask_target | nan_mask_energy
+
+        if nan_mask.any():
+            n_nan = nan_mask.sum()
+            if verbose:
+                print(f"⚠️  CRITICAL: Found {n_nan:,} rows with NaN in features ({n_nan/initial_size*100:.2f}%)")
+                print(f"   This is likely due to incomplete AME enrichment coverage.")
+                print(f"   Dropping these rows BEFORE fitting pipeline...")
+                # Show which features have the most NaN
+                nan_counts = X_features.isna().sum()
+                nan_features = nan_counts[nan_counts > 0].sort_values(ascending=False)
+                if len(nan_features) > 0:
+                    print(f"\n   Features with NaN values:")
+                    for feat, count in nan_features.head(5).items():
+                        print(f"     - {feat}: {count:,} NaN ({count/initial_size*100:.1f}%)")
+                    if len(nan_features) > 5:
+                        print(f"     ... and {len(nan_features) - 5} more features")
+                print()
+
+            # Drop rows with NaN
+            valid_indices = ~nan_mask
+            X_features = X_features[valid_indices]
+            y = y[valid_indices]
+            if energy is not None:
+                energy = energy[valid_indices]
+
+            final_size = len(X_features)
+            if verbose:
+                print(f"   After dropping NaN: {final_size:,} rows ({final_size/initial_size*100:.1f}% retained)")
+                print()
+
+            # Check if we have enough data left
+            if final_size == 0:
+                raise ValueError(
+                    "❌ ERROR: All rows have NaN values in features!\n"
+                    "   This means NO isotopes in your dataset are in the AME2020 database.\n"
+                    "   Solutions:\n"
+                    "   1. Use tiers=['A'] only (no AME enrichment)\n"
+                    "   2. Filter to isotopes with AME data before training\n"
+                    "   3. Implement imputation for missing AME features"
+                )
+
+            if final_size < 1000:
+                print(f"⚠️  WARNING: Only {final_size:,} rows remain after dropping NaN.")
+                print(f"   Consider using fewer tier features or different data selection.")
+                print()
 
         # Create or use pipeline
         if pipeline is None:
@@ -354,9 +409,45 @@ class XGBoostEvaluator:
         if energy_column in self.feature_columns:
             self.feature_columns.remove(energy_column)
 
+        # ============================================================================
+        # CRITICAL: Drop rows with NaN in features BEFORE pipeline fitting
+        # ============================================================================
         X_features = df[self.feature_columns]
         y = df[target_column]
         energy = df[energy_column] if energy_column in df.columns else None
+
+        # Check for NaN in features (before transformation)
+        initial_size = len(df)
+        nan_mask_features = X_features.isna().any(axis=1)
+        nan_mask_target = y.isna()
+        nan_mask_energy = energy.isna() if energy is not None else pd.Series(False, index=df.index)
+        nan_mask = nan_mask_features | nan_mask_target | nan_mask_energy
+
+        if nan_mask.any():
+            n_nan = nan_mask.sum()
+            print(f"  ⚠️  Found {n_nan:,} rows with NaN in features ({n_nan/initial_size*100:.2f}%)")
+            print(f"      Dropping these rows BEFORE fitting pipeline...")
+
+            # Drop rows with NaN
+            valid_indices = ~nan_mask
+            X_features = X_features[valid_indices]
+            y = y[valid_indices]
+            if energy is not None:
+                energy = energy[valid_indices]
+
+            final_size = len(X_features)
+            print(f"      After dropping NaN: {final_size:,} rows ({final_size/initial_size*100:.1f}% retained)\n")
+
+            # Check if we have enough data left
+            if final_size == 0:
+                raise ValueError(
+                    "❌ ERROR: All rows have NaN values in features!\n"
+                    "   This means NO isotopes in your dataset are in the AME2020 database.\n"
+                    "   Solutions:\n"
+                    "   1. Use tiers=['A'] only (no AME enrichment)\n"
+                    "   2. Filter to isotopes with AME data before training\n"
+                    "   3. Implement imputation for missing AME features"
+                )
 
         # Create or use pipeline
         if pipeline is None:
