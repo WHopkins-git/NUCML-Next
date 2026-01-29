@@ -48,9 +48,7 @@ Download the `*.mas20.txt` files from https://www-nds.iaea.org/amdc/
 ### 3. Run ingestion
 
 ```bash
-python scripts/ingest_exfor.py \
-    --x4-db data/x4sqlite1.db \
-    --output data/exfor_processed.parquet
+python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --output data/exfor_processed.parquet
 ```
 
 This reads the X4Pro SQLite database and writes a Parquet dataset with
