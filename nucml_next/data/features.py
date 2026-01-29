@@ -136,6 +136,112 @@ logger = logging.getLogger(__name__)
 R0 = 1.25  # fm (femtometers)
 
 
+def get_particle_emission_vector(mt: int) -> Dict[str, int]:
+    """
+    Get particle emission vector for a single MT code.
+
+    This is a standalone function for use in prediction when constructing
+    feature vectors for specific isotope/reaction combinations.
+
+    Args:
+        mt: ENDF-6 MT reaction code
+
+    Returns:
+        Dictionary with 9 particle emission features:
+        - out_n: Neutrons emitted
+        - out_p: Protons emitted
+        - out_a: Alpha particles emitted
+        - out_g: Gamma indicator (0/1)
+        - out_f: Fission indicator (0/1)
+        - out_t: Tritons emitted
+        - out_h: Helions emitted
+        - out_d: Deuterons emitted
+        - is_met: Isomeric state indicator (0/1)
+
+    Examples:
+        >>> get_particle_emission_vector(2)   # Elastic
+        {'out_n': 1, 'out_p': 0, 'out_a': 0, 'out_g': 0, 'out_f': 0,
+         'out_t': 0, 'out_h': 0, 'out_d': 0, 'is_met': 0}
+        >>> get_particle_emission_vector(18)  # Fission
+        {'out_n': 0, 'out_p': 0, 'out_a': 0, 'out_g': 0, 'out_f': 1,
+         'out_t': 0, 'out_h': 0, 'out_d': 0, 'is_met': 0}
+    """
+    # Initialize all zeros
+    vec = {
+        'out_n': 0, 'out_p': 0, 'out_a': 0, 'out_g': 0, 'out_f': 0,
+        'out_t': 0, 'out_h': 0, 'out_d': 0, 'is_met': 0
+    }
+
+    # Elastic (MT=2)
+    if mt == 2:
+        vec['out_n'] = 1
+    # Inelastic (MT=4, 51-91)
+    elif mt == 4 or (51 <= mt <= 91):
+        vec['out_n'] = 1
+        vec['out_g'] = 1
+    # (n,2n) MT=16
+    elif mt == 16:
+        vec['out_n'] = 2
+    # (n,3n) MT=17
+    elif mt == 17:
+        vec['out_n'] = 3
+    # (n,4n) MT=37
+    elif mt == 37:
+        vec['out_n'] = 4
+    # Fission (MT=18-21)
+    elif 18 <= mt <= 21:
+        vec['out_f'] = 1
+    # Fission + 4n (MT=38)
+    elif mt == 38:
+        vec['out_n'] = 4
+        vec['out_f'] = 1
+    # Capture (MT=102)
+    elif mt == 102:
+        vec['out_g'] = 1
+    # (n,p) MT=103
+    elif mt == 103:
+        vec['out_p'] = 1
+    # (n,d) MT=104
+    elif mt == 104:
+        vec['out_d'] = 1
+    # (n,t) MT=105
+    elif mt == 105:
+        vec['out_t'] = 1
+    # (n,³He) MT=106
+    elif mt == 106:
+        vec['out_h'] = 1
+    # (n,α) MT=107
+    elif mt == 107:
+        vec['out_a'] = 1
+    # (n,2α) MT=108
+    elif mt == 108:
+        vec['out_a'] = 2
+    # (n,nα) MT=22
+    elif mt == 22:
+        vec['out_n'] = 1
+        vec['out_a'] = 1
+    # (n,np) MT=28
+    elif mt == 28:
+        vec['out_n'] = 1
+        vec['out_p'] = 1
+    # Isomeric states (MT=600-849)
+    elif 600 <= mt <= 849:
+        vec['is_met'] = 1
+        # Determine primary particle from MT range
+        if 600 <= mt <= 649:      # (n,p) to isomer
+            vec['out_p'] = 1
+        elif 650 <= mt <= 699:    # (n,d) to isomer
+            vec['out_d'] = 1
+        elif 700 <= mt <= 749:    # (n,t) to isomer
+            vec['out_t'] = 1
+        elif 750 <= mt <= 799:    # (n,³He) to isomer
+            vec['out_h'] = 1
+        elif 800 <= mt <= 849:    # (n,α) to isomer
+            vec['out_a'] = 1
+
+    return vec
+
+
 @dataclass
 class TierConfig:
     """Configuration for tier-based feature generation."""
@@ -183,7 +289,8 @@ class FeatureGenerator:
         self,
         df: pd.DataFrame,
         tiers: List[str] = ['A'],
-        use_particle_emission: bool = True
+        use_particle_emission: bool = True,
+        extra_metadata: Optional[List[str]] = None,
     ) -> pd.DataFrame:
         """
         Generate tier-based features for a dataset.
@@ -197,6 +304,7 @@ class FeatureGenerator:
                 For Tiers B-E: Should contain AME2020/NUBASE2020 columns (added by NucmlDataset)
             tiers: List of tiers to include (e.g., ['A', 'B', 'C'])
             use_particle_emission: If True, use particle-emission vector instead of one-hot MT
+            extra_metadata: Additional columns to preserve in output (e.g., ['Energy_Uncertainty'])
 
         Returns:
             DataFrame with generated features (ONLY columns for requested tiers)
@@ -235,7 +343,7 @@ class FeatureGenerator:
 
         # CRITICAL: Filter to keep ONLY columns belonging to requested tiers
         # This removes unwanted AME/NUBASE columns that were in the input dataframe
-        allowed_columns = self._get_tier_columns(tiers, use_particle_emission)
+        allowed_columns = self._get_tier_columns(tiers, use_particle_emission, extra_metadata)
 
         # Keep only allowed columns that exist in the result
         final_columns = [col for col in allowed_columns if col in result.columns]
@@ -243,13 +351,19 @@ class FeatureGenerator:
 
         return result
 
-    def _get_tier_columns(self, tiers: List[str], use_particle_emission: bool = True) -> List[str]:
+    def _get_tier_columns(
+        self,
+        tiers: List[str],
+        use_particle_emission: bool = True,
+        extra_metadata: Optional[List[str]] = None,
+    ) -> List[str]:
         """
         Get the list of column names that belong to the specified tiers.
 
         Args:
             tiers: List of tiers (e.g., ['A', 'C'])
             use_particle_emission: Whether particle emission vector is used
+            extra_metadata: Additional columns to include (e.g., ['Energy_Uncertainty'])
 
         Returns:
             List of column names for the requested tiers
@@ -258,6 +372,10 @@ class FeatureGenerator:
 
         # Always include these metadata columns for downstream processing
         columns.update(['Entry', 'MT', 'CrossSection', 'Uncertainty'])
+
+        # Include any user-requested extra metadata columns
+        if extra_metadata:
+            columns.update(extra_metadata)
 
         # Tier A: Core nuclear coordinates and particle vector
         if 'A' in tiers or len(tiers) == 0:
@@ -280,9 +398,11 @@ class FeatureGenerator:
             ])
 
         # Tier D: Topological features (NUBASE2020 nuclear structure)
+        # NOTE: Half_Life_s is log-transformed to Half_Life_log10_s for ML
+        # (spans ~54 orders of magnitude from yoctoseconds to stable)
         if 'D' in tiers:
             columns.update([
-                'Spin', 'Parity', 'Isomer_Level', 'Half_Life_s',
+                'Spin', 'Parity', 'Isomer_Level', 'Half_Life_log10_s',
                 'Valence_N', 'Valence_P', 'P_Factor',
                 'Shell_Closure_N', 'Shell_Closure_P'
             ])
@@ -412,7 +532,7 @@ class FeatureGenerator:
         result = df.copy()
 
         # Check if data is pre-enriched (has AME2020 columns)
-        tier_c_cols = ['Mass_Excess_keV', 'Binding_Energy_keV', 'S_1n']
+        tier_c_cols = ['Mass_Excess_keV', 'Binding_Energy_keV', 'S_1n_keV']
         has_enrichment = all(col in result.columns for col in tier_c_cols)
 
         if not has_enrichment:
@@ -431,7 +551,7 @@ class FeatureGenerator:
         # Convert keV to MeV for better numerical stability in ML
         energy_cols = [
             'Mass_Excess_keV', 'Binding_Energy_keV', 'Binding_Per_Nucleon_keV',
-            'S_1n', 'S_2n', 'S_1p', 'S_2p'
+            'S_1n_keV', 'S_2n_keV', 'S_1p_keV', 'S_2p_keV'
         ]
 
         for col in energy_cols:
@@ -529,6 +649,25 @@ class FeatureGenerator:
 
         result['Shell_Closure_N'] = result['N'].apply(lambda n: nearest_magic(n, magic_numbers))
         result['Shell_Closure_P'] = result['Z'].apply(lambda z: nearest_magic(z, magic_numbers))
+
+        # Log-transform Half_Life_s for ML (spans ~54 orders of magnitude)
+        # From yoctoseconds (1e-24 s) to stable (1e30 s)
+        # This makes the feature more suitable for scaling/standardization
+        if 'Half_Life_s' in result.columns:
+            # Replace any remaining inf values with large finite value
+            # (enrichment.py should already handle this, but be defensive)
+            half_life = result['Half_Life_s'].copy()
+            half_life = half_life.replace([np.inf, -np.inf], 1e30)
+
+            # Handle zeros (particle-unstable isotopes) by using small positive value
+            # log10(1e-30) = -30, which is reasonable for the scale
+            half_life = half_life.replace(0, 1e-30)
+
+            # Log10 transform (clamp to avoid log(0) or log(negative))
+            result['Half_Life_log10_s'] = np.log10(np.maximum(half_life, 1e-30))
+
+            # Drop the original Half_Life_s column to avoid confusion
+            result = result.drop(columns=['Half_Life_s'])
 
         return result
 
@@ -809,7 +948,7 @@ class FeatureGenerator:
 
         if 'D' in tiers:
             features.extend([
-                'Spin', 'Parity', 'Isomer_Level',
+                'Spin', 'Parity', 'Isomer_Level', 'Half_Life_log10_s',
                 'Valence_N', 'Valence_P', 'P_Factor',
                 'Shell_Closure_N', 'Shell_Closure_P'
             ])

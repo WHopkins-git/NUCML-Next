@@ -96,7 +96,7 @@ Usage:
     import pandas as pd
     df_parquet = pd.read_parquet('data/exfor_enriched.parquet',
                                   columns=['Z', 'A', 'Energy', 'CrossSection',
-                                          'Mass_Excess_keV', 'S_1n', 'Spin'])
+                                          'Mass_Excess_keV', 'S_1n_keV', 'Spin'])
 """
 
 import sqlite3
@@ -474,6 +474,21 @@ class X4Ingestor:
         2. Parses c5data JSON to extract energy (x1), cross-section (y), uncertainty (dy)
         3. Extracts Z, A from target isotope string (e.g., "U-235" → Z=92, A=235)
 
+        IMPORTANT - Unit Handling:
+        --------------------------
+        The c5data (computational format) is ALREADY unit-normalized by X4Pro:
+        - Energy (x1): Always in eV (electronvolts)
+        - CrossSection (y): Always in barns (b)
+        - Uncertainty (dy): Always in barns (b)
+
+        This is the "C5" computational format used by ENDF/B and all major nuclear
+        data libraries. X4Pro performs unit conversion from the original EXFOR format
+        (which may have keV, MeV, mb, μb, etc.) to standard eV/barns during ingestion.
+
+        Reference: https://www-nds.iaea.org/nrdc/basics/exfor-basics-3.html
+        "The standard units used by the translation program were selected to be
+        the same as the units used by ENDF (e.g., eV, barns, etc.)"
+
         Args:
             conn: SQLite connection
 
@@ -538,7 +553,12 @@ class X4Ingestor:
 
                 energies = c5['x1'].get('x1', [])
                 cross_sections = c5['y'].get('y', [])
-                uncertainties = c5.get('dy', {}).get('dy', [None] * len(energies))
+
+                # Extract uncertainties - nested inside their parent objects
+                # Cross-section uncertainty: c5data.y.dy (NOT c5data.dy)
+                # Energy uncertainty: c5data.x1.dx1 (less common, ~20% of records)
+                xs_uncertainties = c5.get('y', {}).get('dy', [None] * len(energies))
+                energy_uncertainties = c5.get('x1', {}).get('dx1', [None] * len(energies))
 
                 # Ensure all arrays have same length
                 n_points = min(len(energies), len(cross_sections))
@@ -546,8 +566,10 @@ class X4Ingestor:
                     continue
 
                 # Extend uncertainties if needed
-                if len(uncertainties) < n_points:
-                    uncertainties = uncertainties + [None] * (n_points - len(uncertainties))
+                if len(xs_uncertainties) < n_points:
+                    xs_uncertainties = xs_uncertainties + [None] * (n_points - len(xs_uncertainties))
+                if len(energy_uncertainties) < n_points:
+                    energy_uncertainties = energy_uncertainties + [None] * (n_points - len(energy_uncertainties))
 
                 # Create data points
                 for i in range(n_points):
@@ -558,8 +580,9 @@ class X4Ingestor:
                         'Projectile': projectile,  # Add projectile for explicit filtering
                         'MT': mt,
                         'En': energies[i],
+                        'dEn': energy_uncertainties[i],  # Energy uncertainty (eV)
                         'Data': cross_sections[i],
-                        'dData': uncertainties[i]
+                        'dData': xs_uncertainties[i]  # Cross-section uncertainty (barns)
                     })
 
             except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
@@ -580,6 +603,17 @@ class X4Ingestor:
 
         Alternative X4Pro format where corrected data is stored in x4pro_c5dat table
         instead of JSON. Uses INNER JOIN on DatasetID.
+
+        IMPORTANT - Unit Handling:
+        --------------------------
+        The c5dat table contains "C5" computational format data that is ALREADY
+        unit-normalized by X4Pro:
+        - x1 (Energy): Always in eV (electronvolts)
+        - y (CrossSection): Always in barns (b)
+        - dy (Uncertainty): Always in barns (b)
+
+        X4Pro performs unit conversion from the original EXFOR format (which may have
+        keV, MeV, mb, μb, etc.) to standard eV/barns during database creation.
 
         Args:
             conn: SQLite connection
@@ -672,6 +706,10 @@ class X4Ingestor:
             'energy_value': 'Energy',
             'en': 'Energy',        # X4Pro: En → Energy
 
+            'den': 'Energy_Uncertainty',  # X4Pro: dEn → Energy_Uncertainty
+            'd_energy': 'Energy_Uncertainty',
+            'energy_error': 'Energy_Uncertainty',
+
             'xs': 'CrossSection',
             'data': 'CrossSection',  # X4Pro: Data → CrossSection
             'cross_section': 'CrossSection',
@@ -703,9 +741,13 @@ class X4Ingestor:
         if 'Entry' not in df_norm.columns:
             df_norm['Entry'] = 'UNKNOWN'
 
-        # Add Uncertainty if missing
+        # Add Uncertainty if missing (cross-section uncertainty)
         if 'Uncertainty' not in df_norm.columns:
             df_norm['Uncertainty'] = np.nan
+
+        # Add Energy_Uncertainty if missing (energy uncertainty, less common ~20%)
+        if 'Energy_Uncertainty' not in df_norm.columns:
+            df_norm['Energy_Uncertainty'] = np.nan
 
         # Add Projectile if missing (legacy data may not have it)
         if 'Projectile' not in df_norm.columns:
@@ -713,7 +755,8 @@ class X4Ingestor:
             df_norm['Projectile'] = None  # Will be inferred from MT codes if needed
 
         # Select and order final columns
-        final_cols = ['Entry', 'Z', 'A', 'Projectile', 'MT', 'Energy', 'CrossSection', 'Uncertainty']
+        # Note: Energy_Uncertainty added for completeness but rarely used in ML training
+        final_cols = ['Entry', 'Z', 'A', 'Projectile', 'MT', 'Energy', 'Energy_Uncertainty', 'CrossSection', 'Uncertainty']
         df_norm = df_norm[final_cols]
 
         # Clean data
@@ -724,38 +767,82 @@ class X4Ingestor:
         df_norm['Energy'] = df_norm['Energy'].astype(float)
         df_norm['CrossSection'] = df_norm['CrossSection'].astype(float)
 
+        # =====================================================================
+        # UNIT VERIFICATION SANITY CHECK
+        # =====================================================================
+        # The X4Pro C5 format should have Energy in eV and CrossSection in barns.
+        # Log warnings if data appears to be in wrong units.
+        #
+        # Expected ranges:
+        # - Energy: 1e-5 eV (thermal) to 1e9 eV (1 GeV) - nuclear reaction range
+        # - CrossSection: 1e-10 b (very small) to 1e6 b (compound nuclei) - nuclear scale
+        #
+        # If median energy >> 1e9 or << 1e-5, data may be in keV/MeV not eV
+        # If median XS << 1e-10 or >> 1e6, data may be in mb/μb not barns
+
+        median_energy = df_norm['Energy'].median()
+        median_xs = df_norm['CrossSection'].median()
+
+        # Check if energy might be in wrong units
+        if median_energy > 1e12:  # Median > 1 TeV suggests MeV not eV
+            logger.warning(f"UNIT WARNING: Median energy {median_energy:.2e} suggests data may be in keV or MeV, not eV!")
+            logger.warning("  Expected: eV (electronvolts). X4Pro C5 format should be pre-converted.")
+        elif median_energy < 1e-8:  # Median < 10 neV suggests eV is correct but very low energy
+            logger.info(f"Note: Very low median energy {median_energy:.2e} eV (ultra-cold neutrons?)")
+
+        # Check if cross section might be in wrong units
+        if median_xs < 1e-15:  # Median < 1 femtobarn suggests mb or μb not barns
+            logger.warning(f"UNIT WARNING: Median XS {median_xs:.2e} suggests data may be in mb or μb, not barns!")
+            logger.warning("  Expected: barns. X4Pro C5 format should be pre-converted.")
+        elif median_xs > 1e9:  # Median > 1 Gb suggests kilobarns reported as barns
+            logger.warning(f"UNIT WARNING: Median XS {median_xs:.2e} seems very large for barns!")
+
         # Data quality filtering
         initial_count = len(df_norm)
 
+        # Filter 0: Remove natural element targets (A=0)
+        # EXFOR uses A=0 to indicate natural element targets (e.g., Mo-NAT, Fe-NAT)
+        # These cannot be enriched with AME2020 data (which requires specific isotopes)
+        # and produce invalid N = A - Z = -Z values
+        natural_mask = df_norm['A'] == 0
+        natural_filtered = natural_mask.sum()
+        if natural_filtered > 0:
+            df_norm = df_norm[~natural_mask]
+            logger.info(f"Filtered {natural_filtered:,} natural element targets (A=0)")
+
         # Filter 1: Remove non-positive energies (Energy must be > 0)
+        before_energy = len(df_norm)
         df_norm = df_norm[df_norm['Energy'] > 0]
-        energy_filtered = initial_count - len(df_norm)
+        energy_filtered = before_energy - len(df_norm)
         if energy_filtered > 0:
             logger.info(f"Filtered {energy_filtered:,} points with Energy ≤ 0")
 
         # Filter 2: Remove non-positive cross sections (CrossSection must be > 0)
+        before_xs = len(df_norm)
         df_norm = df_norm[df_norm['CrossSection'] > 0]
-        xs_filtered = initial_count - energy_filtered - len(df_norm)
+        xs_filtered = before_xs - len(df_norm)
         if xs_filtered > 0:
             logger.info(f"Filtered {xs_filtered:,} points with CrossSection ≤ 0")
 
         # Filter 3: Remove infinite values
+        before_inf = len(df_norm)
         df_norm = df_norm[np.isfinite(df_norm['Energy'])]
         df_norm = df_norm[np.isfinite(df_norm['CrossSection'])]
-        inf_filtered = initial_count - energy_filtered - xs_filtered - len(df_norm)
+        inf_filtered = before_inf - len(df_norm)
         if inf_filtered > 0:
             logger.info(f"Filtered {inf_filtered:,} points with infinite values")
 
         # Filter 4: Remove unrealistic values
         # Energy: 1e-5 eV (thermal) to 1e9 eV (1 GeV)
         # CrossSection: 1e-10 barns to 1e6 barns
+        before_range = len(df_norm)
         df_norm = df_norm[
             (df_norm['Energy'] >= 1e-5) &
             (df_norm['Energy'] <= 1e9) &
             (df_norm['CrossSection'] >= 1e-10) &
             (df_norm['CrossSection'] <= 1e6)
         ]
-        range_filtered = initial_count - energy_filtered - xs_filtered - inf_filtered - len(df_norm)
+        range_filtered = before_range - len(df_norm)
         if range_filtered > 0:
             logger.info(f"Filtered {range_filtered:,} points outside physical ranges")
 
@@ -880,7 +967,17 @@ class X4Ingestor:
         logger.info(f"Unique isotopes:         {df[['Z', 'A']].drop_duplicates().shape[0]}")
         logger.info(f"Unique reactions (MT):   {df['MT'].nunique()}")
         logger.info(f"Energy range:            {df['Energy'].min():.2e} - {df['Energy'].max():.2e} eV")
-        logger.info(f"Points with uncertainty: {df['Uncertainty'].notna().sum():,}")
+
+        # Uncertainty statistics
+        xs_unc_count = df['Uncertainty'].notna().sum()
+        xs_unc_pct = 100 * xs_unc_count / len(df) if len(df) > 0 else 0
+        logger.info(f"With XS uncertainty:     {xs_unc_count:,} ({xs_unc_pct:.1f}%)")
+
+        if 'Energy_Uncertainty' in df.columns:
+            e_unc_count = df['Energy_Uncertainty'].notna().sum()
+            e_unc_pct = 100 * e_unc_count / len(df) if len(df) > 0 else 0
+            logger.info(f"With energy uncertainty: {e_unc_count:,} ({e_unc_pct:.1f}%)")
+
         logger.info("="*70)
 
 

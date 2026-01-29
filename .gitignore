@@ -57,3 +57,32 @@ ENV/
 # OS
 .DS_Store
 Thumbs.db
+
+# Large nuclear data files — never track
+data/ENDF-B/
+
+nul
+
+# Windows reserved device names
+CON
+PRN
+AUX
+NUL
+COM1
+LPT1
+
+# Local Claude tooling
+.claude/
+
+# Local / generated model artifacts
+nucml_next/baselines/_weights.py
+
+# Local nuclear data
+data/ENDF-B/
+
+# Windows reserved junk
+nul
+
+
+
+

@@ -118,6 +118,15 @@ class XGBoostEvaluator:
         cv_folds: int = 3,
         test_size: float = 0.2,
         verbose: bool = True,
+        # Hyperparameter search space bounds
+        n_estimators_range: tuple = (50, 500),
+        max_depth_range: tuple = (3, 15),
+        learning_rate_range: tuple = (0.01, 0.3),
+        subsample_range: tuple = (0.6, 1.0),
+        # Uncertainty-based sample filtering
+        use_uncertainty_weights: Optional[str] = None,
+        missing_uncertainty_handling: str = 'median',
+        uncertainty_column: str = 'Uncertainty',
     ) -> Dict[str, Any]:
         """
         Optimize hyperparameters using Bayesian optimization.
@@ -133,10 +142,42 @@ class XGBoostEvaluator:
             cv_folds: Cross-validation folds
             test_size: Test set fraction
             verbose: Print progress
+            n_estimators_range: (min, max) for n_estimators. Default: (50, 500)
+            max_depth_range: (min, max) for max_depth. Default: (3, 15)
+            learning_rate_range: (min, max) for learning_rate. Default: (0.01, 0.3)
+            subsample_range: (min, max) for subsample. Default: (0.6, 1.0)
+            use_uncertainty_weights: Weight mode (None, 'xs', or 'both').
+                When set with missing_uncertainty_handling='exclude', samples without
+                valid uncertainty are removed before hyperparameter search.
+            missing_uncertainty_handling: How to handle missing uncertainties
+                ('median', 'equal', or 'exclude'). Only 'exclude' affects
+                the hyperparameter search by removing rows.
+            uncertainty_column: Column name for cross-section uncertainty.
 
         Returns:
             Dictionary with best_params, best_cv_score, test_mse, trials
         """
+        # Apply uncertainty-based row exclusion before optimization
+        from nucml_next.baselines._weights import normalize_weight_mode
+        weight_mode = normalize_weight_mode(use_uncertainty_weights)
+
+        if weight_mode is not None and missing_uncertainty_handling == 'exclude':
+            if uncertainty_column in df.columns:
+                n_before = len(df)
+                valid_mask = df[uncertainty_column].notna() & (df[uncertainty_column] > 0)
+                df = df[valid_mask].reset_index(drop=True)
+                n_after = len(df)
+                if verbose:
+                    print(f"  Uncertainty filter (missing_uncertainty_handling='exclude'):")
+                    print(f"    {n_before:,} → {n_after:,} samples "
+                          f"({100*n_after/n_before:.1f}% retained)")
+                    print()
+            else:
+                if verbose:
+                    print(f"  WARNING: uncertainty column '{uncertainty_column}' not found, "
+                          f"skipping exclusion filter")
+                    print()
+
         if not HYPEROPT_AVAILABLE:
             raise ImportError(
                 "hyperopt required for optimization. Install: pip install hyperopt"
@@ -160,8 +201,8 @@ class XGBoostEvaluator:
         all_numeric = list(set(numeric_cols + sparse_cols))
         feature_columns = [col for col in all_numeric if col not in exclude_columns]
 
-        if energy_column in feature_columns:
-            feature_columns.remove(energy_column)
+        # Keep energy column in features - it's critical for cross-section prediction
+        # The pipeline will log-transform it, but it should remain a feature
 
         non_numeric = [col for col in df.columns if col not in all_numeric and col not in exclude_columns]
         if len(non_numeric) > 0 and verbose:
@@ -187,29 +228,81 @@ class XGBoostEvaluator:
         X_transformed = pipeline.transform(X_features, energy)
         y_transformed = pipeline.transform_target(y)
 
-        # Handle inf/NaN
+        # Handle inf/NaN (critical for AME-enriched data)
+        # Strategy: Impute NaN with 0 (column mean in standardized space), then remove inf
         X_arr = X_transformed[feature_columns].values
         y_arr = y_transformed.values
 
-        finite_mask = np.isfinite(X_arr).all(axis=1) & np.isfinite(y_arr)
-        if not finite_mask.all():
-            n_invalid = (~finite_mask).sum()
+        # Count NaN/inf before processing
+        nan_mask = np.isnan(X_arr)
+        inf_mask = np.isinf(X_arr)
+        nan_cell_count = nan_mask.sum()
+        inf_cell_count = inf_mask.sum()
+        rows_with_nan = nan_mask.any(axis=1).sum()
+        rows_with_inf = inf_mask.any(axis=1).sum()
+        y_invalid = ~np.isfinite(y_arr)
+
+        if missing_uncertainty_handling == 'exclude' and rows_with_nan > 0:
+            # Drop rows with any NaN/inf in features
+            valid_rows = ~nan_mask.any(axis=1) & ~inf_mask.any(axis=1)
+            n_before = len(X_arr)
+            X_arr = X_arr[valid_rows]
+            y_arr = y_arr[valid_rows]
             if verbose:
-                print(f"⚠️  Removing {n_invalid:,} rows with inf/NaN ({n_invalid/len(X_arr)*100:.2f}%)")
-            X_arr = X_arr[finite_mask]
-            y_arr = y_arr[finite_mask]
+                n_samples, n_features = nan_mask.shape
+                print(f"  Feature matrix: {n_samples:,} samples x {n_features} features")
+                print(f"  NaN cells: {nan_cell_count:,} ({nan_cell_count / nan_mask.size * 100:.2f}% of cells)")
+                print(f"  Rows with any NaN: {rows_with_nan:,} ({rows_with_nan / n_samples * 100:.2f}% of samples)")
+                print(f"  Dropping {n_before - len(X_arr):,} rows with NaN/inf features "
+                      f"(missing_uncertainty_handling='exclude')")
+        else:
+            if verbose and (nan_cell_count > 0 or inf_cell_count > 0):
+                n_samples, n_features = X_arr.shape
+                print(f"  Feature matrix: {n_samples:,} samples x {n_features} features")
+                print(f"  NaN cells: {nan_cell_count:,} ({nan_cell_count / X_arr.size * 100:.2f}% of cells)")
+                print(f"  Rows with any NaN: {rows_with_nan:,} ({rows_with_nan / n_samples * 100:.2f}% of samples)")
+                print(f"  Inf cells: {inf_cell_count:,}")
+                print(f"  Target invalid: {y_invalid.sum():,} samples")
+                print(f"  Note: NaN values imputed to 0 (standardized mean); no rows removed")
+            # Impute NaN
+            X_arr = np.nan_to_num(X_arr, nan=0.0, posinf=1e10, neginf=-1e10)
+
+        # Remove rows with invalid targets
+        valid_target_mask = np.isfinite(y_arr)
+        if not valid_target_mask.all():
+            n_invalid = (~valid_target_mask).sum()
+            if verbose:
+                print(f"  Removing {n_invalid:,} rows with invalid target ({n_invalid/len(y_arr)*100:.2f}%)")
+            X_arr = X_arr[valid_target_mask]
+            y_arr = y_arr[valid_target_mask]
+
+        if len(X_arr) == 0:
+            raise ValueError(
+                "No valid samples after handling NaN/inf. Check that:\n"
+                "1. Target column (CrossSection) has valid positive values\n"
+                "2. Energy column has valid positive values\n"
+                "3. Feature columns don't have all-NaN values"
+            )
 
         # Split data
         X_train, X_test, y_train, y_test = train_test_split(
             X_arr, y_arr, test_size=test_size, random_state=42
         )
 
-        # Hyperparameter search space
+        # Hyperparameter search space (using provided ranges)
         space = {
-            'n_estimators': hp.quniform('n_estimators', 50, 500, 50),
-            'max_depth': hp.quniform('max_depth', 3, 15, 1),
-            'learning_rate': hp.loguniform('learning_rate', np.log(0.01), np.log(0.3)),
-            'subsample': hp.uniform('subsample', 0.6, 1.0),
+            'n_estimators': hp.quniform('n_estimators',
+                                        n_estimators_range[0],
+                                        n_estimators_range[1], 50),
+            'max_depth': hp.quniform('max_depth',
+                                     max_depth_range[0],
+                                     max_depth_range[1], 1),
+            'learning_rate': hp.loguniform('learning_rate',
+                                           np.log(learning_rate_range[0]),
+                                           np.log(learning_rate_range[1])),
+            'subsample': hp.uniform('subsample',
+                                    subsample_range[0],
+                                    subsample_range[1]),
             'colsample_bytree': hp.uniform('colsample_bytree', 0.6, 1.0),
             'gamma': hp.loguniform('gamma', np.log(1e-8), np.log(1.0)),
             'reg_alpha': hp.loguniform('reg_alpha', np.log(1e-8), np.log(1.0)),
@@ -320,11 +413,15 @@ class XGBoostEvaluator:
         df: pd.DataFrame,
         target_column: str = 'CrossSection',
         energy_column: str = 'Energy',
+        uncertainty_column: str = 'Uncertainty',
+        energy_uncertainty_column: str = 'Energy_Uncertainty',
         test_size: float = 0.2,
         exclude_columns: Optional[list] = None,
         pipeline: Optional[TransformationPipeline] = None,
         transformation_config: Optional[TransformationConfig] = None,
         early_stopping_rounds: Optional[int] = 10,
+        use_uncertainty_weights: Optional[str] = None,
+        missing_uncertainty_handling: str = 'median',
     ) -> Dict[str, float]:
         """
         Train the XGBoost model with full pipeline integration.
@@ -333,30 +430,72 @@ class XGBoostEvaluator:
             df: Training data with particle emission vectors (from to_tabular())
             target_column: Target column name
             energy_column: Energy column name
+            uncertainty_column: Cross-section uncertainty column name
+            energy_uncertainty_column: Energy uncertainty column name
             test_size: Test set fraction
             exclude_columns: Columns to exclude
             pipeline: Pre-configured pipeline (recommended)
             transformation_config: Config for new pipeline (if pipeline=None)
             early_stopping_rounds: Early stopping rounds (None to disable)
+            use_uncertainty_weights: Uncertainty weighting mode:
+
+                * ``None`` – no weighting (default)
+                * ``'xs'`` – inverse-variance weighting using
+                  cross-section uncertainty only (w = 1/sigma_xs^2)
+                * ``'both'`` – combined weighting using cross-section AND
+                  energy uncertainty (w = 1/(sigma_xs^2 * sigma_E^2))
+            missing_uncertainty_handling: How to handle samples with missing
+                uncertainties when weighting is enabled:
+
+                - ``'median'``: Assign median weight (default, keeps all samples)
+                - ``'equal'``: Assign weight 1.0 (keeps all samples)
+                - ``'exclude'``: Drop samples without valid uncertainty
 
         Returns:
             Training metrics dictionary
+
+        Note on Sample Weighting:
+            When use_uncertainty_weights is enabled:
+            - 'xs': w_i = 1 / sigma_xs_i^2
+            - 'both': w_i = 1 / (sigma_xs_i^2 * sigma_E_i^2)
+            - Weights are normalized to mean=1 to avoid numerical issues
+            - This is statistically correct for least-squares regression
         """
+        from nucml_next.baselines._weights import normalize_weight_mode, compute_sample_weights
+
+        # Validate parameters
+        valid_handling = {'median', 'equal', 'exclude'}
+        if missing_uncertainty_handling not in valid_handling:
+            raise ValueError(f"missing_uncertainty_handling must be one of {valid_handling}")
+
+        weight_mode = normalize_weight_mode(use_uncertainty_weights)
+
         # Prepare features
         if exclude_columns is None:
-            exclude_columns = [target_column, 'Uncertainty', 'Entry', 'MT']
+            exclude_columns = [target_column, 'Uncertainty', 'Energy_Uncertainty', 'Entry', 'MT']
 
-        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-        sparse_cols = [col for col in df.columns if isinstance(df[col].dtype, pd.SparseDtype)]
+        working_df = df.copy()
+
+        numeric_cols = working_df.select_dtypes(include=[np.number]).columns.tolist()
+        sparse_cols = [col for col in working_df.columns if isinstance(working_df[col].dtype, pd.SparseDtype)]
         all_numeric = list(set(numeric_cols + sparse_cols))
         self.feature_columns = [col for col in all_numeric if col not in exclude_columns]
 
-        if energy_column in self.feature_columns:
-            self.feature_columns.remove(energy_column)
+        # Keep energy column in features - it's critical for cross-section prediction
+        # The pipeline will log-transform it, but it should remain a feature
 
-        X_features = df[self.feature_columns]
-        y = df[target_column]
-        energy = df[energy_column] if energy_column in df.columns else None
+        X_features = working_df[self.feature_columns]
+        y = working_df[target_column]
+        energy = working_df[energy_column] if energy_column in working_df.columns else None
+
+        # Compute sample weights from uncertainty (inverse variance weighting)
+        sample_weights = compute_sample_weights(
+            working_df,
+            mode=weight_mode,
+            uncertainty_column=uncertainty_column,
+            energy_uncertainty_column=energy_uncertainty_column,
+            missing_handling=missing_uncertainty_handling,
+        )
 
         # Create or use pipeline
         if pipeline is None:
@@ -375,18 +514,80 @@ class XGBoostEvaluator:
         X_arr = X_transformed[self.feature_columns].values
         y_arr = y_transformed.values
 
-        # Handle inf/NaN
-        finite_mask = np.isfinite(X_arr).all(axis=1) & np.isfinite(y_arr)
-        if not finite_mask.all():
-            n_invalid = (~finite_mask).sum()
-            print(f"  ⚠️  Removing {n_invalid:,} rows with inf/NaN ({n_invalid/len(X_arr)*100:.2f}%)")
-            X_arr = X_arr[finite_mask]
-            y_arr = y_arr[finite_mask]
+        # Handle inf/NaN (critical for AME-enriched data)
+        nan_mask = np.isnan(X_arr)
+        inf_mask = np.isinf(X_arr)
+        nan_cell_count = nan_mask.sum()
+        inf_cell_count = inf_mask.sum()
+        rows_with_nan = nan_mask.any(axis=1).sum()
+        y_invalid = ~np.isfinite(y_arr)
 
-        # Split data
-        X_train, X_test, y_train, y_test = train_test_split(
-            X_arr, y_arr, test_size=test_size, random_state=self.params['random_state']
-        )
+        if missing_uncertainty_handling == 'exclude' and rows_with_nan > 0:
+            # Drop rows with any NaN/inf in features
+            valid_rows = ~nan_mask.any(axis=1) & ~inf_mask.any(axis=1)
+            n_before = len(X_arr)
+            X_arr = X_arr[valid_rows]
+            y_arr = y_arr[valid_rows]
+            if sample_weights is not None:
+                sample_weights = sample_weights[valid_rows]
+            n_samples, n_features = nan_mask.shape
+            print(f"  Feature matrix: {n_samples:,} samples x {n_features} features")
+            print(f"  NaN cells: {nan_cell_count:,} ({nan_cell_count / nan_mask.size * 100:.2f}% of cells)")
+            print(f"  Rows with any NaN: {rows_with_nan:,} ({rows_with_nan / n_samples * 100:.2f}% of samples)")
+            print(f"  Dropping {n_before - len(X_arr):,} rows with NaN/inf features "
+                  f"(missing_uncertainty_handling='exclude')")
+        else:
+            if nan_cell_count > 0 or inf_cell_count > 0:
+                n_samples, n_features = X_arr.shape
+                print(f"  Feature matrix: {n_samples:,} samples x {n_features} features")
+                print(f"  NaN cells: {nan_cell_count:,} ({nan_cell_count / X_arr.size * 100:.2f}% of cells)")
+                print(f"  Rows with any NaN: {rows_with_nan:,} ({rows_with_nan / n_samples * 100:.2f}% of samples)")
+                print(f"  Inf cells: {inf_cell_count:,}")
+                print(f"  Target invalid: {y_invalid.sum():,} samples")
+                print(f"  Note: NaN values imputed to 0 (standardized mean); no rows removed")
+            # Impute NaN
+            X_arr = np.nan_to_num(X_arr, nan=0.0, posinf=1e10, neginf=-1e10)
+
+        # Remove rows with invalid targets (and corresponding sample weights)
+        valid_target_mask = np.isfinite(y_arr)
+        if not valid_target_mask.all():
+            n_invalid = (~valid_target_mask).sum()
+            print(f"  Removing {n_invalid:,} rows with invalid target ({n_invalid/len(y_arr)*100:.2f}%)")
+            X_arr = X_arr[valid_target_mask]
+            y_arr = y_arr[valid_target_mask]
+            if sample_weights is not None:
+                sample_weights = sample_weights[valid_target_mask]
+
+        # Remove rows with NaN sample weights (from missing_uncertainty_handling='exclude')
+        if sample_weights is not None:
+            valid_weight_mask = np.isfinite(sample_weights)
+            if not valid_weight_mask.all():
+                n_excluded = (~valid_weight_mask).sum()
+                print(f"  Excluding {n_excluded:,} rows without valid uncertainty "
+                      f"(missing_uncertainty_handling='exclude')")
+                X_arr = X_arr[valid_weight_mask]
+                y_arr = y_arr[valid_weight_mask]
+                sample_weights = sample_weights[valid_weight_mask]
+
+        if len(X_arr) == 0:
+            raise ValueError(
+                "No valid samples after handling NaN/inf. Check that:\n"
+                "1. Target column (CrossSection) has valid positive values\n"
+                "2. Energy column has valid positive values\n"
+                "3. Feature columns don't have all-NaN values"
+            )
+
+        # Split data (include sample weights if using uncertainty weighting)
+        if sample_weights is not None:
+            X_train, X_test, y_train, y_test, w_train, w_test = train_test_split(
+                X_arr, y_arr, sample_weights,
+                test_size=test_size, random_state=self.params['random_state']
+            )
+        else:
+            X_train, X_test, y_train, y_test = train_test_split(
+                X_arr, y_arr, test_size=test_size, random_state=self.params['random_state']
+            )
+            w_train = None
 
         # Train model
         print(f"Training XGBoost ({self.params['n_estimators']} trees, "
@@ -396,6 +597,7 @@ class XGBoostEvaluator:
         self.model.fit(
             X_train,
             y_train,
+            sample_weight=w_train,
             eval_set=eval_set,
             verbose=False,
         )
@@ -461,6 +663,9 @@ class XGBoostEvaluator:
         # Transform
         X_transformed = self.pipeline.transform(X_features, energy)
         X_arr = X_transformed[self.feature_columns].values
+
+        # Handle NaN with same imputation as training (0 = mean in standardized space)
+        X_arr = np.nan_to_num(X_arr, nan=0.0, posinf=1e10, neginf=-1e10)
 
         # Predict in transformed space
         y_pred_transformed = self.model.predict(X_arr)

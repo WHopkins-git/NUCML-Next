@@ -169,25 +169,38 @@ class TransformationPipeline:
 
             if self.config.scaler_type == 'standard':
                 # Z-score normalization: (X - μ) / σ
-                self.feature_mean_ = np.mean(X_features, axis=0)
-                self.feature_std_ = np.std(X_features, axis=0)
+                # Use nanmean/nanstd to ignore NaN values (e.g., missing AME separation energies)
+                self.feature_mean_ = np.nanmean(X_features, axis=0)
+                self.feature_std_ = np.nanstd(X_features, axis=0)
+                # Handle all-NaN columns: nanmean/nanstd return NaN for all-NaN input
+                # Replace NaN with 0 (mean) and 1 (std) so these columns become zeros after scaling
+                self.feature_mean_[np.isnan(self.feature_mean_)] = 0.0
+                self.feature_std_[np.isnan(self.feature_std_)] = 1.0
                 # Prevent division by zero for constant features
                 self.feature_std_[self.feature_std_ == 0] = 1.0
 
             elif self.config.scaler_type == 'minmax':
                 # Min-max scaling: (X - min) / (max - min)
-                self.feature_min_ = np.min(X_features, axis=0)
-                self.feature_max_ = np.max(X_features, axis=0)
+                # Use nanmin/nanmax to ignore NaN values
+                self.feature_min_ = np.nanmin(X_features, axis=0)
+                self.feature_max_ = np.nanmax(X_features, axis=0)
+                # Handle all-NaN columns: nanmin/nanmax return NaN for all-NaN input
+                self.feature_min_[np.isnan(self.feature_min_)] = 0.0
+                self.feature_max_[np.isnan(self.feature_max_)] = 1.0
                 # Prevent division by zero for constant features
                 range_ = self.feature_max_ - self.feature_min_
                 self.feature_max_[range_ == 0] = self.feature_min_[range_ == 0] + 1.0
 
             elif self.config.scaler_type == 'robust':
                 # Robust scaling: (X - median) / IQR
-                self.feature_median_ = np.median(X_features, axis=0)
-                q75 = np.percentile(X_features, 75, axis=0)
-                q25 = np.percentile(X_features, 25, axis=0)
+                # Use nanmedian/nanpercentile to ignore NaN values
+                self.feature_median_ = np.nanmedian(X_features, axis=0)
+                q75 = np.nanpercentile(X_features, 75, axis=0)
+                q25 = np.nanpercentile(X_features, 25, axis=0)
                 self.feature_iqr_ = q75 - q25
+                # Handle all-NaN columns: nanmedian/nanpercentile return NaN for all-NaN input
+                self.feature_median_[np.isnan(self.feature_median_)] = 0.0
+                self.feature_iqr_[np.isnan(self.feature_iqr_)] = 1.0
                 # Prevent division by zero for constant features
                 self.feature_iqr_[self.feature_iqr_ == 0] = 1.0
 
@@ -233,7 +246,7 @@ class TransformationPipeline:
 
         # 1. Scale features based on scaler_type
         if self.config.scaler_type != 'none':
-            X_features = X[self.feature_columns_].values
+            X_features = X[self.feature_columns_].values.astype(np.float64)
 
             if self.config.scaler_type == 'standard':
                 # Z-score normalization: (X - μ) / σ
@@ -246,6 +259,12 @@ class TransformationPipeline:
             elif self.config.scaler_type == 'robust':
                 # Robust scaling: (X - median) / IQR
                 X_scaled = (X_features - self.feature_median_) / self.feature_iqr_
+
+            # Handle inf values that can arise from:
+            # - Division when std/IQR/range is very small (despite our std==0 check)
+            # - Input data containing extreme values
+            # Replace inf with large finite values to allow downstream processing
+            X_scaled = np.nan_to_num(X_scaled, nan=np.nan, posinf=1e10, neginf=-1e10)
 
             X_transformed[self.feature_columns_] = X_scaled
 

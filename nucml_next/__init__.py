@@ -17,7 +17,8 @@ Modules:
     model: Deep learning architectures (GNN, Transformer)
     physics: Physics-informed loss functions (Unitarity, Thresholds)
     validation: OpenMC integration for reactor validation
-    utils: Visualization and helper utilities
+    visualization: Publication-quality cross-section plots (EXFOR, ENDF, ML models)
+    utils: Metrics and helper utilities
 
 Authors: NUCML-Next Team
 License: MIT
@@ -29,7 +30,7 @@ __version__ = "1.0.0"
 # Submodules will be imported on first access
 def __getattr__(name):
     """Lazy import for submodules to avoid loading unnecessary dependencies."""
-    if name in ["data", "baselines", "model", "physics", "validation", "utils"]:
+    if name in ["data", "baselines", "model", "physics", "validation", "visualization", "utils"]:
         import importlib
         module = importlib.import_module(f"nucml_next.{name}")
         globals()[name] = module
@@ -42,5 +43,6 @@ __all__ = [
     "model",
     "physics",
     "validation",
+    "visualization",
     "utils",
 ]
