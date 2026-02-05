@@ -77,9 +77,6 @@ LPT1
 # Experiment artefacts (model weights, scalers, figures)
 save/
 
-# Local / generated model artifacts
-nucml_next/baselines/_weights.py
-
 # Local nuclear data
 data/ENDF-B/
 

@@ -407,7 +407,7 @@ class NucmlDataset(TorchDataset):
             table = pq.read_table(
                 str(data_path),
                 columns=essential_columns,  # Column pruning
-                filters=self._build_filters(filters),  # Filter pushdown
+                filters=self._build_filters(legacy_filters),  # Filter pushdown
                 memory_map=True,  # Memory-mapped I/O (faster, less RAM)
                 use_threads=True  # Parallel read
             )
