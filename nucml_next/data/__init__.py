@@ -37,10 +37,51 @@ from nucml_next.data.mt_codes import (
 from nucml_next.ingest import X4Ingestor, ingest_x4, AME2020Loader
 
 def __getattr__(name):
-    """Lazy import for GraphBuilder (requires torch)."""
+    """Lazy import for torch-dependent modules."""
     if name == "GraphBuilder":
         from nucml_next.data.graph_builder import GraphBuilder
         return GraphBuilder
+    if name == "HoldoutConfig":
+        from nucml_next.experiment import HoldoutConfig
+        return HoldoutConfig
+    # Outlier detection (requires torch/gpytorch)
+    if name == "SVGPOutlierDetector":
+        from nucml_next.data.outlier_detection import SVGPOutlierDetector
+        return SVGPOutlierDetector
+    if name == "SVGPConfig":
+        from nucml_next.data.outlier_detection import SVGPConfig
+        return SVGPConfig
+    if name == "extract_svgp_hyperparameters":
+        from nucml_next.data.outlier_detection import extract_svgp_hyperparameters
+        return extract_svgp_hyperparameters
+    # Per-experiment outlier detection (new approach)
+    if name == "ExperimentOutlierDetector":
+        from nucml_next.data.experiment_outlier import ExperimentOutlierDetector
+        return ExperimentOutlierDetector
+    if name == "ExperimentOutlierConfig":
+        from nucml_next.data.experiment_outlier import ExperimentOutlierConfig
+        return ExperimentOutlierConfig
+    if name == "ExactGPExperiment":
+        from nucml_next.data.experiment_gp import ExactGPExperiment
+        return ExactGPExperiment
+    if name == "ExactGPExperimentConfig":
+        from nucml_next.data.experiment_gp import ExactGPExperimentConfig
+        return ExactGPExperimentConfig
+    if name == "ConsensusBuilder":
+        from nucml_next.data.consensus import ConsensusBuilder
+        return ConsensusBuilder
+    if name == "ConsensusConfig":
+        from nucml_next.data.consensus import ConsensusConfig
+        return ConsensusConfig
+    if name == "prepare_log_uncertainties":
+        from nucml_next.data.experiment_gp import prepare_log_uncertainties
+        return prepare_log_uncertainties
+    if name == "compute_wasserstein_calibration":
+        from nucml_next.data.calibration import compute_wasserstein_calibration
+        return compute_wasserstein_calibration
+    if name == "optimize_lengthscale_wasserstein":
+        from nucml_next.data.calibration import optimize_lengthscale_wasserstein
+        return optimize_lengthscale_wasserstein
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
@@ -62,4 +103,19 @@ __all__ = [
     "X4Ingestor",
     "ingest_x4",
     "AME2020Loader",
+    "HoldoutConfig",
+    # Legacy SVGP outlier detection
+    "SVGPOutlierDetector",
+    "SVGPConfig",
+    "extract_svgp_hyperparameters",
+    # Per-experiment outlier detection (new approach)
+    "ExperimentOutlierDetector",
+    "ExperimentOutlierConfig",
+    "ExactGPExperiment",
+    "ExactGPExperimentConfig",
+    "ConsensusBuilder",
+    "ConsensusConfig",
+    "prepare_log_uncertainties",
+    "compute_wasserstein_calibration",
+    "optimize_lengthscale_wasserstein",
 ]

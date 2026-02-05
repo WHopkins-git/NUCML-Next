@@ -379,12 +379,12 @@ class AME2020DataEnricher:
                     records.append({
                         'Z': Z,
                         'A': A,
-                        'S_2n': values[0],
-                        'S_2p': values[1],
-                        'Q_alpha': values[2],
-                        'Q_2beta_minus': values[3],
-                        'Q_ep': values[4],
-                        'Q_beta_n': values[5],
+                        'S_2n_keV': values[0],
+                        'S_2p_keV': values[1],
+                        'Q_alpha_keV': values[2],
+                        'Q_2beta_minus_keV': values[3],
+                        'Q_ep_keV': values[4],
+                        'Q_beta_n_keV': values[5],
                     })
 
                 except (ValueError, IndexError):
@@ -480,12 +480,12 @@ class AME2020DataEnricher:
                     records.append({
                         'Z': Z,
                         'A': A,
-                        'S_1n': values[0],
-                        'S_1p': values[1],
-                        'Q_4beta_minus': values[2],
-                        'Q_d_alpha': values[3],
-                        'Q_p_alpha': values[4],
-                        'Q_n_alpha': values[5],
+                        'S_1n_keV': values[0],
+                        'S_1p_keV': values[1],
+                        'Q_4beta_minus_keV': values[2],
+                        'Q_d_alpha_keV': values[3],
+                        'Q_p_alpha_keV': values[4],
+                        'Q_n_alpha_keV': values[5],
                     })
 
                 except (ValueError, IndexError):
@@ -662,10 +662,20 @@ class AME2020DataEnricher:
 
         Returns:
             Half-life in seconds, or None if stable/unparseable
+
+        Note:
+            Stable isotopes return 1e30 seconds (a very large finite value) instead of inf.
+            This is ~3e22 years, much larger than the age of the universe (~4.4e17 s).
+            Using a finite value avoids inf/NaN issues in ML pipelines while still
+            representing "effectively infinite" half-life.
         """
         # Handle special cases
+        # NOTE: Use large finite value instead of inf to avoid ML pipeline issues
+        # 1e30 seconds ≈ 3e22 years >> age of universe (~1.4e10 years)
+        STABLE_HALFLIFE_S = 1e30
+
         if 'stbl' in halflife_str or 'stable' in halflife_str:
-            return np.inf  # Stable
+            return STABLE_HALFLIFE_S  # Stable (large finite value, not inf)
         if 'p-unst' in halflife_str:
             return 0.0  # Particle unstable (essentially immediate)
 
@@ -886,9 +896,9 @@ class AME2020DataEnricher:
             ])
 
         if 'C' in tiers:
-            # Tier C adds separation energies
+            # Tier C adds separation energies (keV units, converted to MeV in features.py)
             columns.extend([
-                'S_1n', 'S_2n', 'S_1p', 'S_2p'
+                'S_1n_keV', 'S_2n_keV', 'S_1p_keV', 'S_2p_keV'
             ])
 
         if 'D' in tiers:
@@ -898,10 +908,10 @@ class AME2020DataEnricher:
             ])
 
         if 'E' in tiers:
-            # Tier E adds all Q-values
+            # Tier E adds all Q-values (keV units, converted to MeV in features.py)
             columns.extend([
-                'Q_alpha', 'Q_2beta_minus', 'Q_ep', 'Q_beta_n',
-                'Q_4beta_minus', 'Q_d_alpha', 'Q_p_alpha', 'Q_n_alpha'
+                'Q_alpha_keV', 'Q_2beta_minus_keV', 'Q_ep_keV', 'Q_beta_n_keV',
+                'Q_4beta_minus_keV', 'Q_d_alpha_keV', 'Q_p_alpha_keV', 'Q_n_alpha_keV'
             ])
 
         return columns

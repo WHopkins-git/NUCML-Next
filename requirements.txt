@@ -21,6 +21,7 @@ torch>=2.0.0
 torch-geometric>=2.3.0
 torch-scatter>=2.1.0
 torch-sparse>=0.6.0
+gpytorch>=1.11
 
 # Visualization
 matplotlib>=3.7.0

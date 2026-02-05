@@ -41,6 +41,7 @@ setup(
         "xgboost>=2.0.0",
         "torch>=2.0.0",
         "torch-geometric>=2.3.0",
+        "gpytorch>=1.11",
         "matplotlib>=3.7.0",
         "seaborn>=0.12.0",
         "joblib>=1.3.0",

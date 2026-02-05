@@ -20,16 +20,21 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 # Optional PyTorch imports (only required for graph mode)
+# Catch both ImportError and OSError (DLL initialization failures on Windows)
 try:
     from torch.utils.data import Dataset as TorchDataset
     import torch
     from torch_geometric.data import Data
     TORCH_AVAILABLE = True
-except ImportError:
+except (ImportError, OSError) as e:
     TORCH_AVAILABLE = False
     TorchDataset = object  # Fallback base class for tabular-only mode
     torch = None
     Data = None
+    # Log warning if it's an OSError (DLL issue) rather than missing package
+    if isinstance(e, OSError):
+        import warnings
+        warnings.warn(f"PyTorch DLL initialization failed: {e}. Graph mode disabled.")
 
 # Lazy import GraphBuilder (requires torch) - only imported when needed
 # from nucml_next.data.graph_builder import GraphBuilder  # Moved to lazy import in __init__
@@ -173,11 +178,21 @@ class NucmlDataset(TorchDataset):
         # Load EXFOR data from Parquet (optimized for large files)
         print(f"\nLoading data from {self.data_path}...")
         self.df = self._load_parquet_data(self.data_path, self.selection, self.filters, lazy_load)
-        print(f"✓ Loaded {len(self.df):,} EXFOR data points from {self.data_path}")
+        print(f"[OK] Loaded {len(self.df):,} EXFOR data points from {self.data_path}")
 
         # Apply on-demand AME enrichment if needed (based on requested tiers)
         if self.selection and self.selection.tiers:
             self._enrich_with_ame_if_needed(self.selection.tiers)
+
+            # Also enrich the stashed holdout data (if any) so that
+            # get_holdout_data() can project to the same tier features.
+            holdout_raw = getattr(self, '_holdout_df', None)
+            if holdout_raw is not None and not holdout_raw.empty:
+                _original_df = self.df
+                self.df = holdout_raw
+                self._enrich_with_ame_if_needed(self.selection.tiers)
+                self._holdout_df = self.df
+                self.df = _original_df
 
         # Initialize graph builder (only for graph mode) and tabular projector
         if self.mode == 'graph':
@@ -193,7 +208,7 @@ class NucmlDataset(TorchDataset):
             # Build graph eagerly only if explicitly requested
             print("Building global graph structure...")
             self.graph_data = self.graph_builder.build_global_graph()
-            print(f"✓ Graph built: {self.graph_data.num_nodes} nodes, {self.graph_data.num_edges} edges")
+            print(f"[OK] Graph built: {self.graph_data.num_nodes} nodes, {self.graph_data.num_edges} edges")
 
     def _load_parquet_data(
         self,
@@ -232,7 +247,10 @@ class NucmlDataset(TorchDataset):
         # NOTE: For single-file data, Z, A, MT must be in the column list
         # NOTE: AME columns (Mass_Excess_keV, etc.) are added later via on-demand enrichment
         essential_columns = [
-            'Entry', 'Z', 'A', 'N', 'MT', 'Energy', 'CrossSection', 'Uncertainty'
+            'Entry', 'Z', 'A', 'N', 'MT', 'Energy', 'CrossSection',
+            'Uncertainty', 'Energy_Uncertainty',  # Both uncertainty columns for weighting
+            'Projectile',  # Needed for projectile filtering (neutron vs charged particle)
+            'z_score', 'gp_mean', 'gp_std',  # SVGP outlier columns (optional, from --run-svgp)
         ]
 
         # Check if partitioned dataset (directory) or single file
@@ -302,7 +320,7 @@ class NucmlDataset(TorchDataset):
                     print("  ⚠️  Warning: No fragments matched filter criteria. Returning empty DataFrame.")
                     return pd.DataFrame()
 
-                print(f"  ⏳ Reading {total_fragments} partition fragments (showing progress every 10%)...")
+                print(f"  Reading {total_fragments} partition fragments (showing progress every 10%)...")
                 start = time.time()
 
                 # Read fragments in batches with progress updates
@@ -310,9 +328,13 @@ class NucmlDataset(TorchDataset):
                 report_interval = max(1, total_fragments // 10)  # Report every 10%
 
                 for i, fragment in enumerate(fragments):
-                    # Read fragment data (without partition columns initially)
+                    # Read fragment data with row-level filter applied
+                    # NOTE: get_fragments(filter=) only prunes at the partition level
+                    # (Z/A/MT directories). Non-partition filters like Energy must be
+                    # applied here so PyArrow pushes them into the Parquet row-group reader.
                     fragment_table = fragment.to_table(
                         columns=None,  # Read all data columns
+                        filter=filter_expr,  # Apply Energy (and other) filters within each file
                         use_threads=True
                     )
 
@@ -356,21 +378,21 @@ class NucmlDataset(TorchDataset):
                         print(f"    Progress: {percent:3d}% ({i+1}/{total_fragments} fragments, {elapsed:.0f}s elapsed, ETA {eta:.0f}s)")
 
                 # Concatenate all tables
-                print("  ⏳ Concatenating fragments...")
+                print("  [*] Concatenating fragments...")
                 import pyarrow.compute as pc
                 table = pa.concat_tables(tables)
                 read_time = time.time() - start
-                print(f"  ✓ Read complete: {read_time:.1f}s, {table.nbytes / 1e9:.2f} GB")
+                print(f"  [OK] Read complete: {read_time:.1f}s, {table.nbytes / 1e9:.2f} GB")
 
                 # Convert to pandas (this is often the slowest part)
-                print("  ⏳ Converting to Pandas...")
+                print("  [*] Converting to Pandas...")
                 start = time.time()
                 df = table.to_pandas()
                 convert_time = time.time() - start
-                print(f"  ✓ Conversion complete: {convert_time:.1f}s")
+                print(f"  [OK] Conversion complete: {convert_time:.1f}s")
 
                 total_time = time.time() - start_total
-                print(f"  ✓ Total load time: {total_time:.1f}s")
+                print(f"  [OK] Total load time: {total_time:.1f}s")
 
         else:
             # Single Parquet file
@@ -380,7 +402,7 @@ class NucmlDataset(TorchDataset):
             start_total = time.time()
 
             # Read table
-            print("  ⏳ Reading Parquet file...")
+            print("  [*] Reading Parquet file...")
             start = time.time()
             table = pq.read_table(
                 str(data_path),
@@ -390,17 +412,17 @@ class NucmlDataset(TorchDataset):
                 use_threads=True  # Parallel read
             )
             read_time = time.time() - start
-            print(f"  ✓ Read complete: {read_time:.1f}s, {table.nbytes / 1e9:.2f} GB")
+            print(f"  [OK] Read complete: {read_time:.1f}s, {table.nbytes / 1e9:.2f} GB")
 
             # Convert to pandas
-            print("  ⏳ Converting to Pandas...")
+            print("  [*] Converting to Pandas...")
             start = time.time()
             df = table.to_pandas()
             convert_time = time.time() - start
-            print(f"  ✓ Conversion complete: {convert_time:.1f}s")
+            print(f"  [OK] Conversion complete: {convert_time:.1f}s")
 
             total_time = time.time() - start_total
-            print(f"  ✓ Total load time: {total_time:.1f}s")
+            print(f"  [OK] Total load time: {total_time:.1f}s")
 
         # Post-load filtering (applied to DataFrame after reading)
         if selection is not None:
@@ -409,13 +431,8 @@ class NucmlDataset(TorchDataset):
 
             # 1. Projectile filtering (neutrons only)
             # Prefer explicit Projectile column if available, otherwise use MT codes
-            # NOTE: Skip if already filtered at fragment level (mt_mode='all_physical' + projectile='neutron')
-            # In that case, predicate pushdown already filtered to neutron MT codes
-            needs_projectile_filter = (
-                selection.projectile == 'neutron' and
-                not (selection.mt_mode == 'all_physical')  # Already filtered at fragment level
-            )
-            if needs_projectile_filter:
+            # ALWAYS apply this filter when projectile='neutron' to exclude charged particle reactions
+            if selection.projectile == 'neutron':
                 before = len(df)
 
                 # Method 1: Use explicit Projectile column if available (most accurate)
@@ -423,7 +440,7 @@ class NucmlDataset(TorchDataset):
                     df = df[df['Projectile'] == 'n']  # 'n' = neutron in EXFOR
                     removed = before - len(df)
                     if removed > 0:
-                        print(f"  ✓ Projectile filter (neutrons): Removed {removed:,} non-neutron reactions (using explicit Projectile column)")
+                        print(f"  [OK] Projectile filter (neutrons): Removed {removed:,} non-neutron reactions (using explicit Projectile column)")
 
                 # Method 2: Fall back to MT code filtering (for legacy data without Projectile)
                 else:
@@ -432,21 +449,47 @@ class NucmlDataset(TorchDataset):
                         df = df[df['MT'].isin(projectile_mt)]
                         removed = before - len(df)
                         if removed > 0:
-                            print(f"  ✓ Projectile filter (neutrons): Removed {removed:,} non-neutron reactions (inferred from MT codes)")
+                            print(f"  [OK] Projectile filter (neutrons): Removed {removed:,} non-neutron reactions (inferred from MT codes)")
 
-            # 2. Holdout isotopes (exclude specific Z/A pairs for evaluation)
-            if selection.holdout_isotopes:
-                before = len(df)
-                for z, a in selection.holdout_isotopes:
-                    df = df[~((df['Z'] == z) & (df['A'] == a))]
-                removed = before - len(df)
-                if removed > 0:
-                    isotopes_str = ', '.join([f"({z},{a})" for z, a in selection.holdout_isotopes])
-                    print(f"  ✓ Holdout filter: Removed {removed:,} measurements from {isotopes_str}")
+            # 2. Phase-space holdout (rich criteria or legacy isotope list)
+            holdout_cfg = getattr(selection, 'holdout_config', None)
+            if holdout_cfg is not None and holdout_cfg.rules:
+                holdout_mask = holdout_cfg.build_mask(df)
+                n_holdout = int(holdout_mask.sum())
+                if n_holdout > 0:
+                    self._holdout_df = df.loc[holdout_mask].copy()
+                    df = df.loc[~holdout_mask].copy()
+                    print(f"  [OK] Holdout filter: Reserved {n_holdout:,} measurements "
+                          f"({len(holdout_cfg.rules)} rule(s))")
+                else:
+                    self._holdout_df = pd.DataFrame()
+            else:
+                self._holdout_df = None
 
-            # 3. Data validity (drop NaN or non-positive cross-sections)
+            # 3. Outlier filtering (z_score-based, from SVGP ingestion)
+            if selection.z_threshold is not None and not selection.include_outliers:
+                if 'z_score' in df.columns:
+                    before = len(df)
+                    df = df[df['z_score'] <= selection.z_threshold]
+                    removed = before - len(df)
+                    if removed > 0:
+                        print(f"  [OK] Outlier filter: Removed {removed:,} points with z_score > {selection.z_threshold}")
+                else:
+                    print(f"  [!] Warning: z_threshold={selection.z_threshold} specified but z_score column "
+                          f"not found in Parquet. Run ingestion with --run-svgp to enable outlier filtering.")
+
+            # 4. Data validity (drop NaN or non-positive cross-sections, invalid isotopes)
             if selection.drop_invalid:
                 before = len(df)
+
+                # Drop invalid isotope entries (A must be >= 1 for valid nuclides)
+                # EXFOR sometimes has A=0 which causes all AME enrichment columns to be NaN
+                if 'A' in df.columns:
+                    invalid_isotope_mask = df['A'] < 1
+                    n_invalid_isotopes = invalid_isotope_mask.sum()
+                    if n_invalid_isotopes > 0:
+                        df = df[~invalid_isotope_mask]
+                        print(f"  [OK] Isotope validity: Removed {n_invalid_isotopes:,} entries with invalid A<1")
 
                 # Drop NaN cross-sections
                 df = df.dropna(subset=['CrossSection'])
@@ -456,11 +499,11 @@ class NucmlDataset(TorchDataset):
 
                 removed = before - len(df)
                 if removed > 0:
-                    print(f"  ✓ Validity filter: Removed {removed:,} invalid measurements (NaN or ≤0)")
+                    print(f"  [OK] Validity filter: Removed {removed:,} invalid measurements (NaN or ≤0)")
 
             final_rows = len(df)
             if initial_rows != final_rows:
-                print(f"  Summary: {initial_rows:,} → {final_rows:,} ({100 * final_rows / initial_rows:.1f}% retained)\n")
+                print(f"  Summary: {initial_rows:,} -> {final_rows:,} ({100 * final_rows / initial_rows:.1f}% retained)\n")
 
         return df
 
@@ -577,8 +620,8 @@ class NucmlDataset(TorchDataset):
             n_enriched = self.df['Mass_Excess_keV'].notna().sum() if 'Mass_Excess_keV' in self.df.columns else 0
             coverage = 100 * n_enriched / len(self.df) if len(self.df) > 0 else 0
 
-            print(f"  ✓ Added {added_cols} AME enrichment columns")
-            print(f"  ✓ Coverage: {n_enriched:,} / {len(self.df):,} ({coverage:.1f}%) measurements enriched\n")
+            print(f"  [OK] Added {added_cols} AME enrichment columns")
+            print(f"  [OK] Coverage: {n_enriched:,} / {len(self.df):,} ({coverage:.1f}%) measurements enriched\n")
 
         except Exception as e:
             print(f"\n  ⚠️  WARNING: Failed to load AME enrichment: {e}")
@@ -597,7 +640,7 @@ class NucmlDataset(TorchDataset):
             PyArrow filter expression
 
         Example:
-            {'Z': [92], 'MT': [18]} → [('Z', 'in', [92]), ('MT', 'in', [18])]
+            {'Z': [92], 'MT': [18]} -> [('Z', 'in', [92]), ('MT', 'in', [18])]
         """
         if not filters:
             return None
@@ -625,7 +668,7 @@ class NucmlDataset(TorchDataset):
 
         Example:
             DataSelection(projectile='neutron', energy_min=1e3, energy_max=1e6, mt_mode='reactor_core')
-            → (Energy >= 1000) & (Energy <= 1e6) & (MT.isin([2,4,16,18,102,103,107]))
+            -> (Energy >= 1000) & (Energy <= 1e6) & (MT.isin([2,4,16,18,102,103,107]))
         """
         import pyarrow.compute as pc
 
@@ -671,7 +714,7 @@ class NucmlDataset(TorchDataset):
             PyArrow compute expression or None
 
         Example:
-            {'Z': [92], 'MT': [18]} → (field('Z').isin([92])) & (field('MT').isin([18]))
+            {'Z': [92], 'MT': [18]} -> (field('Z').isin([92])) & (field('MT').isin([18]))
         """
         if not filters:
             return None
@@ -708,7 +751,7 @@ class NucmlDataset(TorchDataset):
         if self.graph_data is None:
             print("Building global graph structure (first access)...")
             self.graph_data = self.graph_builder.build_global_graph()
-            print(f"✓ Graph built: {self.graph_data.num_nodes} nodes, {self.graph_data.num_edges} edges")
+            print(f"[OK] Graph built: {self.graph_data.num_nodes} nodes, {self.graph_data.num_edges} edges")
         return self.graph_data
 
     def __len__(self) -> int:
@@ -752,6 +795,7 @@ class NucmlDataset(TorchDataset):
         self,
         tiers: Optional[List[str]] = None,
         reaction_types: Optional[List[int]] = None,
+        extra_metadata: Optional[List[str]] = None,
     ) -> pd.DataFrame:
         """
         Project graph data to tabular format for classical ML.
@@ -764,6 +808,8 @@ class NucmlDataset(TorchDataset):
             tiers: List of feature tiers to include (e.g., ['A', 'C', 'E'])
                    If None, uses selection.tiers or defaults to ['A'].
             reaction_types: Filter to specific MT codes (None = all reactions)
+            extra_metadata: Additional columns to preserve in output
+                   (e.g., ['Energy_Uncertainty'] for combined uncertainty weighting)
 
         Returns:
             DataFrame with tier-based features ready for ML training
@@ -778,6 +824,9 @@ class NucmlDataset(TorchDataset):
             >>>
             >>> # Filter to specific reactions
             >>> df_fission = dataset.to_tabular(tiers=['A', 'C'], reaction_types=[18])
+            >>>
+            >>> # Include Energy_Uncertainty for combined weighting
+            >>> df = dataset.to_tabular(extra_metadata=['Energy_Uncertainty'])
         """
         from nucml_next.data.features import FeatureGenerator
 
@@ -798,7 +847,48 @@ class NucmlDataset(TorchDataset):
         if reaction_types is not None:
             df = df[df['MT'].isin(reaction_types)]
 
-        return generator.generate_features(df, tiers=tiers)
+        return generator.generate_features(df, tiers=tiers, extra_metadata=extra_metadata)
+
+    def get_holdout_data(
+        self,
+        tiers: Optional[List[str]] = None,
+        extra_metadata: Optional[List[str]] = None,
+    ) -> Optional[pd.DataFrame]:
+        """
+        Return the holdout DataFrame projected to tabular format.
+
+        The holdout rows were separated during loading (via
+        ``HoldoutConfig`` rules in the ``DataSelection``).  This method
+        applies the same tier-based feature generation used by
+        :meth:`to_tabular` so the result can be passed directly to
+        ``model.predict()`` or ``compute_holdout_metrics()``.
+
+        Parameters
+        ----------
+        tiers : list of str, optional
+            Feature tiers (default: selection.tiers).
+        extra_metadata : list of str, optional
+            Extra columns to preserve (e.g. ``['Energy_Uncertainty']``).
+
+        Returns
+        -------
+        pd.DataFrame or None
+            Tabular holdout data, or ``None`` if no holdout was configured.
+        """
+        raw = getattr(self, '_holdout_df', None)
+        if raw is None or raw.empty:
+            return None
+
+        from nucml_next.data.features import FeatureGenerator
+
+        if tiers is None:
+            if self.selection is not None:
+                tiers = self.selection.tiers
+            else:
+                tiers = ['A']
+
+        generator = FeatureGenerator(enricher=None)
+        return generator.generate_features(raw, tiers=tiers, extra_metadata=extra_metadata)
 
     def get_isotope_graph(self, Z: int, A: int) -> Data:
         """
@@ -825,7 +915,7 @@ class NucmlDataset(TorchDataset):
         """
         table = pa.Table.from_pandas(self.df)
         pq.write_table(table, output_path)
-        print(f"✓ Saved dataset to {output_path}")
+        print(f"[OK] Saved dataset to {output_path}")
 
     def get_statistics(self) -> Dict[str, Any]:
         """
@@ -850,6 +940,57 @@ class NucmlDataset(TorchDataset):
             })
 
         return stats
+
+    def outlier_summary(
+        self,
+        thresholds: Optional[List[float]] = None,
+    ) -> pd.DataFrame:
+        """
+        Summarize outlier counts at various z-score thresholds.
+
+        Requires the Parquet to have been ingested with --run-svgp, which adds
+        a z_score column to each data point.
+
+        Args:
+            thresholds: List of z-score thresholds to evaluate.
+                       Default: [2.0, 3.0, 4.0, 5.0]
+
+        Returns:
+            DataFrame with columns: threshold, outliers, pct, retained
+
+        Raises:
+            ValueError: If z_score column not found in dataset
+
+        Example:
+            >>> dataset.outlier_summary()
+               threshold  outliers   pct  retained
+            0        2.0      5432  1.23    435678
+            1        3.0      1234  0.28    439876
+            2        4.0       456  0.10    440654
+            3        5.0       123  0.03    440987
+        """
+        if 'z_score' not in self.df.columns:
+            raise ValueError(
+                "z_score column not found in dataset.\n"
+                "Run ingestion with --run-svgp to enable outlier detection:\n"
+                "  python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --run-svgp"
+            )
+
+        if thresholds is None:
+            thresholds = [2.0, 3.0, 4.0, 5.0]
+
+        total = len(self.df)
+        rows = []
+        for t in thresholds:
+            n_outlier = (self.df['z_score'] > t).sum()
+            rows.append({
+                'threshold': t,
+                'outliers': int(n_outlier),
+                'pct': 100 * n_outlier / total if total > 0 else 0.0,
+                'retained': total - int(n_outlier),
+            })
+
+        return pd.DataFrame(rows)
 
     def get_transformation_pipeline(
         self,
