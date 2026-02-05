@@ -52,7 +52,7 @@ class TestTransformationPipeline(unittest.TestCase):
         )
 
     def test_fit_transform(self):
-        """Test pipeline fitting and transformation."""
+        """Test pipeline fitting and transformation (default: minmax scaler)."""
         pipeline = TransformationPipeline()
 
         # Fit and transform
@@ -63,19 +63,18 @@ class TestTransformationPipeline(unittest.TestCase):
 
         # Check pipeline is fitted
         self.assertTrue(pipeline.is_fitted_)
-        self.assertIsNotNone(pipeline.feature_mean_)
-        self.assertIsNotNone(pipeline.feature_std_)
+        # Default is now minmax, so check min/max params
+        self.assertIsNotNone(pipeline.feature_min_)
+        self.assertIsNotNone(pipeline.feature_max_)
 
         # Check transformed data shape
         self.assertEqual(len(X_transformed), len(self.X))
         self.assertEqual(len(y_transformed), len(self.y))
 
-        # Check standardization (mean ≈ 0, std ≈ 1)
+        # Check minmax scaling (values in [0, 1])
         for col in ['Z', 'A', 'N']:
-            col_mean = X_transformed[col].mean()
-            col_std = X_transformed[col].std()
-            self.assertAlmostEqual(col_mean, 0.0, places=10)
-            self.assertAlmostEqual(col_std, 1.0, places=1)
+            self.assertAlmostEqual(X_transformed[col].min(), 0.0, places=10)
+            self.assertAlmostEqual(X_transformed[col].max(), 1.0, places=10)
 
     def test_log_transform_target(self):
         """Test log-transformation of cross-sections."""
@@ -163,7 +162,7 @@ class TestTransformationPipeline(unittest.TestCase):
             pipeline.get_params()
 
     def test_save_load(self):
-        """Test pipeline save and load functionality."""
+        """Test pipeline save and load functionality (default: minmax)."""
         pipeline = TransformationPipeline()
         pipeline.fit(self.X, self.y, self.energy,
                     feature_columns=['Z', 'A', 'N', 'R_fm'])
@@ -178,15 +177,15 @@ class TestTransformationPipeline(unittest.TestCase):
             # Load pipeline
             loaded_pipeline = TransformationPipeline.load(temp_path)
 
-            # Check parameters match
+            # Check parameters match (default is now minmax)
             self.assertTrue(loaded_pipeline.is_fitted_)
             np.testing.assert_array_equal(
-                loaded_pipeline.feature_mean_,
-                pipeline.feature_mean_
+                loaded_pipeline.feature_min_,
+                pipeline.feature_min_
             )
             np.testing.assert_array_equal(
-                loaded_pipeline.feature_std_,
-                pipeline.feature_std_
+                loaded_pipeline.feature_max_,
+                pipeline.feature_max_
             )
             self.assertEqual(
                 loaded_pipeline.feature_columns_,
@@ -238,20 +237,21 @@ class TestTransformationPipeline(unittest.TestCase):
         self.assertTrue(np.all(np.isfinite(X_transformed['Constant'])))
 
     def test_get_params(self):
-        """Test parameter retrieval."""
+        """Test parameter retrieval (default: minmax scaler)."""
         pipeline = TransformationPipeline()
         pipeline.fit(self.X, feature_columns=['Z', 'A', 'N'])
 
         params = pipeline.get_params()
 
-        self.assertIn('feature_mean', params)
-        self.assertIn('feature_std', params)
+        # Default scaler is now minmax, so check for min/max params
+        self.assertIn('feature_min', params)
+        self.assertIn('feature_max', params)
         self.assertIn('feature_columns', params)
         self.assertIn('n_features', params)
         self.assertEqual(params['n_features'], 3)
 
-    def test_promiscuity_factor_standardization(self):
-        """Test that Promiscuity Factor is properly standardized."""
+    def test_promiscuity_factor_scaling(self):
+        """Test that Promiscuity Factor is properly scaled (default: minmax)."""
         # Create sample data with P_Factor
         X_with_p = self.X.copy()
         X_with_p['Valence_N'] = np.random.randint(0, 20, len(self.X))
@@ -265,12 +265,38 @@ class TestTransformationPipeline(unittest.TestCase):
             axis=1
         )
 
+        # Default scaler is now minmax
         pipeline = TransformationPipeline()
         pipeline.fit(X_with_p, feature_columns=['Z', 'A', 'P_Factor'])
 
         X_transformed = pipeline.transform(X_with_p)
 
-        # Check P_Factor is standardized
+        # Check P_Factor is minmax-scaled to [0, 1]
+        self.assertAlmostEqual(X_transformed['P_Factor'].min(), 0.0, places=10)
+        self.assertAlmostEqual(X_transformed['P_Factor'].max(), 1.0, places=10)
+
+    def test_promiscuity_factor_standardization(self):
+        """Test that Promiscuity Factor is properly standardized with standard scaler."""
+        # Create sample data with P_Factor
+        X_with_p = self.X.copy()
+        X_with_p['Valence_N'] = np.random.randint(0, 20, len(self.X))
+        X_with_p['Valence_P'] = np.random.randint(0, 20, len(self.X))
+
+        # Compute Promiscuity Factor
+        X_with_p['P_Factor'] = X_with_p.apply(
+            lambda row: (row['Valence_N'] * row['Valence_P']) /
+                       (row['Valence_N'] + row['Valence_P'])
+                       if (row['Valence_N'] + row['Valence_P']) > 0 else 0.0,
+            axis=1
+        )
+
+        config = TransformationConfig(scaler_type='standard')
+        pipeline = TransformationPipeline(config=config)
+        pipeline.fit(X_with_p, feature_columns=['Z', 'A', 'P_Factor'])
+
+        X_transformed = pipeline.transform(X_with_p)
+
+        # Check P_Factor is standardized (mean ≈ 0, std ≈ 1)
         p_mean = X_transformed['P_Factor'].mean()
         p_std = X_transformed['P_Factor'].std()
 
@@ -536,6 +562,99 @@ class TestToggleableTransformations(unittest.TestCase):
 
         finally:
             Path(temp_path).unlink(missing_ok=True)
+
+
+    def test_scale_features_all(self):
+        """Test scale_features='all' scales every numeric column."""
+        config = TransformationConfig(scaler_type='minmax', scale_features='all')
+        pipeline = TransformationPipeline(config=config)
+
+        pipeline.fit(self.X)  # No feature_columns arg -> uses config
+        X_transformed = pipeline.transform(self.X)
+
+        # All numeric columns should be scaled to [0, 1]
+        for col in self.X.columns:
+            self.assertAlmostEqual(X_transformed[col].min(), 0.0, places=10,
+                                   msg=f"{col} min != 0")
+            self.assertAlmostEqual(X_transformed[col].max(), 1.0, places=10,
+                                   msg=f"{col} max != 1")
+
+    def test_scale_features_explicit_list(self):
+        """Test scale_features with an explicit column list."""
+        config = TransformationConfig(
+            scaler_type='minmax',
+            scale_features=['Z', 'A']  # Only scale Z and A
+        )
+        pipeline = TransformationPipeline(config=config)
+
+        pipeline.fit(self.X)
+        X_transformed = pipeline.transform(self.X)
+
+        # Z and A should be scaled
+        for col in ['Z', 'A']:
+            self.assertAlmostEqual(X_transformed[col].min(), 0.0, places=10)
+            self.assertAlmostEqual(X_transformed[col].max(), 1.0, places=10)
+
+        # N and R_fm should NOT be scaled (remain original values)
+        for col in ['N', 'R_fm']:
+            np.testing.assert_allclose(
+                X_transformed[col].values,
+                self.X[col].values,
+                rtol=1e-15,
+                err_msg=f"{col} should not be scaled"
+            )
+
+    def test_log_energy_before_scaling(self):
+        """Test that log-energy is applied BEFORE scaling (new order)."""
+        # Create X with Energy column
+        X_with_energy = self.X.copy()
+        X_with_energy['Energy'] = self.energy
+
+        config = TransformationConfig(
+            scaler_type='minmax',
+            scale_features='all',
+            log_energy=True,
+        )
+        pipeline = TransformationPipeline(config=config)
+        pipeline.fit(X_with_energy, energy=self.energy)
+        X_transformed = pipeline.transform(X_with_energy, self.energy)
+
+        # Energy should be log-transformed AND THEN scaled to [0, 1]
+        # Not just log-transformed
+        self.assertAlmostEqual(X_transformed['Energy'].min(), 0.0, places=5)
+        self.assertAlmostEqual(X_transformed['Energy'].max(), 1.0, places=5)
+
+        # Verify inverse recovers original
+        X_reconstructed = pipeline.inverse_transform(X_transformed, self.energy)
+        for col in ['Z', 'A', 'N', 'R_fm']:
+            np.testing.assert_allclose(
+                X_reconstructed[col].values,
+                X_with_energy[col].values,
+                rtol=1e-5,
+                err_msg=f"Reconstruction failed for {col}"
+            )
+
+    def test_scale_features_none_same_as_all(self):
+        """Test that scale_features=None behaves same as 'all'."""
+        config_all = TransformationConfig(scaler_type='minmax', scale_features='all')
+        config_none = TransformationConfig(scaler_type='minmax', scale_features=None)
+
+        pipeline_all = TransformationPipeline(config=config_all)
+        pipeline_none = TransformationPipeline(config=config_none)
+
+        pipeline_all.fit(self.X)
+        pipeline_none.fit(self.X)
+
+        X_all = pipeline_all.transform(self.X)
+        X_none = pipeline_none.transform(self.X)
+
+        for col in self.X.columns:
+            np.testing.assert_allclose(
+                X_all[col].values,
+                X_none[col].values,
+                rtol=1e-15,
+                err_msg=f"Mismatch for {col}"
+            )
 
 
 class TestPromiscuityFactor(unittest.TestCase):

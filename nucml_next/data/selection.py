@@ -18,7 +18,7 @@ Design Philosophy:
 """
 
 from dataclasses import dataclass, field
-from typing import Optional, List, Tuple, Set, Literal
+from typing import Any, Optional, List, Tuple, Set, Literal, Union
 import numpy as np
 
 
@@ -84,6 +84,14 @@ class TransformationConfig:
     Controls log-scaling and standardization/normalization of features and targets.
     All transformations are reversible for predictions.
 
+    **Order of operations** (forward transform):
+      1. Log-transform cross-section: σ' = log(σ + ε)
+      2. Log-transform energy: E' = log(E)
+      3. Scale features (applied to the already-log-transformed values)
+
+    This ensures the scaler sees the compressed log-space values rather than
+    the raw multi-order-of-magnitude physical values.
+
     Attributes:
         # Target (cross-section) transformations
         log_target: Enable log₁₀ transform for cross-sections. Default: True
@@ -94,16 +102,19 @@ class TransformationConfig:
 
         # Feature standardization
         scaler_type: Type of feature scaling. Options:
-            - 'standard': Z-score normalization (X-μ)/σ [Default]
-            - 'minmax': Min-max scaling to [0,1]
+            - 'minmax': Min-max scaling to [0,1] [Default]
+            - 'standard': Z-score normalization (X-μ)/σ
             - 'robust': Robust scaling using median and IQR
             - 'none': No scaling (use raw features)
 
         # Custom feature selection for scaling
-        scale_features: Columns to scale. None = auto-detect numeric columns
+        scale_features: Columns to scale. Options:
+            - 'all': Scale every numeric column [Default]
+            - None: Auto-detect numeric columns (same as 'all')
+            - List[str]: Explicit list of column names to scale
 
     Example:
-        >>> # Default: Log-transform everything, Z-score standardization
+        >>> # Default: Log-transform + MinMax scaling on all features
         >>> config = TransformationConfig()
 
         >>> # No transformations (raw data)
@@ -113,9 +124,9 @@ class TransformationConfig:
         ...     scaler_type='none'
         ... )
 
-        >>> # MinMax scaling with custom epsilon
+        >>> # Standard (Z-score) scaling on specific features only
         >>> config = TransformationConfig(
-        ...     scaler_type='minmax',
+        ...     scaler_type='standard',
         ...     target_epsilon=1e-8,
         ...     scale_features=['Z', 'A', 'N', 'Mass_Excess_MeV']
         ... )
@@ -131,8 +142,8 @@ class TransformationConfig:
     energy_log_base: Literal[10, 'e', 2] = 10
 
     # Feature scaling
-    scaler_type: Literal['standard', 'minmax', 'robust', 'none'] = 'standard'
-    scale_features: Optional[List[str]] = None
+    scaler_type: Literal['standard', 'minmax', 'robust', 'none'] = 'minmax'
+    scale_features: Union[None, Literal['all'], List[str]] = 'all'
 
     def __post_init__(self):
         """Validate configuration after initialization."""
@@ -144,6 +155,14 @@ class TransformationConfig:
         valid_scalers = ['standard', 'minmax', 'robust', 'none']
         if self.scaler_type not in valid_scalers:
             raise ValueError(f"scaler_type must be one of {valid_scalers}, got '{self.scaler_type}'")
+
+        # Validate scale_features
+        if self.scale_features is not None and self.scale_features != 'all':
+            if not isinstance(self.scale_features, list):
+                raise ValueError(
+                    f"scale_features must be 'all', None, or a list of column names, "
+                    f"got {type(self.scale_features).__name__}: {self.scale_features}"
+                )
 
         # Validate log bases
         valid_bases = [10, 'e', 2]
@@ -160,8 +179,12 @@ class TransformationConfig:
             f"  Energy: log={self.log_energy}, base={self.energy_log_base}",
             f"  Features: scaler={self.scaler_type}",
         ]
-        if self.scale_features:
+        if self.scale_features == 'all':
+            lines.append("  Scale features: 'all' (every numeric column)")
+        elif isinstance(self.scale_features, list) and self.scale_features:
             lines.append(f"  Scale features: {self.scale_features[:5]}{'...' if len(self.scale_features) > 5 else ''}")
+        elif self.scale_features is None:
+            lines.append("  Scale features: auto-detect numeric columns")
         lines.append(")")
         return "\n".join(lines)
 
@@ -239,8 +262,13 @@ class DataSelection:
     # Data validity
     drop_invalid: bool = True  # Drop NaN or non-positive cross-sections
 
-    # Evaluation controls
-    holdout_isotopes: Optional[List[Tuple[int, int]]] = None  # [(Z, A), ...] to exclude
+    # Evaluation controls -- holdout
+    holdout_isotopes: Optional[List[Tuple[int, int]]] = None  # LEGACY: [(Z, A), ...] to exclude
+    holdout_config: Optional[Any] = None  # HoldoutConfig (rich phase-space holdout)
+
+    # Outlier filtering (requires z_score column from SVGP ingestion)
+    z_threshold: Optional[float] = None    # None = no filtering; 3.0 = exclude z > 3
+    include_outliers: bool = True          # False = remove points above z_threshold
 
     # Feature tier selection (Valdez 2021 hierarchy)
     tiers: List[str] = field(default_factory=lambda: ['A'])  # Default: Core features only
@@ -278,6 +306,22 @@ class DataSelection:
         # Ensure Tier A is always included (base features required)
         if 'A' not in self.tiers and len(self.tiers) > 0:
             self.tiers = ['A'] + self.tiers
+
+        # Validate holdout: holdout_isotopes and holdout_config are mutually exclusive
+        if self.holdout_isotopes is not None and self.holdout_config is not None:
+            raise ValueError(
+                "Cannot specify both 'holdout_isotopes' and 'holdout_config'. "
+                "Use 'holdout_config' for new code (holdout_isotopes is legacy)."
+            )
+
+        # Bridge legacy holdout_isotopes → holdout_config
+        if self.holdout_isotopes is not None:
+            from nucml_next.experiment import HoldoutConfig
+            self.holdout_config = HoldoutConfig.from_legacy(self.holdout_isotopes)
+
+        # Validate z_threshold
+        if self.z_threshold is not None and self.z_threshold <= 0:
+            raise ValueError(f"z_threshold must be positive, got {self.z_threshold}")
 
     def get_mt_codes(self) -> List[int]:
         """
@@ -364,8 +408,17 @@ class DataSelection:
                         f"log_energy={self.transformation_config.log_energy}, "
                         f"scaler={self.transformation_config.scaler_type}")
 
-        if self.holdout_isotopes:
+        if self.holdout_config and self.holdout_config.rules:
+            lines.append(f"  Holdout: {len(self.holdout_config.rules)} rule(s)")
+            for i, rule in enumerate(self.holdout_config.rules):
+                lines.append(f"    Rule {i+1}: {rule}")
+        elif self.holdout_isotopes:
             lines.append(f"  Holdout isotopes: {self.holdout_isotopes}")
+
+        # Show outlier filtering settings
+        if self.z_threshold is not None:
+            action = "remove" if not self.include_outliers else "keep (flagged)"
+            lines.append(f"  Outlier filter: z_threshold={self.z_threshold}, action={action}")
 
         lines.append(f"  Drop invalid: {self.drop_invalid}")
         lines.append(")")

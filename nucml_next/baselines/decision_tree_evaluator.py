@@ -214,6 +214,12 @@ class DecisionTreeEvaluator:
         min_samples_split_range: tuple = (2, 20),
         min_samples_leaf_range: tuple = (1, 10),
         max_features_options: Optional[list] = None,
+        min_impurity_decrease: float = 0.0,
+        # Validation strategy (method='bayesian' only)
+        validation_method: str = 'holdout',
+        train_fraction: float = 0.70,
+        val_fraction: float = 0.15,
+        test_fraction: float = 0.15,
         # Uncertainty-based sample filtering
         use_uncertainty_weights: Optional[str] = None,
         missing_uncertainty_handling: str = 'median',
@@ -256,6 +262,21 @@ class DecisionTreeEvaluator:
             min_samples_split_range: (min, max) tuple for sampling
             min_samples_leaf_range: (min, max) tuple for sampling
             max_features_options: List of max_features values [None, 'sqrt']
+            min_impurity_decrease: Fixed min_impurity_decrease for all trees.
+                Defaults to 0.0 (no regularization). This is NOT searched
+                because absolute impurity thresholds found on subsampled data
+                over-regularize on full data. Set to a small positive value
+                (e.g. 1e-7) only if you observe severe overfitting.
+
+            # Validation strategy (method='bayesian' only):
+            validation_method: How to evaluate candidates during search.
+                - 'holdout': Train/val/test split (default). Simpler and faster.
+                  Val set scores candidates; test set evaluates the final model.
+                - 'kfold': K-fold cross-validation during search, plus a held-out
+                  test set for final evaluation.
+            train_fraction: Fraction for training (holdout mode). Default: 0.70
+            val_fraction: Fraction for validation (holdout mode). Default: 0.15
+            test_fraction: Fraction for final test (holdout mode). Default: 0.15
 
             # Uncertainty-based sample filtering:
             use_uncertainty_weights: Weight mode (None, 'xs', or 'both').
@@ -269,10 +290,11 @@ class DecisionTreeEvaluator:
         Returns:
             Dictionary with:
             - best_params: Optimal hyperparameters
-            - best_score: Best cross-validation score
+            - best_score: Best validation/CV score
             - test_mse: Test MSE in original scale
             - cv_results: Full CV results (for grid/random methods)
             - trials: Hyperopt trials object (for bayesian method)
+            - validation_method: Which validation strategy was used
         """
         # Apply uncertainty-based row exclusion before optimization
         from nucml_next.baselines._weights import normalize_weight_mode
@@ -311,6 +333,13 @@ class DecisionTreeEvaluator:
                 min_samples_split_range=min_samples_split_range,
                 min_samples_leaf_range=min_samples_leaf_range,
                 max_features_options=max_features_options,
+                min_impurity_decrease=min_impurity_decrease,
+                subsample_fraction=subsample_fraction,
+                subsample_max_samples=subsample_max_samples,
+                validation_method=validation_method,
+                train_fraction=train_fraction,
+                val_fraction=val_fraction,
+                test_fraction=test_fraction,
             )
         elif method in ['grid', 'random', 'halving']:
             return self._optimize_sklearn(
@@ -587,14 +616,53 @@ class DecisionTreeEvaluator:
         min_samples_split_range: tuple,
         min_samples_leaf_range: tuple,
         max_features_options: Optional[list],
+        min_impurity_decrease: float = 0.0,
+        subsample_fraction: Optional[float] = None,
+        subsample_max_samples: Optional[int] = None,
+        validation_method: str = 'holdout',
+        train_fraction: float = 0.70,
+        val_fraction: float = 0.15,
+        test_fraction: float = 0.15,
     ) -> Dict[str, Any]:
         """
         Hyperparameter optimization using Bayesian optimization (hyperopt).
+
+        Supports two validation strategies:
+
+        **holdout** (default):
+            Data is split into train/val/test. Each hyperopt trial trains on
+            the train set and evaluates on the val set. The final model is
+            retrained on train+val and scored on the held-out test set.
+            Faster and simpler -- recommended for large datasets.
+
+        **kfold**:
+            Each hyperopt trial runs k-fold cross-validation on the
+            train+val portion. The final model is retrained on train+val
+            and scored on the held-out test set.
+
+        Args:
+            min_impurity_decrease: Fixed min_impurity_decrease for all trees.
+                Defaults to 0.0. Not searched because absolute impurity
+                thresholds found on subsampled data over-regularize on
+                full data.
+            validation_method: 'holdout' or 'kfold'.
+            train_fraction: Train fraction for holdout mode (default 0.70).
+            val_fraction: Validation fraction for holdout mode (default 0.15).
+            test_fraction: Test fraction for holdout mode (default 0.15).
         """
         if not HYPEROPT_AVAILABLE:
             raise ImportError(
                 "hyperopt required for Bayesian optimization. Install: pip install hyperopt"
             )
+
+        valid_methods = ('holdout', 'kfold')
+        if validation_method not in valid_methods:
+            raise ValueError(
+                f"validation_method must be one of {valid_methods}, "
+                f"got {validation_method!r}"
+            )
+
+        use_subsample = subsample_fraction is not None or subsample_max_samples is not None
 
         if verbose:
             print("\n" + "=" * 80)
@@ -602,8 +670,24 @@ class DecisionTreeEvaluator:
             print("=" * 80)
             print(f"Dataset size: {len(df):,} samples")
             print(f"Max evaluations: {max_evals}")
-            print(f"Cross-validation folds: {cv_folds}")
+            if validation_method == 'holdout':
+                print(f"Validation method: holdout "
+                      f"(train={train_fraction:.0%} / val={val_fraction:.0%} / "
+                      f"test={test_fraction:.0%})")
+            else:
+                print(f"Validation method: {cv_folds}-fold cross-validation")
+            print(f"min_impurity_decrease: {min_impurity_decrease}")
             print()
+
+        # Validate holdout fractions
+        if validation_method == 'holdout':
+            frac_sum = train_fraction + val_fraction + test_fraction
+            if abs(frac_sum - 1.0) > 1e-6:
+                raise ValueError(
+                    f"train_fraction + val_fraction + test_fraction must sum to 1.0, "
+                    f"got {frac_sum:.4f} "
+                    f"({train_fraction} + {val_fraction} + {test_fraction})"
+                )
 
         # Prepare data
         X_arr, y_arr, feature_columns, pipeline = self._prepare_data(
@@ -611,10 +695,87 @@ class DecisionTreeEvaluator:
             pipeline, transformation_config, verbose
         )
 
-        # Split data
-        X_train, X_test, y_train, y_test = train_test_split(
-            X_arr, y_arr, test_size=test_size, random_state=42
-        )
+        # Apply subsampling for faster search
+        n_samples = len(X_arr)
+        if use_subsample:
+            target_size = n_samples
+            if subsample_fraction is not None:
+                target_size = min(target_size, int(n_samples * subsample_fraction))
+            if subsample_max_samples is not None:
+                target_size = min(target_size, subsample_max_samples)
+
+            if target_size < n_samples:
+                rng = np.random.default_rng(42)
+                subsample_idx = rng.choice(n_samples, size=target_size, replace=False)
+                X_search = X_arr[subsample_idx]
+                y_search = y_arr[subsample_idx]
+                if verbose:
+                    print(f"  Subsampled for search: {n_samples:,} -> {target_size:,} samples "
+                          f"({100*target_size/n_samples:.1f}%)")
+                    print(f"  NOTE: Final model will be evaluated on full data after search")
+                    print()
+            else:
+                X_search = X_arr
+                y_search = y_arr
+                target_size = n_samples
+        else:
+            X_search = X_arr
+            y_search = y_arr
+            target_size = n_samples
+
+        # ----------------------------------------------------------------
+        # Split data according to validation_method
+        # ----------------------------------------------------------------
+        if validation_method == 'holdout':
+            # Two-stage split: first carve out test, then split remainder
+            # into train and val.
+            _test_frac = test_fraction
+            _val_of_trainval = val_fraction / (train_fraction + val_fraction)
+
+            X_trainval, X_test_search, y_trainval, y_test_search = train_test_split(
+                X_search, y_search, test_size=_test_frac, random_state=42
+            )
+            X_train, X_val, y_train, y_val = train_test_split(
+                X_trainval, y_trainval, test_size=_val_of_trainval, random_state=42
+            )
+
+            if verbose:
+                print(f"  Holdout split (search data):")
+                print(f"    Train: {len(X_train):,}  Val: {len(X_val):,}  Test: {len(X_test_search):,}")
+                print()
+        else:
+            # kfold: split into train+val (for CV) and test (for final eval)
+            X_train, X_test_search, y_train, y_test_search = train_test_split(
+                X_search, y_search, test_size=test_size, random_state=42
+            )
+            if verbose:
+                print(f"  K-fold split (search data):")
+                print(f"    Train+Val (for {cv_folds}-fold CV): {len(X_train):,}  "
+                      f"Test: {len(X_test_search):,}")
+                print()
+
+        # Also split full data for final evaluation (if subsampling)
+        if use_subsample and target_size < n_samples:
+            if validation_method == 'holdout':
+                _test_frac_full = test_fraction
+                X_trainval_full, X_test_full, y_trainval_full, y_test_full = train_test_split(
+                    X_arr, y_arr, test_size=_test_frac_full, random_state=42
+                )
+            else:
+                X_trainval_full, X_test_full, y_trainval_full, y_test_full = train_test_split(
+                    X_arr, y_arr, test_size=test_size, random_state=42
+                )
+        else:
+            if validation_method == 'holdout':
+                X_trainval_full = np.concatenate([X_train, X_val])
+                y_trainval_full = np.concatenate([y_train, y_val])
+                X_test_full = X_test_search
+                y_test_full = y_test_search
+            else:
+                X_trainval_full = X_train
+                X_test_full = X_test_search
+                y_trainval_full = y_train
+                y_test_full = y_test_search
 
         # Apply defaults for search space parameters
         if max_depth_options is None:
@@ -628,9 +789,17 @@ class DecisionTreeEvaluator:
             print(f"  min_samples_split: {min_samples_split_range[0]} to {min_samples_split_range[1]}")
             print(f"  min_samples_leaf: {min_samples_leaf_range[0]} to {min_samples_leaf_range[1]}")
             print(f"  max_features options: {max_features_options}")
+            print(f"  min_impurity_decrease: {min_impurity_decrease} (fixed, not searched)")
             print()
 
         # Hyperparameter search space
+        # NOTE: min_impurity_decrease is NOT searched. When subsampling data
+        # for faster search, hyperopt finds a min_impurity_decrease tuned to
+        # the subsample size. Applied to the full dataset this over-regularizes
+        # (e.g. depth 36, 1085 leaves on 8M samples). The structural params
+        # (max_depth, min_samples_split, min_samples_leaf) already control
+        # complexity and generalise correctly from subsample to full data.
+        # Users can override via the min_impurity_decrease parameter.
         space = {
             'max_depth': hp.choice('max_depth', max_depth_options),
             'min_samples_split': hp.quniform('min_samples_split',
@@ -639,33 +808,58 @@ class DecisionTreeEvaluator:
             'min_samples_leaf': hp.quniform('min_samples_leaf',
                                             min_samples_leaf_range[0],
                                             min_samples_leaf_range[1], 1),
-            'min_impurity_decrease': hp.loguniform('min_impurity_decrease', np.log(1e-10), np.log(1e-4)),
             'max_features': hp.choice('max_features', max_features_options),
         }
 
-        def objective(params):
-            if params['max_depth'] is not None:
-                params['max_depth'] = int(params['max_depth'])
-            params['min_samples_split'] = int(params['min_samples_split'])
-            params['min_samples_leaf'] = int(params['min_samples_leaf'])
+        # Capture min_impurity_decrease in closure
+        _mid = min_impurity_decrease
 
-            model = DecisionTreeRegressor(
-                max_depth=params['max_depth'],
-                min_samples_split=params['min_samples_split'],
-                min_samples_leaf=params['min_samples_leaf'],
-                min_impurity_decrease=params['min_impurity_decrease'],
-                max_features=params['max_features'],
-                random_state=42,
-            )
+        if validation_method == 'holdout':
+            # Holdout: train on X_train, evaluate on X_val
+            def objective(params):
+                if params['max_depth'] is not None:
+                    params['max_depth'] = int(params['max_depth'])
+                params['min_samples_split'] = int(params['min_samples_split'])
+                params['min_samples_leaf'] = int(params['min_samples_leaf'])
 
-            cv_scores = cross_val_score(
-                model, X_train, y_train,
-                cv=cv_folds,
-                scoring='neg_mean_squared_error',
-                n_jobs=-1
-            )
+                model = DecisionTreeRegressor(
+                    max_depth=params['max_depth'],
+                    min_samples_split=params['min_samples_split'],
+                    min_samples_leaf=params['min_samples_leaf'],
+                    min_impurity_decrease=_mid,
+                    max_features=params['max_features'],
+                    random_state=42,
+                )
+                model.fit(X_train, y_train)
+                y_val_pred = model.predict(X_val)
+                val_mse = mean_squared_error(y_val, y_val_pred)
 
-            return {'loss': -cv_scores.mean(), 'status': STATUS_OK, 'params': params}
+                return {'loss': val_mse, 'status': STATUS_OK, 'params': params}
+        else:
+            # K-fold: cross-validate on X_train
+            def objective(params):
+                if params['max_depth'] is not None:
+                    params['max_depth'] = int(params['max_depth'])
+                params['min_samples_split'] = int(params['min_samples_split'])
+                params['min_samples_leaf'] = int(params['min_samples_leaf'])
+
+                model = DecisionTreeRegressor(
+                    max_depth=params['max_depth'],
+                    min_samples_split=params['min_samples_split'],
+                    min_samples_leaf=params['min_samples_leaf'],
+                    min_impurity_decrease=_mid,
+                    max_features=params['max_features'],
+                    random_state=42,
+                )
+
+                cv_scores = cross_val_score(
+                    model, X_train, y_train,
+                    cv=cv_folds,
+                    scoring='neg_mean_squared_error',
+                    n_jobs=-1
+                )
+
+                return {'loss': -cv_scores.mean(), 'status': STATUS_OK, 'params': params}
 
         # Run optimization
         trials = Trials()
@@ -688,29 +882,45 @@ class DecisionTreeEvaluator:
             best_params['max_depth'] = int(best_params['max_depth'])
         best_params['min_samples_split'] = int(best_params['min_samples_split'])
         best_params['min_samples_leaf'] = int(best_params['min_samples_leaf'])
+        best_params['min_impurity_decrease'] = _mid
         best_params['random_state'] = 42
 
-        # Evaluate on test set
+        # ----------------------------------------------------------------
+        # Retrain on train+val, evaluate on test
+        # ----------------------------------------------------------------
+        if verbose:
+            print(f"\nRetraining best model on train+val data ({len(X_trainval_full):,} samples)...")
+
         final_model = DecisionTreeRegressor(**best_params)
-        final_model.fit(X_train, y_train)
-        y_test_pred = final_model.predict(X_test)
+        final_model.fit(X_trainval_full, y_trainval_full)
+        y_test_pred = final_model.predict(X_test_full)
 
         # Inverse transform
         if pipeline.config.log_target:
             y_test_pred = pipeline.inverse_transform_target(pd.Series(y_test_pred)).values
-            y_test_orig = pipeline.inverse_transform_target(pd.Series(y_test)).values
+            y_test_orig = pipeline.inverse_transform_target(pd.Series(y_test_full)).values
         else:
-            y_test_orig = y_test
+            y_test_orig = y_test_full
 
         test_mse = mean_squared_error(y_test_orig, y_test_pred)
-        best_cv_score = -trials.best_trial['result']['loss']
+        test_r2 = r2_score(y_test_orig, y_test_pred)
+        best_trial_loss = trials.best_trial['result']['loss']
+
+        if validation_method == 'holdout':
+            score_label = "Best val MSE (transformed space)"
+            best_score = best_trial_loss  # holdout loss is already MSE
+        else:
+            score_label = "Best CV MSE (transformed space)"
+            best_score = best_trial_loss  # kfold loss is -neg_mse = MSE
 
         if verbose:
             print("\n" + "=" * 80)
             print("OPTIMIZATION COMPLETE")
             print("=" * 80)
-            print(f"Best CV MSE (transformed space): {best_cv_score:.6f}")
+            print(f"Validation method: {validation_method}")
+            print(f"{score_label}: {best_score:.6f}")
             print(f"Test MSE (original space): {test_mse:.4e}")
+            print(f"Test R2 (original space):  {test_r2:.4f}")
             print()
             print("Optimal Hyperparameters:")
             for key, value in best_params.items():
@@ -720,9 +930,11 @@ class DecisionTreeEvaluator:
 
         return {
             'best_params': best_params,
-            'best_score': best_cv_score,
+            'best_score': best_score,
             'test_mse': test_mse,
+            'test_r2': test_r2,
             'trials': trials,
+            'validation_method': validation_method,
         }
 
     def _prepare_data(
@@ -907,19 +1119,33 @@ class DecisionTreeEvaluator:
         y = working_df[target_column]
         energy = working_df[energy_column] if energy_column in working_df.columns else None
 
+        # Resolve transformation config early so we can pass log flags to weights
+        if pipeline is not None:
+            _tc = pipeline.config
+        elif transformation_config is not None:
+            _tc = transformation_config
+        else:
+            _tc = TransformationConfig()
+            transformation_config = _tc
+
         # Compute sample weights from uncertainty (inverse variance weighting)
+        # When log_target is True, uncertainties are propagated into log-space
+        # so that weights reflect relative precision (δσ/σ) rather than
+        # absolute precision (δσ). This prevents extreme weight ratios.
         sample_weights = compute_sample_weights(
             working_df,
             mode=weight_mode,
             uncertainty_column=uncertainty_column,
             energy_uncertainty_column=energy_uncertainty_column,
             missing_handling=missing_uncertainty_handling,
+            target_column=target_column,
+            log_target=_tc.log_target,
+            energy_column=energy_column,
+            log_energy=_tc.log_energy,
         )
 
         # Create or use pipeline
         if pipeline is None:
-            if transformation_config is None:
-                transformation_config = TransformationConfig()
             pipeline = TransformationPipeline(config=transformation_config)
             pipeline.fit(X_features, y, energy, feature_columns=self.feature_columns)
 
@@ -1013,45 +1239,168 @@ class DecisionTreeEvaluator:
               f"min_samples_leaf={self.min_samples_leaf})...")
         self.model.fit(X_train, y_train, sample_weight=w_train)
 
-        # Predictions
-        y_train_pred = self.model.predict(X_train)
-        y_test_pred = self.model.predict(X_test)
+        # Predictions in transformed (log) space
+        y_train_pred_log = self.model.predict(X_train)
+        y_test_pred_log = self.model.predict(X_test)
 
-        # Inverse transform
+        # ----------------------------------------------------------------
+        # DUAL-SPACE METRIC CALCULATION
+        # ----------------------------------------------------------------
+        # 1) Feature space (log10): metrics on raw model output
+        # 2) Physical space (barns): inverse-transform then re-calculate
+        # ----------------------------------------------------------------
+
+        # -- Log-space metrics (always computed on transformed targets) --
+        train_mse_log = mean_squared_error(y_train, y_train_pred_log)
+        test_mse_log = mean_squared_error(y_test, y_test_pred_log)
+        train_mae_log = mean_absolute_error(y_train, y_train_pred_log)
+        test_mae_log = mean_absolute_error(y_test, y_test_pred_log)
+        train_r2_log = r2_score(y_train, y_train_pred_log)
+        test_r2_log = r2_score(y_test, y_test_pred_log)
+
+        # -- Physical-space metrics (barns) --
         if self.pipeline.config.log_target:
-            y_train_pred = self.pipeline.inverse_transform_target(pd.Series(y_train_pred)).values
-            y_test_pred = self.pipeline.inverse_transform_target(pd.Series(y_test_pred)).values
-            y_train_orig = self.pipeline.inverse_transform_target(pd.Series(y_train)).values
-            y_test_orig = self.pipeline.inverse_transform_target(pd.Series(y_test)).values
+            # Inverse transform: sigma = 10^y' - epsilon, clipped to >= 0
+            y_train_pred_barns = self.pipeline.inverse_transform_target(
+                pd.Series(y_train_pred_log)).values
+            y_test_pred_barns = self.pipeline.inverse_transform_target(
+                pd.Series(y_test_pred_log)).values
+            y_train_barns = self.pipeline.inverse_transform_target(
+                pd.Series(y_train)).values
+            y_test_barns = self.pipeline.inverse_transform_target(
+                pd.Series(y_test)).values
+
+            # Safety clip: ensure no negative values from floating-point noise
+            y_train_pred_barns = np.clip(y_train_pred_barns, 0.0, None)
+            y_test_pred_barns = np.clip(y_test_pred_barns, 0.0, None)
+            y_train_barns = np.clip(y_train_barns, 0.0, None)
+            y_test_barns = np.clip(y_test_barns, 0.0, None)
         else:
-            y_train_orig = y_train
-            y_test_orig = y_test
+            # No log transform — log-space IS physical space
+            y_train_pred_barns = y_train_pred_log
+            y_test_pred_barns = y_test_pred_log
+            y_train_barns = y_train
+            y_test_barns = y_test
 
-        # Metrics
-        train_mse = mean_squared_error(y_train_orig, y_train_pred)
-        test_mse = mean_squared_error(y_test_orig, y_test_pred)
-        train_mae = mean_absolute_error(y_train_orig, y_train_pred)
-        test_mae = mean_absolute_error(y_test_orig, y_test_pred)
-        test_r2 = r2_score(y_test_orig, y_test_pred)
+        train_mse_barns = mean_squared_error(y_train_barns, y_train_pred_barns)
+        test_mse_barns = mean_squared_error(y_test_barns, y_test_pred_barns)
+        train_mae_barns = mean_absolute_error(y_train_barns, y_train_pred_barns)
+        test_mae_barns = mean_absolute_error(y_test_barns, y_test_pred_barns)
+        train_r2_barns = r2_score(y_train_barns, y_train_pred_barns)
+        test_r2_barns = r2_score(y_test_barns, y_test_pred_barns)
 
+        # -- Tree structural diagnostics --
+        tree_depth = self.model.get_depth()
+        num_leaves = self.model.get_n_leaves()
+        n_train = len(X_train)
+        n_test = len(X_test)
+        samples_per_leaf = n_train / num_leaves if num_leaves > 0 else 0
+
+        # ----------------------------------------------------------------
+        # Store all metrics
+        # ----------------------------------------------------------------
         self.metrics = {
-            'train_mse': train_mse,
-            'test_mse': test_mse,
-            'train_mae': train_mae,
-            'test_mae': test_mae,
-            'test_r2': test_r2,
-            'num_leaves': self.model.get_n_leaves(),
-            'tree_depth': self.model.get_depth(),
+            # Log-space (feature space)
+            'train_mse_log': train_mse_log,
+            'test_mse_log': test_mse_log,
+            'train_mae_log': train_mae_log,
+            'test_mae_log': test_mae_log,
+            'train_r2_log': train_r2_log,
+            'test_r2_log': test_r2_log,
+            # Physical space (barns)
+            'train_mse_barns': train_mse_barns,
+            'test_mse_barns': test_mse_barns,
+            'train_mae_barns': train_mae_barns,
+            'test_mae_barns': test_mae_barns,
+            'train_r2_barns': train_r2_barns,
+            'test_r2_barns': test_r2_barns,
+            # Structural
+            'num_leaves': num_leaves,
+            'tree_depth': tree_depth,
+            'n_train': n_train,
+            'n_test': n_test,
+            'samples_per_leaf': samples_per_leaf,
         }
 
         self.is_trained = True
 
-        print(f"[OK] Training complete!")
-        print(f"  Test MSE: {test_mse:.4e}")
-        print(f"  Test MAE: {test_mae:.4e}")
-        print(f"  Test R2: {test_r2:.4f}")
-        print(f"  Tree depth: {self.metrics['tree_depth']}")
-        print(f"  Leaves: {self.metrics['num_leaves']}")
+        # ----------------------------------------------------------------
+        # FORMATTED PERFORMANCE DIAGNOSTICS TABLE
+        # ----------------------------------------------------------------
+        def _gap_pct(train_val, test_val):
+            """Compute gap as percentage: (test - train) / |train| * 100."""
+            if train_val == 0:
+                return float('inf')
+            return (test_val - train_val) / abs(train_val) * 100
+
+        def _fmt_metric(val, is_r2=False):
+            """Format a metric value for table display."""
+            if is_r2:
+                return f"{val:.4f}"
+            elif abs(val) >= 1e5 or (abs(val) < 1e-2 and val != 0):
+                return f"{val:.2e}"
+            else:
+                return f"{val:.4f}"
+
+        print()
+        print("=" * 70)
+        print("FINAL PERFORMANCE DIAGNOSTICS")
+        print("=" * 70)
+        print(f"{'METRIC':<20s}| {'TRAIN SET':>16s} | {'TEST SET':>16s} | {'GAP (%)':>8s}")
+        print("-" * 70)
+
+        rows = [
+            ("MSE  (Log10)",  train_mse_log,   test_mse_log,   False),
+            ("MAE  (Log10)",  train_mae_log,    test_mae_log,   False),
+            ("R^2  (Log10)",  train_r2_log,     test_r2_log,    True),
+            ("MSE  (Barns)",  train_mse_barns,  test_mse_barns, False),
+            ("MAE  (Barns)",  train_mae_barns,  test_mae_barns, False),
+            ("R^2  (Barns)",  train_r2_barns,   test_r2_barns,  True),
+        ]
+
+        for label, train_val, test_val, is_r2 in rows:
+            gap = _gap_pct(train_val, test_val)
+            gap_str = f"{gap:+.1f}%" if abs(gap) < 1e6 else "   inf"
+            print(f"{label:<20s}| {_fmt_metric(train_val, is_r2):>16s} "
+                  f"| {_fmt_metric(test_val, is_r2):>16s} | {gap_str:>8s}")
+
+        print("-" * 70)
+
+        # ----------------------------------------------------------------
+        # GENERALIZATION & OVERFITTING DIAGNOSTICS
+        # ----------------------------------------------------------------
+        mse_gap_log = _gap_pct(train_mse_log, test_mse_log)
+        r2_gap_log = test_r2_log - train_r2_log  # absolute difference for R^2
+
+        print()
+        print("GENERALIZATION & STRUCTURAL DIAGNOSTICS")
+        print("-" * 70)
+        print(f"  Log-space MSE gap (test-train)/train:  {mse_gap_log:+.1f}%")
+        print(f"  Log-space R^2 gap (test - train):      {r2_gap_log:+.4f}")
+        print(f"  Tree depth:          {tree_depth}")
+        print(f"  Leaf count:          {num_leaves:,}")
+        print(f"  Training samples:    {n_train:,}")
+        print(f"  Test samples:        {n_test:,}")
+        print(f"  Samples / leaf:      {samples_per_leaf:,.1f}")
+
+        # Diagnostic flags
+        if mse_gap_log > 50:
+            print(f"  [!] WARNING: Large generalization gap ({mse_gap_log:.0f}%) "
+                  f"-- possible overfitting")
+        elif mse_gap_log < 2:
+            print(f"  [i] Tight generalization gap ({mse_gap_log:.1f}%) "
+                  f"-- model may be underfitting")
+        else:
+            print(f"  [OK] Generalization gap within normal range")
+
+        if samples_per_leaf < 5:
+            print(f"  [!] WARNING: Only {samples_per_leaf:.1f} samples/leaf "
+                  f"-- tree may be memorising training data")
+        elif samples_per_leaf > 10000:
+            print(f"  [i] {samples_per_leaf:,.0f} samples/leaf "
+                  f"-- tree may benefit from deeper splits")
+
+        print("=" * 70)
 
         return self.metrics
 

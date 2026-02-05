@@ -285,6 +285,9 @@ class X4Ingestor:
         ame2020_dir: Optional[str] = None,
         partitioning: List[str] = [],  # No partitioning by default (changed from ['Z', 'A', 'MT'])
         max_partitions: int = 10000,
+        run_svgp: bool = False,
+        svgp_config: Optional[Any] = None,
+        z_filter: Optional[List[int]] = None,
     ):
         """
         Initialize X4 ingestor - extracts lean EXFOR data only.
@@ -301,6 +304,13 @@ class X4Ingestor:
                          For datasets <10GB, no partitioning is recommended (fastest load, simplest).
             max_partitions: Maximum number of partitions allowed (default: 10000)
                            Only relevant if partitioning is enabled. Allows >1024 partitions.
+            run_svgp: Run SVGP outlier detection after normalization. Default: False.
+                     When True, adds z_score, gp_mean, gp_std columns to Parquet.
+            svgp_config: SVGPConfig object with SVGP hyperparameters (device, epochs, etc.).
+                        If None and run_svgp=True, uses SVGPConfig defaults.
+            z_filter: Optional list of atomic numbers (Z) to include. Default: None (all elements).
+                     Example: [17, 92] for Chlorine and Uranium only.
+                     Useful for creating test subsets for faster development/testing.
 
         Note:
             This ingestor now produces LEAN Parquet files containing only EXFOR measurements.
@@ -314,6 +324,9 @@ class X4Ingestor:
         self.output_path = Path(output_path)
         self.partitioning = partitioning
         self.max_partitions = max_partitions
+        self.run_svgp = run_svgp
+        self.svgp_config = svgp_config
+        self.z_filter = z_filter
 
         if not self.x4_db_path.exists():
             raise FileNotFoundError(f"X4 database not found: {self.x4_db_path}")
@@ -340,6 +353,8 @@ class X4Ingestor:
         logger.info("="*70)
         logger.info(f"Source: {self.x4_db_path}")
         logger.info(f"Output: {self.output_path}")
+        if self.z_filter:
+            logger.info(f"Z filter: {self.z_filter} (subset mode)")
         logger.info("="*70)
 
         # Connect to database
@@ -354,7 +369,25 @@ class X4Ingestor:
             df = self._normalize(df)
             logger.info(f"Normalized to standard schema")
 
-            # Write lean Parquet (EXFOR data only)
+            # Apply Z filter if specified (subset mode)
+            if self.z_filter:
+                before = len(df)
+                df = df[df['Z'].isin(self.z_filter)]
+                logger.info(f"Z filter applied: {before:,} -> {len(df):,} points "
+                           f"(Z in {self.z_filter})")
+
+            # SVGP outlier detection (optional)
+            if self.run_svgp:
+                logger.info("Running SVGP outlier detection...")
+                from nucml_next.data.outlier_detection import SVGPOutlierDetector, SVGPConfig
+                config = self.svgp_config if self.svgp_config is not None else SVGPConfig()
+                detector = SVGPOutlierDetector(config)
+                df = detector.score_dataframe(df)
+                n_outliers = (df['z_score'] > 3).sum()
+                logger.info(f"SVGP scoring complete: {n_outliers:,} outliers at z>3 "
+                           f"({100 * n_outliers / len(df):.2f}%)")
+
+            # Write lean Parquet (EXFOR data only, plus optional SVGP columns)
             # AME enrichment now happens during feature generation
             self._write_parquet(df)
             logger.info(f"Saved to {self.output_path}")
@@ -987,6 +1020,9 @@ def ingest_x4(
     output_path: str = 'data/exfor_processed.parquet',
     ame2020_dir: Optional[str] = None,
     max_partitions: int = 10000,
+    run_svgp: bool = False,
+    svgp_config: Optional[Any] = None,
+    z_filter: Optional[List[int]] = None,
 ) -> pd.DataFrame:
     """
     Convenience function for lean X4 ingestion (EXFOR data only).
@@ -997,6 +1033,10 @@ def ingest_x4(
         ame2020_dir: DEPRECATED - This parameter is ignored.
                     AME enrichment now happens during feature generation.
         max_partitions: Maximum number of partitions (default: 10000 for full EXFOR)
+        run_svgp: Run SVGP outlier detection (adds z_score column). Default: False.
+        svgp_config: SVGPConfig object with SVGP hyperparameters. Default: None.
+        z_filter: Optional list of atomic numbers (Z) to include. Default: None (all).
+                 Example: [17, 92] for Chlorine and Uranium only.
 
     Returns:
         Processed DataFrame with EXFOR data (lean, no AME duplication)
@@ -1005,18 +1045,31 @@ def ingest_x4(
         >>> # Basic ingestion (no enrichment)
         >>> df = ingest_x4('data/x4sqlite1.db', 'data/exfor.parquet')
 
-        >>> # Full enrichment (all tiers)
+        >>> # With SVGP outlier detection
+        >>> from nucml_next.data.outlier_detection import SVGPConfig
         >>> df = ingest_x4(
         ...     x4_db_path='data/x4sqlite1.db',
-        ...     output_path='data/exfor_enriched.parquet',
-        ...     ame2020_dir='data/'
+        ...     output_path='data/exfor.parquet',
+        ...     run_svgp=True,
+        ...     svgp_config=SVGPConfig(device='cuda'),
         ... )
-        >>> # Parquet now contains all enrichment columns for tier-based feature selection
+        >>> # Parquet now contains z_score column for outlier filtering
+
+        >>> # Test subset (Uranium + Chlorine only)
+        >>> df = ingest_x4(
+        ...     x4_db_path='data/x4sqlite1.db',
+        ...     output_path='data/exfor_test.parquet',
+        ...     z_filter=[17, 92],  # Cl=17, U=92
+        ...     run_svgp=True,
+        ... )
     """
     ingestor = X4Ingestor(
         x4_db_path=x4_db_path,
         output_path=output_path,
         ame2020_dir=ame2020_dir,
         max_partitions=max_partitions,
+        run_svgp=run_svgp,
+        svgp_config=svgp_config,
+        z_filter=z_filter,
     )
     return ingestor.ingest()

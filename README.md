@@ -18,6 +18,24 @@ cd NUCML-Next
 pip install -r requirements.txt
 ```
 
+**Or with conda:**
+
+```bash
+git clone https://github.com/WHopkins-git/NUCML-Next.git
+cd NUCML-Next
+conda create -n nucml python=3.10
+conda activate nucml
+conda install -c conda-forge numpy pandas scipy matplotlib seaborn scikit-learn xgboost ipywidgets jupyter pyarrow
+conda install -c pytorch -c gpytorch gpytorch pytorch
+pip install -r requirements.txt  # for any remaining packages
+```
+
+Key dependencies:
+
+- `gpytorch` -- required for GP outlier detection (`--outlier-method`)
+- `ipywidgets` -- required for interactive threshold explorer in notebooks
+- `xgboost`, `scikit-learn` -- baseline models
+
 ### 2. Download data files
 
 Place all files in the `data/` directory.
@@ -48,15 +66,82 @@ Download the `*.mas20.txt` files from https://www-nds.iaea.org/amdc/
 ### 3. Run ingestion
 
 ```bash
+# Basic ingestion (no outlier detection)
 python scripts/ingest_exfor.py \
     --x4-db data/x4sqlite1.db \
     --output data/exfor_processed.parquet
+
+# Test subset: Uranium + Chlorine only (~300K points, minutes instead of hours)
+python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --test-subset
+
+# Custom element subset (Gold, Uranium, Iron)
+python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --z-filter 79,92,26
+
+# With per-experiment GP outlier detection (RECOMMENDED)
+python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method experiment
+
+# With legacy SVGP outlier detection
+python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method svgp
+
+# With GPU acceleration
+python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db \
+    --outlier-method experiment --svgp-device cuda
+
+# With checkpointing (resume interrupted runs)
+python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db \
+    --outlier-method experiment --svgp-device cuda \
+    --svgp-checkpoint-dir data/checkpoints/
+
+# Full pipeline: test subset + per-experiment outlier detection
+python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db \
+    --test-subset --outlier-method experiment --z-threshold 3.0
 ```
 
-This reads the X4Pro SQLite database and writes a Parquet dataset with
-schema `[Entry, Z, A, MT, Energy, CrossSection, Uncertainty]`.
+The ingestion pipeline:
+
+1. **Extract** -- reads cross-section measurements from the X4Pro SQLite
+   database (auto-detects schema variants).
+2. **Normalise** -- maps to standard schema, applies data-quality filters
+   (removes A=0, non-positive values, unrealistic ranges).
+3. **Outlier scoring** (if `--outlier-method`) -- fits Gaussian Processes
+   to detect anomalous measurements and discrepant experiments.
+4. **Write Parquet** -- saves lean dataset for downstream use.
+
+Output schema:
+
+```
+[Entry, Z, A, N, Projectile, MT, Energy, CrossSection, Uncertainty,
+ Energy_Uncertainty, log_E, log_sigma, gp_mean, gp_std, z_score,
+ experiment_outlier, point_outlier, calibration_metric, experiment_id]
+                ^^^^^ added by --outlier-method experiment ^^^^^
+```
+
 AME2020 enrichment is applied later during feature generation, not at
 ingestion time.
+
+<details>
+<summary>Expected console output (with --outlier-method experiment)</summary>
+
+```
+======================================================================
+NUCML-Next: X4Pro EXFOR Data Ingestion (Lean Mode)
+======================================================================
+X4 Database:  data/x4sqlite1.db
+Output:       data/exfor_processed.parquet
+Mode:         Lean extraction (EXFOR data only)
+Outlier:      Per-experiment GP (recommended) - z_threshold=3.0
+======================================================================
+
+... (Experiment scoring progress bar) ...
+
+Ingestion complete!
+Processed 13,419,082 data points
+Saved to: data/exfor_processed.parquet
+Per-experiment outlier detection:
+    Point outliers: 180,000 (1.34%)
+    Experiment outliers: 450 experiments flagged
+```
+</details>
 
 ### 4. Run notebooks
 
@@ -84,21 +169,192 @@ Tier A is always included. Reaction channels (MT codes) are encoded as a
 
 ---
 
+## Transformation pipeline
+
+The `TransformationPipeline` applies transforms in a fixed order before
+training. The order matters: log-transforms run **first**, so that the
+scaler sees compressed log-space values rather than raw multi-order-of-
+magnitude physical values.
+
+**Order of operations (forward transform):**
+
+1. Log-transform cross-section: `sigma' = log10(sigma + epsilon)`
+   - `target_epsilon = 1e-10` prevents `log(0)` for very small cross-sections
+2. Log-transform energy: `E' = log10(E)`
+   - No epsilon for energy (measurements are always > 0)
+3. Scale all features: `X' = (X - min) / (max - min)`
+   - Applied to already-log-transformed values
+
+**Defaults:**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `log_target` | `True` | Log-transform cross-sections |
+| `target_epsilon` | `1e-10` | Epsilon for `log(sigma + eps)` |
+| `log_energy` | `True` | Log-transform energies |
+| `scaler_type` | `'minmax'` | Feature scaling method (`minmax`, `standard`, `robust`, `none`) |
+| `scale_features` | `'all'` | Scale every numeric column |
+
+For tree-based models (Decision Trees, XGBoost), feature scaling is not
+mathematically necessary because trees only use value ordering. MinMax
+scaling is cheap and prepares the pipeline for neural networks where
+scaling is required.
+
+```python
+from nucml_next.data.selection import TransformationConfig
+
+config = TransformationConfig(
+    log_target=True,
+    target_epsilon=1e-10,
+    log_energy=True,
+    scaler_type='minmax',
+    scale_features='all',
+)
+```
+
+---
+
+## Outlier detection (optional)
+
+NUCML-Next includes GP-based outlier detection that flags suspicious EXFOR
+measurements and identifies discrepant experiments. Two methods are available:
+
+### Per-experiment GP (recommended)
+
+The `--outlier-method experiment` approach fits independent Exact GPs to each
+EXFOR experiment (Entry) within a (Z, A, MT) group, builds consensus from
+multiple experiments, and flags entire experiments that deviate systematically.
+
+**Key advantages:**
+- Uses heteroscedastic noise from measurement uncertainties
+- Flags discrepant *experiments*, not just individual points
+- Better handles resonance structure (no over-smoothing)
+- Calibrates lengthscale via Wasserstein distance
+
+**Output columns:**
+- `experiment_outlier` -- bool: entire experiment flagged as discrepant
+- `point_outlier` -- bool: individual point is anomalous
+- `z_score` -- float: continuous anomaly score
+- `calibration_metric` -- float: per-experiment Wasserstein distance
+- `experiment_id` -- str: EXFOR Entry identifier
+
+### Legacy SVGP
+
+The `--outlier-method svgp` approach pools all experiments per (Z, A, MT)
+group and fits a single Sparse Variational GP. This produces point-level
+z-scores but cannot identify systematically discrepant experiments.
+
+### CLI reference
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--outlier-method` | none | `experiment` (recommended) or `svgp` (legacy) |
+| `--z-threshold` | 3.0 | Z-score threshold for point outliers |
+| `--svgp-device` | `cpu` | PyTorch device: `cpu` or `cuda` |
+| `--svgp-checkpoint-dir` | none | Directory for checkpoint files |
+| `--svgp-likelihood` | `student_t` | Likelihood type for SVGP method |
+
+**Performance:** The full EXFOR database (~13.4M points, ~30K experiments)
+takes approximately 4 hours single-threaded or under 1 hour with 8 workers.
+Checkpointing allows interrupted runs to resume.
+
+### Run ingestion with outlier scoring
+
+```bash
+# Per-experiment GP (recommended)
+python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method experiment
+
+# Per-experiment GP with GPU and checkpointing
+python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db \
+    --outlier-method experiment --svgp-device cuda \
+    --svgp-checkpoint-dir data/checkpoints/
+
+# Legacy SVGP
+python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method svgp
+```
+
+### Filter outliers at load time
+
+```python
+from nucml_next.data import DataSelection, NucmlDataset
+
+selection = DataSelection(
+    z_threshold=3.0,          # Exclude points with z_score > 3
+    include_outliers=False,   # Remove (not just flag) outliers
+)
+dataset = NucmlDataset('data/exfor_processed.parquet', selection=selection)
+# -> [OK] Outlier filter: Removed 180,000 points with z_score > 3.0
+
+# View outlier statistics at different thresholds
+dataset.outlier_summary()
+#    threshold  outliers     pct  retained
+# 0        2.0    380000    2.83  13039082
+# 1        3.0    180000    1.34  13239082
+# 2        4.0     45000    0.34  13374082
+# 3        5.0     12000    0.09  13407082
+```
+
+### Programmatic API
+
+```python
+from nucml_next.data import ExperimentOutlierDetector, ExperimentOutlierConfig
+
+# Per-experiment GP (recommended)
+config = ExperimentOutlierConfig(point_z_threshold=3.0)
+detector = ExperimentOutlierDetector(config)
+df_scored = detector.score_dataframe(df)
+# df_scored has: experiment_outlier, point_outlier, z_score, experiment_id
+
+# Filter to non-discrepant experiments
+df_clean = df_scored[~df_scored['experiment_outlier']]
+```
+
+### Interactive threshold explorer
+
+In Jupyter notebooks, use the interactive widget to browse any (Z, A, MT)
+group, visualise the GP predictive distribution, and adjust the threshold:
+
+```python
+from nucml_next.visualization.threshold_explorer import ThresholdExplorer
+
+explorer = ThresholdExplorer('data/exfor_processed.parquet')
+explorer.show()  # cascading dropdowns + probability surface + z-score bands
+```
+
+### Edge cases
+
+- Groups with **< 10 points**: MAD (Median Absolute Deviation) fallback
+  with consistency constant 1.4826
+- Experiments with **< 5 points**: evaluated against consensus from larger
+  experiments, or MAD if no consensus available
+- Groups with **1 experiment**: GP fit possible, but `experiment_outlier`
+  cannot be assessed (no comparison)
+- **No `--outlier-method`**: outlier columns are absent; `z_threshold`
+  emits a warning and has no effect
+- **GP numerical failure**: falls back to MAD automatically, logged at
+  WARNING level
+
+---
+
 ## Package structure
 
 ```
 nucml_next/
   ingest/          X4Pro SQLite -> Parquet ingestion
-  data/            NucmlDataset, DataSelection, feature generation, transformations
+  data/            NucmlDataset, DataSelection, TransformationPipeline,
+                   ExperimentOutlierDetector (experiment_outlier.py),
+                   SVGPOutlierDetector (outlier_detection.py, legacy)
   baselines/       DecisionTreeEvaluator, XGBoostEvaluator
   model/           GNN-Transformer architecture
   physics/         Physics-informed and sensitivity-weighted loss
   validation/      OpenMC reactor benchmarking
-  visualization/   CrossSectionFigure (EXFOR overlay plots)
+  visualization/   CrossSectionFigure, IsotopePlotter (one-line plotting),
+                   ThresholdExplorer (interactive notebook widget)
   utils/           Helpers
 
 scripts/
-  ingest_exfor.py  CLI for X4Pro -> Parquet
+  ingest_exfor.py  CLI for X4Pro -> Parquet (with --outlier-method support)
+  validate_experiment_outlier.py  Validation on benchmark reactions
   clean_ame_files.py  Replace '#' estimated-value markers in AME files
 
 notebooks/

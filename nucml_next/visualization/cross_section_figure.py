@@ -798,6 +798,184 @@ class CrossSectionFigure:
         return self
 
     # =========================================================================
+    # SVGP / OUTLIER VISUALIZATION
+    # =========================================================================
+
+    def add_gp_fit(
+        self,
+        energies: np.ndarray,
+        gp_mean: np.ndarray,
+        gp_std: np.ndarray,
+        n_sigma: float = 2.0,
+        label: str = 'GP fit',
+        color: str = '#2ca02c',
+        fill_alpha: float = 0.15,
+        line_alpha: float = 0.8,
+        linewidth: float = 2.0,
+        zorder: int = 2,
+        log_space: bool = True,
+        **kwargs,
+    ) -> 'CrossSectionFigure':
+        """
+        Add GP mean curve with uncertainty band.
+
+        Plots the Gaussian Process fit from SVGP outlier detection,
+        showing the smooth trend and confidence interval.
+
+        Args:
+            energies: Energy values (log10 if log_space=True, linear otherwise)
+            gp_mean: GP predicted mean (log10(sigma) if log_space=True)
+            gp_std: GP predicted std (log10(sigma) space if log_space=True)
+            n_sigma: Number of standard deviations for uncertainty band
+            label: Legend label
+            color: Line and fill color
+            fill_alpha: Uncertainty band transparency
+            line_alpha: Mean line transparency
+            linewidth: Mean line width
+            zorder: Drawing order
+            log_space: If True, energies/gp_mean/gp_std are in log10 space
+                      and will be converted to linear for plotting.
+                      If False, values are already in linear space.
+            **kwargs: Additional arguments passed to ax.plot()
+
+        Returns:
+            self for method chaining
+
+        Example:
+            >>> # Plot GP fit from Parquet z_score columns
+            >>> subset = df[(df['Z'] == 92) & (df['A'] == 235) & (df['MT'] == 2)]
+            >>> fig.add_gp_fit(
+            ...     subset['log_E'].values,
+            ...     subset['gp_mean'].values,
+            ...     subset['gp_std'].values,
+            ... )
+        """
+        energies = np.asarray(energies)
+        gp_mean = np.asarray(gp_mean)
+        gp_std = np.asarray(gp_std)
+
+        if log_space:
+            # Convert from log10 to linear for plotting
+            E_plot = 10 ** energies
+            mean_plot = 10 ** gp_mean
+            upper_plot = 10 ** (gp_mean + n_sigma * gp_std)
+            lower_plot = 10 ** (gp_mean - n_sigma * gp_std)
+        else:
+            E_plot = energies
+            mean_plot = gp_mean
+            upper_plot = gp_mean + n_sigma * gp_std
+            lower_plot = gp_mean - n_sigma * gp_std
+
+        # Sort by energy
+        sort_idx = np.argsort(E_plot)
+        E_plot = E_plot[sort_idx]
+        mean_plot = mean_plot[sort_idx]
+        upper_plot = upper_plot[sort_idx]
+        lower_plot = lower_plot[sort_idx]
+
+        # Plot mean line
+        line, = self.ax.plot(
+            E_plot, mean_plot,
+            color=color, linewidth=linewidth,
+            alpha=line_alpha, zorder=zorder, label=label,
+            **kwargs
+        )
+
+        # Plot uncertainty band
+        self.ax.fill_between(
+            E_plot, lower_plot, upper_plot,
+            color=color, alpha=fill_alpha, zorder=zorder - 0.5,
+        )
+
+        self._legend_handles.append(line)
+        self._legend_labels.append(label)
+
+        return self
+
+    def add_exfor_outliers(
+        self,
+        data: pd.DataFrame,
+        z_threshold: float = 3.0,
+        energy_column: str = 'Energy',
+        xs_column: str = 'CrossSection',
+        z_score_column: str = 'z_score',
+        inlier_color: str = 'tab:blue',
+        outlier_color: str = 'tab:red',
+        inlier_alpha: float = 0.5,
+        outlier_alpha: float = 0.9,
+        inlier_size: float = 25,
+        outlier_size: float = 60,
+        outlier_marker: str = 'x',
+        inlier_marker: str = 'o',
+        zorder: int = 1,
+        **kwargs,
+    ) -> 'CrossSectionFigure':
+        """
+        Add EXFOR data with outlier highlighting based on z_score.
+
+        Plots inlier and outlier points in different colors/markers for
+        visual inspection of SVGP outlier detection results.
+
+        Args:
+            data: DataFrame with energy, cross-section, and z_score columns
+            z_threshold: Z-score threshold for outlier classification
+            energy_column: Column name for energy values
+            xs_column: Column name for cross-section values
+            z_score_column: Column name for z-score values
+            inlier_color: Color for inlier points
+            outlier_color: Color for outlier points
+            inlier_alpha: Transparency for inlier points
+            outlier_alpha: Transparency for outlier points
+            inlier_size: Marker size for inlier points
+            outlier_size: Marker size for outlier points
+            outlier_marker: Marker style for outliers ('x', 'D', '^', etc.)
+            inlier_marker: Marker style for inliers ('o', 's', etc.)
+            zorder: Drawing order
+            **kwargs: Additional arguments passed to ax.scatter()
+
+        Returns:
+            self for method chaining
+
+        Example:
+            >>> subset = df[(df['Z'] == 92) & (df['A'] == 235) & (df['MT'] == 2)]
+            >>> fig.add_exfor_outliers(subset, z_threshold=3.0)
+        """
+        if z_score_column not in data.columns:
+            raise ValueError(
+                f"Column '{z_score_column}' not found in data. "
+                f"Run ingestion with --run-svgp to add z_score column."
+            )
+
+        inliers = data[data[z_score_column] <= z_threshold]
+        outliers = data[data[z_score_column] > z_threshold]
+
+        # Plot inliers
+        if len(inliers) > 0:
+            s_in = self.ax.scatter(
+                inliers[energy_column], inliers[xs_column],
+                c=inlier_color, marker=inlier_marker, s=inlier_size,
+                alpha=inlier_alpha, zorder=zorder,
+                label=f'EXFOR inliers ({len(inliers):,})',
+                edgecolors='none', **kwargs
+            )
+            self._legend_handles.append(s_in)
+            self._legend_labels.append(f'EXFOR inliers ({len(inliers):,})')
+
+        # Plot outliers
+        if len(outliers) > 0:
+            s_out = self.ax.scatter(
+                outliers[energy_column], outliers[xs_column],
+                c=outlier_color, marker=outlier_marker, s=outlier_size,
+                alpha=outlier_alpha, zorder=zorder + 1,
+                label=f'Outliers z>{z_threshold} ({len(outliers):,})',
+                linewidths=1.5,
+            )
+            self._legend_handles.append(s_out)
+            self._legend_labels.append(f'Outliers z>{z_threshold} ({len(outliers):,})')
+
+        return self
+
+    # =========================================================================
     # ANNOTATION AND CUSTOMIZATION
     # =========================================================================
 

@@ -4,8 +4,17 @@ Reversible Transformation Pipeline for Nuclear Cross-Section ML
 
 Implements standardized transformations for nuclear cross-section data:
 1. Log-scaling for cross-sections and energies (stabilizes gradients)
-2. StandardScaler for nuclear features (centers data at zero)
+2. Feature scaling (MinMax, StandardScaler, Robust, or none)
 3. Inverse transformations for predictions (converts back to physical units)
+
+Order of Operations (forward transform):
+-----------------------------------------
+1. Log-transform cross-section: σ' = log₁₀(σ + ε)      [transform_target]
+2. Log-transform energy:        E' = log₁₀(E)           [transform, step 1]
+3. Scale all features:          X' = (X - min)/(max-min) [transform, step 2]
+
+The scaler is fitted on log-transformed data so that compressed log-space
+values are scaled rather than raw multi-order-of-magnitude physical values.
 
 Mathematical Transformations:
 -----------------------------
@@ -17,14 +26,14 @@ Mathematical Transformations:
    Forward:  E' = log₁₀(E)
    Inverse:  E = 10^(E')
 
-3. Feature standardization (Z-score normalization):
-   Forward:  X' = (X - μ) / σ
-   Inverse:  X = X' * σ + μ
+3. Feature scaling (default: MinMax):
+   Forward:  X' = (X - min) / (max - min)
+   Inverse:  X = X' * (max - min) + min
 
 Pipeline Hygiene:
 -----------------
 - All transformations are reversible (fit/transform/inverse_transform)
-- Scaler parameters (μ, σ) stored for inference time
+- Scaler parameters (min, max) stored for inference time
 - Prevents data leakage: fit only on training set, transform train/val/test
 - Thread-safe: Can be pickled and loaded for production deployment
 
@@ -79,12 +88,15 @@ class TransformationPipeline:
     """
     Reversible transformation pipeline for nuclear cross-section ML.
 
-    Implements log-scaling, standardization, and inverse transformations
+    Implements log-scaling, feature scaling, and inverse transformations
     with proper handling of training/inference time parameter reuse.
 
+    **Forward transform order:** log-energy → scale features.
+    The scaler is fitted on already-log-transformed values.
+
     Supports multiple scaling strategies:
+    - 'minmax': Min-max scaling to [0, 1]  (default)
     - 'standard': Z-score normalization (X-μ)/σ
-    - 'minmax': Min-max scaling to [0, 1]
     - 'robust': Robust scaling using median and IQR
     - 'none': No scaling
     """
@@ -133,16 +145,22 @@ class TransformationPipeline:
         """
         Fit transformation parameters on training data.
 
-        Computes mean and standard deviation for each feature to enable
-        Z-score normalization. These parameters are stored and reused
-        for transform() calls on validation/test data.
+        Computes scaler statistics (mean/std, min/max, or median/IQR) for each
+        feature column.  These parameters are stored and reused for
+        ``transform()`` calls on validation/test data.
+
+        **Important:** The scaler is fitted on the *log-transformed* data so
+        that at ``transform()`` time the pipeline applies log-transforms first
+        and then scales.
 
         Args:
             X: Feature matrix (DataFrame)
             y: Target cross-sections (Series) - optional, not used for fitting
             energy: Incident energies (Series) - optional, not used for fitting
-            feature_columns: List of columns to standardize
-                           If None, standardizes all numeric columns
+            feature_columns: List of columns to standardize.
+                If None, resolved from ``config.scale_features``:
+                  - ``'all'`` or ``None``: all numeric columns
+                  - ``List[str]``: those exact columns
 
         Returns:
             self (fitted pipeline)
@@ -152,20 +170,33 @@ class TransformationPipeline:
             >>> pipeline.fit(X_train, y_train, energy_train,
             ...              feature_columns=['Z', 'A', 'N', 'R_fm', 'Mass_Excess_MeV'])
         """
-        # Determine which columns to scale
+        # -------------------------------------------------------------------
+        # Resolve which columns to scale
+        # -------------------------------------------------------------------
         if feature_columns is None:
-            # Use config if available, otherwise all numeric columns
-            if self.config.scale_features is not None:
-                feature_columns = self.config.scale_features
+            # Use config if available
+            if self.config.scale_features is not None and self.config.scale_features != 'all':
+                # Explicit list of column names
+                feature_columns = list(self.config.scale_features)
             else:
-                # Default: standardize all numeric columns
+                # 'all' or None -> all numeric columns
                 feature_columns = X.select_dtypes(include=[np.number]).columns.tolist()
 
         self.feature_columns_ = feature_columns
 
+        # -------------------------------------------------------------------
+        # Apply log-energy transform BEFORE fitting the scaler, so that the
+        # scaler statistics are computed on log-space Energy.
+        # -------------------------------------------------------------------
+        X_for_fit = X.copy()
+        if self.config.log_energy and energy is not None and 'Energy' in X_for_fit.columns:
+            X_for_fit['Energy'] = self._apply_log(energy.values, self.config.energy_log_base)
+
+        # -------------------------------------------------------------------
         # Compute scaler parameters based on scaler_type
+        # -------------------------------------------------------------------
         if self.config.scaler_type != 'none':
-            X_features = X[feature_columns].values
+            X_features = X_for_fit[feature_columns].values.astype(np.float64)
 
             if self.config.scaler_type == 'standard':
                 # Z-score normalization: (X - μ) / σ
@@ -223,8 +254,9 @@ class TransformationPipeline:
         """
         Apply transformations to features and energy.
 
-        Applies standardization to features and log-scaling to energy
-        using parameters fitted during fit().
+        **Order of operations** (matches ``fit()``):
+          1. Log-transform energy (if enabled)
+          2. Scale features (using parameters fitted on log-transformed data)
 
         Args:
             X: Feature matrix (DataFrame)
@@ -244,9 +276,20 @@ class TransformationPipeline:
 
         X_transformed = X.copy()
 
-        # 1. Scale features based on scaler_type
+        # 1. Log-transform energy FIRST (before scaling)
+        if self.config.log_energy and energy is not None:
+            energy_transformed = self._apply_log(energy.values, self.config.energy_log_base)
+
+            if 'Energy' in X_transformed.columns:
+                # Replace Energy column with log-transformed version
+                X_transformed['Energy'] = energy_transformed
+            else:
+                # Add log-transformed energy as new column
+                X_transformed['Energy_log'] = energy_transformed
+
+        # 2. Scale features AFTER log-transforms
         if self.config.scaler_type != 'none':
-            X_features = X[self.feature_columns_].values.astype(np.float64)
+            X_features = X_transformed[self.feature_columns_].values.astype(np.float64)
 
             if self.config.scaler_type == 'standard':
                 # Z-score normalization: (X - μ) / σ
@@ -267,17 +310,6 @@ class TransformationPipeline:
             X_scaled = np.nan_to_num(X_scaled, nan=np.nan, posinf=1e10, neginf=-1e10)
 
             X_transformed[self.feature_columns_] = X_scaled
-
-        # 2. Log-transform energy if enabled
-        if self.config.log_energy and energy is not None:
-            energy_transformed = self._apply_log(energy.values, self.config.energy_log_base)
-
-            if 'Energy' in X_transformed.columns:
-                # Replace Energy column with log-transformed version
-                X_transformed['Energy'] = energy_transformed
-            else:
-                # Add log-transformed energy as new column
-                X_transformed['Energy_log'] = energy_transformed
 
         return X_transformed
 
@@ -388,11 +420,11 @@ class TransformationPipeline:
         energy: Optional[pd.Series] = None
     ) -> pd.DataFrame:
         """
-        Reverse standardization and log-transforms on features.
+        Reverse scaling and log-transforms on features.
 
-        Converts transformed features back to original scale:
-        - Standardized features: X = X' * σ + μ
-        - Log energy: E = 10^(E')
+        **Order of operations** (reverse of ``transform()``):
+          1. Reverse scaling (unscale features back to log-space)
+          2. Reverse log-transform on energy (convert log-energy back to eV)
 
         Args:
             X: Transformed feature matrix
@@ -412,7 +444,7 @@ class TransformationPipeline:
 
         X_original = X.copy()
 
-        # 1. Reverse scaling based on scaler_type
+        # 1. Reverse scaling FIRST (undo step 2 of forward transform)
         if self.config.scaler_type != 'none':
             X_scaled = X[self.feature_columns_].values
 
@@ -430,7 +462,7 @@ class TransformationPipeline:
 
             X_original[self.feature_columns_] = X_features
 
-        # 2. Reverse log-transform on energy if enabled
+        # 2. Reverse log-transform on energy (undo step 1 of forward transform)
         if self.config.log_energy and energy is not None:
             energy_original = self._inverse_log(energy.values, self.config.energy_log_base)
 

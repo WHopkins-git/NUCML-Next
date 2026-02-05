@@ -11,11 +11,24 @@ This script implements the lean ingestion architecture:
 - AME2020/NUBASE2020 enrichment happens during feature generation
 
 Usage:
-    # Standard ingestion
+    # Standard ingestion (full database, ~13M points)
     python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db
 
-    # With custom output path
-    python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --output data/my_exfor.parquet
+    # Test subset (Uranium + Chlorine only, ~300K points, takes minutes)
+    python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --test-subset
+
+    # Custom element subset
+    python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --z-filter 79,92,26
+
+    # With per-experiment GP outlier detection (RECOMMENDED)
+    python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method experiment
+
+    # With legacy SVGP outlier detection
+    python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method svgp
+
+    # Full pipeline: test subset + per-experiment outlier detection
+    python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --test-subset \\
+        --outlier-method experiment --z-threshold 3.0
 
 Requirements:
     - X4Pro SQLite database (x4sqlite1.db)
@@ -49,11 +62,23 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Standard ingestion
+  # Standard ingestion (full database)
   python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db
 
-  # With custom output path
-  python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --output data/exfor.parquet
+  # Test subset (Uranium + Chlorine only, much faster)
+  python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --test-subset
+
+  # Custom element subset (Gold, Uranium, Iron)
+  python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --z-filter 79,92,26
+
+  # With SVGP outlier detection (Student-t likelihood, default)
+  python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --run-svgp
+
+  # With SVGP using heteroscedastic likelihood (uses measurement uncertainties)
+  python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --run-svgp --svgp-likelihood heteroscedastic
+
+  # Full pipeline: test subset + SVGP + CUDA acceleration
+  python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --test-subset --run-svgp --svgp-device cuda
 
 Note:
   AME2020/NUBASE2020 enrichment is now handled during feature generation.
@@ -82,7 +107,90 @@ Note:
         help='DEPRECATED - This parameter is ignored. AME enrichment now happens during feature generation.'
     )
 
+    # Outlier detection options
+    parser.add_argument(
+        '--outlier-method',
+        type=str,
+        default=None,
+        choices=['svgp', 'experiment', None],
+        help='Outlier detection method: '
+             '"svgp" (legacy pooled SVGP), '
+             '"experiment" (per-experiment GP with consensus, recommended). '
+             'Default: None (no outlier detection)'
+    )
+    parser.add_argument(
+        '--run-svgp',
+        action='store_true',
+        default=False,
+        help='DEPRECATED: Use --outlier-method svgp instead. '
+             'Run SVGP outlier detection (adds z_score column to Parquet)'
+    )
+    parser.add_argument(
+        '--no-svgp',
+        action='store_true',
+        default=False,
+        help='Explicitly skip outlier detection (default behavior)'
+    )
+    parser.add_argument(
+        '--svgp-device',
+        type=str,
+        default='cpu',
+        choices=['cpu', 'cuda'],
+        help='Device for SVGP computation (default: cpu)'
+    )
+    parser.add_argument(
+        '--svgp-checkpoint-dir',
+        type=str,
+        default=None,
+        help='Directory for outlier detection checkpoints (enables resume on interruption)'
+    )
+    parser.add_argument(
+        '--svgp-likelihood',
+        type=str,
+        default='student_t',
+        choices=['student_t', 'heteroscedastic', 'gaussian'],
+        help='SVGP likelihood type (default: student_t). Options: '
+             'student_t (robust to outliers), '
+             'heteroscedastic (uses measurement uncertainties), '
+             'gaussian (legacy)'
+    )
+    parser.add_argument(
+        '--z-threshold',
+        type=float,
+        default=3.0,
+        help='Z-score threshold for flagging point outliers (default: 3.0)'
+    )
+
+    # Subset filtering options
+    parser.add_argument(
+        '--test-subset',
+        action='store_true',
+        default=False,
+        help='Use test subset: Uranium (Z=92) + Chlorine (Z=17) only. '
+             'Much faster for development/testing (~300K points instead of 13M)'
+    )
+    parser.add_argument(
+        '--z-filter',
+        type=str,
+        default=None,
+        help='Comma-separated list of atomic numbers (Z) to include. '
+             'Example: --z-filter 79,92,26 for Au, U, Fe'
+    )
+
     args = parser.parse_args()
+
+    # Parse z_filter
+    z_filter = None
+    if args.test_subset:
+        z_filter = [17, 92]  # Chlorine and Uranium
+    elif args.z_filter:
+        try:
+            z_filter = [int(z.strip()) for z in args.z_filter.split(',')]
+        except ValueError:
+            print(f"Error: Invalid --z-filter format. Expected comma-separated integers.")
+            print(f"  Got: {args.z_filter}")
+            print(f"  Example: --z-filter 79,92,26")
+            sys.exit(1)
 
     # Validate X4 database
     x4_path = Path(args.x4_db)
@@ -99,6 +207,34 @@ Note:
         print("   AME enrichment now happens during feature generation for better performance.")
         print("   Place AME files in data/ and NucmlDataset will load them automatically.\n")
 
+    # Determine outlier detection method
+    outlier_method = args.outlier_method
+    if args.run_svgp and not args.no_svgp and outlier_method is None:
+        # Legacy --run-svgp flag
+        outlier_method = 'svgp'
+        print("⚠️  WARNING: --run-svgp is deprecated. Use --outlier-method svgp instead.\n")
+
+    # Build outlier detector config
+    svgp_config = None
+    experiment_outlier_config = None
+
+    if outlier_method == 'svgp':
+        from nucml_next.data.outlier_detection import SVGPConfig
+        svgp_config = SVGPConfig(
+            device=args.svgp_device,
+            checkpoint_dir=args.svgp_checkpoint_dir,
+            likelihood=args.svgp_likelihood,
+        )
+    elif outlier_method == 'experiment':
+        from nucml_next.data.experiment_outlier import ExperimentOutlierConfig
+        experiment_outlier_config = ExperimentOutlierConfig(
+            point_z_threshold=args.z_threshold,
+            checkpoint_dir=args.svgp_checkpoint_dir,
+        )
+
+    run_svgp = outlier_method == 'svgp'
+    run_experiment_outlier = outlier_method == 'experiment'
+
     # Run ingestion
     print("\n" + "="*70)
     print("NUCML-Next: X4Pro EXFOR Data Ingestion (Lean Mode)")
@@ -106,18 +242,56 @@ Note:
     print(f"X4 Database:  {args.x4_db}")
     print(f"Output:       {args.output}")
     print(f"Mode:         Lean extraction (EXFOR data only)")
+    if z_filter:
+        print(f"Z Filter:     {z_filter} (subset mode)")
+    if outlier_method == 'svgp':
+        print(f"Outlier:      SVGP (legacy) - device={args.svgp_device}, likelihood={args.svgp_likelihood}")
+    elif outlier_method == 'experiment':
+        print(f"Outlier:      Per-experiment GP (recommended) - z_threshold={args.z_threshold}")
+    else:
+        print(f"Outlier:      Disabled (use --outlier-method to enable)")
+    if args.svgp_checkpoint_dir:
+        print(f"Checkpoints:  {args.svgp_checkpoint_dir}")
     print("="*70 + "\n")
 
     df = ingest_x4(
         x4_db_path=args.x4_db,
         output_path=args.output,
         ame2020_dir=None,  # Always None now (enrichment happens during feature generation)
+        run_svgp=run_svgp,
+        svgp_config=svgp_config,
+        z_filter=z_filter,
     )
+
+    # Run per-experiment outlier detection if requested
+    if run_experiment_outlier:
+        print("\n" + "-"*70)
+        print("Running per-experiment GP outlier detection...")
+        print("-"*70 + "\n")
+
+        from nucml_next.data.experiment_outlier import ExperimentOutlierDetector
+
+        detector = ExperimentOutlierDetector(experiment_outlier_config)
+        df = detector.score_dataframe(df)
+
+        # Save updated dataframe
+        df.to_parquet(args.output, index=False)
 
     print(f"\n✓ Ingestion complete!")
     print(f"✓ Processed {len(df):,} data points")
     print(f"✓ Saved to: {args.output}")
-    print(f"✓ Lean Parquet contains EXFOR data only (no AME duplication)")
+
+    if run_svgp and 'z_score' in df.columns:
+        n_outliers = (df['z_score'] > args.z_threshold).sum()
+        print(f"✓ SVGP outlier detection: {n_outliers:,} outliers at z>{args.z_threshold} ({100*n_outliers/len(df):.2f}%)")
+    elif run_experiment_outlier and 'z_score' in df.columns:
+        n_point_outliers = df['point_outlier'].sum() if 'point_outlier' in df.columns else 0
+        n_exp_outliers = df[df['experiment_outlier']]['experiment_id'].nunique() if 'experiment_outlier' in df.columns else 0
+        print(f"✓ Per-experiment outlier detection:")
+        print(f"    Point outliers: {n_point_outliers:,} ({100*n_point_outliers/len(df):.2f}%)")
+        print(f"    Experiment outliers: {n_exp_outliers} experiments flagged")
+    else:
+        print(f"✓ Lean Parquet contains EXFOR data only (no AME duplication)")
     print(f"\n💡 AME2020/NUBASE2020 enrichment will be added during feature generation")
     print(f"   Place AME *.mas20.txt files in data/ directory")
     print()

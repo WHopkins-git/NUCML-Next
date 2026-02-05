@@ -35,6 +35,16 @@ def __getattr__(name):
         module = importlib.import_module(f"nucml_next.{name}")
         globals()[name] = module
         return module
+    # Convenience re-exports from experiment module
+    if name in ("ExperimentManager", "HoldoutConfig", "compute_holdout_metrics"):
+        from nucml_next.experiment import ExperimentManager, HoldoutConfig, compute_holdout_metrics
+        _map = {
+            "ExperimentManager": ExperimentManager,
+            "HoldoutConfig": HoldoutConfig,
+            "compute_holdout_metrics": compute_holdout_metrics,
+        }
+        globals().update(_map)
+        return _map[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [

@@ -488,19 +488,33 @@ class XGBoostEvaluator:
         y = working_df[target_column]
         energy = working_df[energy_column] if energy_column in working_df.columns else None
 
+        # Resolve transformation config early so we can pass log flags to weights
+        if pipeline is not None:
+            _tc = pipeline.config
+        elif transformation_config is not None:
+            _tc = transformation_config
+        else:
+            _tc = TransformationConfig()
+            transformation_config = _tc
+
         # Compute sample weights from uncertainty (inverse variance weighting)
+        # When log_target is True, uncertainties are propagated into log-space
+        # so that weights reflect relative precision (δσ/σ) rather than
+        # absolute precision (δσ). This prevents extreme weight ratios.
         sample_weights = compute_sample_weights(
             working_df,
             mode=weight_mode,
             uncertainty_column=uncertainty_column,
             energy_uncertainty_column=energy_uncertainty_column,
             missing_handling=missing_uncertainty_handling,
+            target_column=target_column,
+            log_target=_tc.log_target,
+            energy_column=energy_column,
+            log_energy=_tc.log_energy,
         )
 
         # Create or use pipeline
         if pipeline is None:
-            if transformation_config is None:
-                transformation_config = TransformationConfig()
             pipeline = TransformationPipeline(config=transformation_config)
             pipeline.fit(X_features, y, energy, feature_columns=self.feature_columns)
 
@@ -602,44 +616,158 @@ class XGBoostEvaluator:
             verbose=False,
         )
 
-        # Predictions
-        y_train_pred = self.model.predict(X_train)
-        y_test_pred = self.model.predict(X_test)
+        # Predictions in transformed (log) space
+        y_train_pred_log = self.model.predict(X_train)
+        y_test_pred_log = self.model.predict(X_test)
 
-        # Inverse transform if using log
+        # ----------------------------------------------------------------
+        # DUAL-SPACE METRIC CALCULATION
+        # ----------------------------------------------------------------
+        # 1) Feature space (log10): metrics on raw model output
+        # 2) Physical space (barns): inverse-transform then re-calculate
+        # ----------------------------------------------------------------
+
+        # -- Log-space metrics --
+        train_mse_log = mean_squared_error(y_train, y_train_pred_log)
+        test_mse_log = mean_squared_error(y_test, y_test_pred_log)
+        train_mae_log = mean_absolute_error(y_train, y_train_pred_log)
+        test_mae_log = mean_absolute_error(y_test, y_test_pred_log)
+        train_r2_log = r2_score(y_train, y_train_pred_log)
+        test_r2_log = r2_score(y_test, y_test_pred_log)
+
+        # -- Physical-space metrics (barns) --
         if self.pipeline.config.log_target:
-            y_train_pred = self.pipeline.inverse_transform_target(pd.Series(y_train_pred)).values
-            y_test_pred = self.pipeline.inverse_transform_target(pd.Series(y_test_pred)).values
-            y_train_orig = self.pipeline.inverse_transform_target(pd.Series(y_train)).values
-            y_test_orig = self.pipeline.inverse_transform_target(pd.Series(y_test)).values
+            # Inverse transform: sigma = 10^y' - epsilon, clipped to >= 0
+            y_train_pred_barns = self.pipeline.inverse_transform_target(
+                pd.Series(y_train_pred_log)).values
+            y_test_pred_barns = self.pipeline.inverse_transform_target(
+                pd.Series(y_test_pred_log)).values
+            y_train_barns = self.pipeline.inverse_transform_target(
+                pd.Series(y_train)).values
+            y_test_barns = self.pipeline.inverse_transform_target(
+                pd.Series(y_test)).values
+
+            # Safety clip: ensure no negative values from floating-point noise
+            y_train_pred_barns = np.clip(y_train_pred_barns, 0.0, None)
+            y_test_pred_barns = np.clip(y_test_pred_barns, 0.0, None)
+            y_train_barns = np.clip(y_train_barns, 0.0, None)
+            y_test_barns = np.clip(y_test_barns, 0.0, None)
         else:
-            y_train_orig = y_train
-            y_test_orig = y_test
+            y_train_pred_barns = y_train_pred_log
+            y_test_pred_barns = y_test_pred_log
+            y_train_barns = y_train
+            y_test_barns = y_test
 
-        # Metrics
-        train_mse = mean_squared_error(y_train_orig, y_train_pred)
-        test_mse = mean_squared_error(y_test_orig, y_test_pred)
-        train_mae = mean_absolute_error(y_train_orig, y_train_pred)
-        test_mae = mean_absolute_error(y_test_orig, y_test_pred)
-        train_r2 = r2_score(y_train_orig, y_train_pred)
-        test_r2 = r2_score(y_test_orig, y_test_pred)
+        train_mse_barns = mean_squared_error(y_train_barns, y_train_pred_barns)
+        test_mse_barns = mean_squared_error(y_test_barns, y_test_pred_barns)
+        train_mae_barns = mean_absolute_error(y_train_barns, y_train_pred_barns)
+        test_mae_barns = mean_absolute_error(y_test_barns, y_test_pred_barns)
+        train_r2_barns = r2_score(y_train_barns, y_train_pred_barns)
+        test_r2_barns = r2_score(y_test_barns, y_test_pred_barns)
 
+        # -- Ensemble structural diagnostics --
+        n_train = len(X_train)
+        n_test = len(X_test)
+        best_iter = self.model.best_iteration if hasattr(self.model, 'best_iteration') else None
+
+        # ----------------------------------------------------------------
+        # Store all metrics
+        # ----------------------------------------------------------------
         self.metrics = {
-            'train_mse': train_mse,
-            'test_mse': test_mse,
-            'train_mae': train_mae,
-            'test_mae': test_mae,
-            'train_r2': train_r2,
-            'test_r2': test_r2,
-            'best_iteration': self.model.best_iteration if hasattr(self.model, 'best_iteration') else None,
+            # Log-space (feature space)
+            'train_mse_log': train_mse_log,
+            'test_mse_log': test_mse_log,
+            'train_mae_log': train_mae_log,
+            'test_mae_log': test_mae_log,
+            'train_r2_log': train_r2_log,
+            'test_r2_log': test_r2_log,
+            # Physical space (barns)
+            'train_mse_barns': train_mse_barns,
+            'test_mse_barns': test_mse_barns,
+            'train_mae_barns': train_mae_barns,
+            'test_mae_barns': test_mae_barns,
+            'train_r2_barns': train_r2_barns,
+            'test_r2_barns': test_r2_barns,
+            # Structural
+            'n_train': n_train,
+            'n_test': n_test,
+            'best_iteration': best_iter,
+            'n_estimators': self.params['n_estimators'],
+            'max_depth': self.params['max_depth'],
         }
 
         self.is_trained = True
 
-        print(f"✓ Training complete!")
-        print(f"  Test MSE: {test_mse:.4e}")
-        print(f"  Test MAE: {test_mae:.4e}")
-        print(f"  Test R²: {test_r2:.4f}")
+        # ----------------------------------------------------------------
+        # FORMATTED PERFORMANCE DIAGNOSTICS TABLE
+        # ----------------------------------------------------------------
+        def _gap_pct(train_val, test_val):
+            """Compute gap as percentage: (test - train) / |train| * 100."""
+            if train_val == 0:
+                return float('inf')
+            return (test_val - train_val) / abs(train_val) * 100
+
+        def _fmt_metric(val, is_r2=False):
+            """Format a metric value for table display."""
+            if is_r2:
+                return f"{val:.4f}"
+            elif abs(val) >= 1e5 or (abs(val) < 1e-2 and val != 0):
+                return f"{val:.2e}"
+            else:
+                return f"{val:.4f}"
+
+        print()
+        print("=" * 70)
+        print("FINAL PERFORMANCE DIAGNOSTICS")
+        print("=" * 70)
+        print(f"{'METRIC':<20s}| {'TRAIN SET':>16s} | {'TEST SET':>16s} | {'GAP (%)':>8s}")
+        print("-" * 70)
+
+        rows = [
+            ("MSE  (Log10)",  train_mse_log,   test_mse_log,   False),
+            ("MAE  (Log10)",  train_mae_log,    test_mae_log,   False),
+            ("R^2  (Log10)",  train_r2_log,     test_r2_log,    True),
+            ("MSE  (Barns)",  train_mse_barns,  test_mse_barns, False),
+            ("MAE  (Barns)",  train_mae_barns,  test_mae_barns, False),
+            ("R^2  (Barns)",  train_r2_barns,   test_r2_barns,  True),
+        ]
+
+        for label, train_val, test_val, is_r2 in rows:
+            gap = _gap_pct(train_val, test_val)
+            gap_str = f"{gap:+.1f}%" if abs(gap) < 1e6 else "   inf"
+            print(f"{label:<20s}| {_fmt_metric(train_val, is_r2):>16s} "
+                  f"| {_fmt_metric(test_val, is_r2):>16s} | {gap_str:>8s}")
+
+        print("-" * 70)
+
+        # ----------------------------------------------------------------
+        # GENERALIZATION & OVERFITTING DIAGNOSTICS
+        # ----------------------------------------------------------------
+        mse_gap_log = _gap_pct(train_mse_log, test_mse_log)
+        r2_gap_log = test_r2_log - train_r2_log
+
+        print()
+        print("GENERALIZATION & STRUCTURAL DIAGNOSTICS")
+        print("-" * 70)
+        print(f"  Log-space MSE gap (test-train)/train:  {mse_gap_log:+.1f}%")
+        print(f"  Log-space R^2 gap (test - train):      {r2_gap_log:+.4f}")
+        print(f"  n_estimators:        {self.params['n_estimators']}")
+        print(f"  max_depth:           {self.params['max_depth']}")
+        if best_iter is not None:
+            print(f"  best_iteration:      {best_iter}")
+        print(f"  Training samples:    {n_train:,}")
+        print(f"  Test samples:        {n_test:,}")
+
+        if mse_gap_log > 50:
+            print(f"  [!] WARNING: Large generalization gap ({mse_gap_log:.0f}%) "
+                  f"-- possible overfitting")
+        elif mse_gap_log < 2:
+            print(f"  [i] Tight generalization gap ({mse_gap_log:.1f}%) "
+                  f"-- model may be underfitting")
+        else:
+            print(f"  [OK] Generalization gap within normal range")
+
+        print("=" * 70)
 
         return self.metrics
 

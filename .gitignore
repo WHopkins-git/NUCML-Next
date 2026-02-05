@@ -74,6 +74,9 @@ LPT1
 # Local Claude tooling
 .claude/
 
+# Experiment artefacts (model weights, scalers, figures)
+save/
+
 # Local / generated model artifacts
 nucml_next/baselines/_weights.py
 

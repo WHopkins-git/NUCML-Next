@@ -184,6 +184,16 @@ class NucmlDataset(TorchDataset):
         if self.selection and self.selection.tiers:
             self._enrich_with_ame_if_needed(self.selection.tiers)
 
+            # Also enrich the stashed holdout data (if any) so that
+            # get_holdout_data() can project to the same tier features.
+            holdout_raw = getattr(self, '_holdout_df', None)
+            if holdout_raw is not None and not holdout_raw.empty:
+                _original_df = self.df
+                self.df = holdout_raw
+                self._enrich_with_ame_if_needed(self.selection.tiers)
+                self._holdout_df = self.df
+                self.df = _original_df
+
         # Initialize graph builder (only for graph mode) and tabular projector
         if self.mode == 'graph':
             # Lazy import GraphBuilder (requires torch)
@@ -239,7 +249,8 @@ class NucmlDataset(TorchDataset):
         essential_columns = [
             'Entry', 'Z', 'A', 'N', 'MT', 'Energy', 'CrossSection',
             'Uncertainty', 'Energy_Uncertainty',  # Both uncertainty columns for weighting
-            'Projectile'  # Needed for projectile filtering (neutron vs charged particle)
+            'Projectile',  # Needed for projectile filtering (neutron vs charged particle)
+            'z_score', 'gp_mean', 'gp_std',  # SVGP outlier columns (optional, from --run-svgp)
         ]
 
         # Check if partitioned dataset (directory) or single file
@@ -440,17 +451,34 @@ class NucmlDataset(TorchDataset):
                         if removed > 0:
                             print(f"  [OK] Projectile filter (neutrons): Removed {removed:,} non-neutron reactions (inferred from MT codes)")
 
-            # 2. Holdout isotopes (exclude specific Z/A pairs for evaluation)
-            if selection.holdout_isotopes:
-                before = len(df)
-                for z, a in selection.holdout_isotopes:
-                    df = df[~((df['Z'] == z) & (df['A'] == a))]
-                removed = before - len(df)
-                if removed > 0:
-                    isotopes_str = ', '.join([f"({z},{a})" for z, a in selection.holdout_isotopes])
-                    print(f"  [OK] Holdout filter: Removed {removed:,} measurements from {isotopes_str}")
+            # 2. Phase-space holdout (rich criteria or legacy isotope list)
+            holdout_cfg = getattr(selection, 'holdout_config', None)
+            if holdout_cfg is not None and holdout_cfg.rules:
+                holdout_mask = holdout_cfg.build_mask(df)
+                n_holdout = int(holdout_mask.sum())
+                if n_holdout > 0:
+                    self._holdout_df = df.loc[holdout_mask].copy()
+                    df = df.loc[~holdout_mask].copy()
+                    print(f"  [OK] Holdout filter: Reserved {n_holdout:,} measurements "
+                          f"({len(holdout_cfg.rules)} rule(s))")
+                else:
+                    self._holdout_df = pd.DataFrame()
+            else:
+                self._holdout_df = None
 
-            # 3. Data validity (drop NaN or non-positive cross-sections, invalid isotopes)
+            # 3. Outlier filtering (z_score-based, from SVGP ingestion)
+            if selection.z_threshold is not None and not selection.include_outliers:
+                if 'z_score' in df.columns:
+                    before = len(df)
+                    df = df[df['z_score'] <= selection.z_threshold]
+                    removed = before - len(df)
+                    if removed > 0:
+                        print(f"  [OK] Outlier filter: Removed {removed:,} points with z_score > {selection.z_threshold}")
+                else:
+                    print(f"  [!] Warning: z_threshold={selection.z_threshold} specified but z_score column "
+                          f"not found in Parquet. Run ingestion with --run-svgp to enable outlier filtering.")
+
+            # 4. Data validity (drop NaN or non-positive cross-sections, invalid isotopes)
             if selection.drop_invalid:
                 before = len(df)
 
@@ -821,6 +849,47 @@ class NucmlDataset(TorchDataset):
 
         return generator.generate_features(df, tiers=tiers, extra_metadata=extra_metadata)
 
+    def get_holdout_data(
+        self,
+        tiers: Optional[List[str]] = None,
+        extra_metadata: Optional[List[str]] = None,
+    ) -> Optional[pd.DataFrame]:
+        """
+        Return the holdout DataFrame projected to tabular format.
+
+        The holdout rows were separated during loading (via
+        ``HoldoutConfig`` rules in the ``DataSelection``).  This method
+        applies the same tier-based feature generation used by
+        :meth:`to_tabular` so the result can be passed directly to
+        ``model.predict()`` or ``compute_holdout_metrics()``.
+
+        Parameters
+        ----------
+        tiers : list of str, optional
+            Feature tiers (default: selection.tiers).
+        extra_metadata : list of str, optional
+            Extra columns to preserve (e.g. ``['Energy_Uncertainty']``).
+
+        Returns
+        -------
+        pd.DataFrame or None
+            Tabular holdout data, or ``None`` if no holdout was configured.
+        """
+        raw = getattr(self, '_holdout_df', None)
+        if raw is None or raw.empty:
+            return None
+
+        from nucml_next.data.features import FeatureGenerator
+
+        if tiers is None:
+            if self.selection is not None:
+                tiers = self.selection.tiers
+            else:
+                tiers = ['A']
+
+        generator = FeatureGenerator(enricher=None)
+        return generator.generate_features(raw, tiers=tiers, extra_metadata=extra_metadata)
+
     def get_isotope_graph(self, Z: int, A: int) -> Data:
         """
         Get the subgraph for a specific isotope.
@@ -871,6 +940,57 @@ class NucmlDataset(TorchDataset):
             })
 
         return stats
+
+    def outlier_summary(
+        self,
+        thresholds: Optional[List[float]] = None,
+    ) -> pd.DataFrame:
+        """
+        Summarize outlier counts at various z-score thresholds.
+
+        Requires the Parquet to have been ingested with --run-svgp, which adds
+        a z_score column to each data point.
+
+        Args:
+            thresholds: List of z-score thresholds to evaluate.
+                       Default: [2.0, 3.0, 4.0, 5.0]
+
+        Returns:
+            DataFrame with columns: threshold, outliers, pct, retained
+
+        Raises:
+            ValueError: If z_score column not found in dataset
+
+        Example:
+            >>> dataset.outlier_summary()
+               threshold  outliers   pct  retained
+            0        2.0      5432  1.23    435678
+            1        3.0      1234  0.28    439876
+            2        4.0       456  0.10    440654
+            3        5.0       123  0.03    440987
+        """
+        if 'z_score' not in self.df.columns:
+            raise ValueError(
+                "z_score column not found in dataset.\n"
+                "Run ingestion with --run-svgp to enable outlier detection:\n"
+                "  python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --run-svgp"
+            )
+
+        if thresholds is None:
+            thresholds = [2.0, 3.0, 4.0, 5.0]
+
+        total = len(self.df)
+        rows = []
+        for t in thresholds:
+            n_outlier = (self.df['z_score'] > t).sum()
+            rows.append({
+                'threshold': t,
+                'outliers': int(n_outlier),
+                'pct': 100 * n_outlier / total if total > 0 else 0.0,
+                'retained': total - int(n_outlier),
+            })
+
+        return pd.DataFrame(rows)
 
     def get_transformation_pipeline(
         self,
