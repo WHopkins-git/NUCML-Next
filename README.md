@@ -67,9 +67,7 @@ Download the `*.mas20.txt` files from https://www-nds.iaea.org/amdc/
 
 ```bash
 # Basic ingestion (no outlier detection)
-python scripts/ingest_exfor.py \
-    --x4-db data/x4sqlite1.db \
-    --output data/exfor_processed.parquet
+python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --output data/exfor_processed.parquet
 
 # Test subset: Uranium + Chlorine only (~300K points, minutes instead of hours)
 python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --test-subset
@@ -83,18 +81,14 @@ python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method experi
 # With legacy SVGP outlier detection
 python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method svgp
 
-# With GPU acceleration
-python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db \
-    --outlier-method experiment --svgp-device cuda
+# With GPU acceleration (requires PyTorch with CUDA)
+python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method experiment --svgp-device cuda
 
 # With checkpointing (resume interrupted runs)
-python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db \
-    --outlier-method experiment --svgp-device cuda \
-    --svgp-checkpoint-dir data/checkpoints/
+python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method experiment --svgp-device cuda --svgp-checkpoint-dir data/checkpoints/
 
 # Full pipeline: test subset + per-experiment outlier detection
-python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db \
-    --test-subset --outlier-method experiment --z-threshold 3.0
+python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --test-subset --outlier-method experiment --z-threshold 3.0
 ```
 
 The ingestion pipeline:
@@ -265,9 +259,7 @@ Checkpointing allows interrupted runs to resume.
 python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method experiment
 
 # Per-experiment GP with GPU and checkpointing
-python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db \
-    --outlier-method experiment --svgp-device cuda \
-    --svgp-checkpoint-dir data/checkpoints/
+python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method experiment --svgp-device cuda --svgp-checkpoint-dir data/checkpoints/
 
 # Legacy SVGP
 python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method svgp

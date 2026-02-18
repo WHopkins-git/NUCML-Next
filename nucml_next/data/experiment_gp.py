@@ -171,17 +171,35 @@ class ExactGPExperiment:
         return self
 
     def _fit_with_wasserstein_calibration(self) -> None:
-        """Optimize lengthscale via Wasserstein calibration distance."""
-        from nucml_next.data.calibration import optimize_lengthscale_wasserstein
+        """Optimize lengthscale via Wasserstein calibration distance.
 
-        self._lengthscale, self.calibration_metric = optimize_lengthscale_wasserstein(
-            self._train_x,
-            self._train_y,
-            self._noise_variance,
-            lengthscale_bounds=self.config.lengthscale_bounds,
-            outputscale=self._outputscale,
-            mean_value=self._mean_value,
-        )
+        Uses PyTorch-accelerated version when device is 'cuda' for GPU speedup.
+        """
+        # Use PyTorch-accelerated version for GPU or when explicitly requested
+        if self.config.device != 'cpu':
+            from nucml_next.data.calibration import optimize_lengthscale_wasserstein_torch
+
+            self._lengthscale, self.calibration_metric = optimize_lengthscale_wasserstein_torch(
+                self._train_x,
+                self._train_y,
+                self._noise_variance,
+                lengthscale_bounds=self.config.lengthscale_bounds,
+                outputscale=self._outputscale,
+                mean_value=self._mean_value,
+                device=self.config.device,
+            )
+        else:
+            # CPU: use NumPy version (slightly faster for small matrices)
+            from nucml_next.data.calibration import optimize_lengthscale_wasserstein
+
+            self._lengthscale, self.calibration_metric = optimize_lengthscale_wasserstein(
+                self._train_x,
+                self._train_y,
+                self._noise_variance,
+                lengthscale_bounds=self.config.lengthscale_bounds,
+                outputscale=self._outputscale,
+                mean_value=self._mean_value,
+            )
 
         logger.debug(
             f"Wasserstein calibration: ls={self._lengthscale:.4f}, "
@@ -245,7 +263,17 @@ class ExactGPExperiment:
         return K
 
     def _build_prediction_cache(self) -> None:
-        """Build cached quantities for fast prediction."""
+        """Build cached quantities for fast prediction.
+
+        Uses PyTorch when device is CUDA for GPU acceleration.
+        """
+        if self.config.device != 'cpu':
+            self._build_prediction_cache_torch()
+        else:
+            self._build_prediction_cache_numpy()
+
+    def _build_prediction_cache_numpy(self) -> None:
+        """Build prediction cache using NumPy (CPU)."""
         K = self._compute_kernel_matrix(
             self._train_x, self._lengthscale, self._outputscale
         )
@@ -257,6 +285,42 @@ class ExactGPExperiment:
         self._alpha = np.linalg.solve(
             self._L.T, np.linalg.solve(self._L, residuals)
         )
+
+    def _build_prediction_cache_torch(self) -> None:
+        """Build prediction cache using PyTorch (GPU-accelerated)."""
+        import torch
+
+        device = self.config.device
+        if device == 'cuda' and not torch.cuda.is_available():
+            logger.warning("CUDA not available, falling back to CPU for prediction cache")
+            self._build_prediction_cache_numpy()
+            return
+
+        torch_device = torch.device(device)
+        n = len(self._train_x)
+
+        # Convert to tensors
+        x = torch.tensor(self._train_x, dtype=torch.float64, device=torch_device)
+        noise_var = torch.tensor(self._noise_variance, dtype=torch.float64, device=torch_device)
+
+        # Build kernel matrix
+        diff = x.unsqueeze(1) - x.unsqueeze(0)
+        K = self._outputscale * torch.exp(-0.5 * diff.pow(2) / (self._lengthscale ** 2))
+        K = K + torch.diag(noise_var) + 1e-6 * torch.eye(n, dtype=torch.float64, device=torch_device)
+
+        # Cholesky decomposition
+        L = torch.linalg.cholesky(K)
+
+        # Compute alpha = L^{-T} @ L^{-1} @ residuals
+        residuals = torch.tensor(
+            self._train_y - self._mean_value, dtype=torch.float64, device=torch_device
+        )
+        z = torch.linalg.solve_triangular(L, residuals.unsqueeze(1), upper=False).squeeze(1)
+        alpha = torch.linalg.solve_triangular(L.T, z.unsqueeze(1), upper=True).squeeze(1)
+
+        # Store back as NumPy arrays (predictions will be on CPU)
+        self._L = L.cpu().numpy()
+        self._alpha = alpha.cpu().numpy()
 
     def predict(
         self,

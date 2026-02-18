@@ -227,7 +227,27 @@ Note:
         )
     elif outlier_method == 'experiment':
         from nucml_next.data.experiment_outlier import ExperimentOutlierConfig
+        from nucml_next.data.experiment_gp import ExactGPExperimentConfig
+
+        # Validate CUDA availability before proceeding
+        if args.svgp_device == 'cuda':
+            try:
+                import torch
+                if not torch.cuda.is_available():
+                    print(f"WARNING: --svgp-device cuda requested but CUDA is not available.")
+                    print(f"         Falling back to CPU. Check your PyTorch installation.")
+                    args.svgp_device = 'cpu'
+                else:
+                    print(f"CUDA available: {torch.cuda.get_device_name(0)}")
+            except ImportError:
+                print(f"WARNING: --svgp-device cuda requested but PyTorch not installed.")
+                print(f"         Falling back to CPU.")
+                args.svgp_device = 'cpu'
+
+        # Pass device to GP config for GPU-accelerated fitting
+        gp_config = ExactGPExperimentConfig(device=args.svgp_device)
         experiment_outlier_config = ExperimentOutlierConfig(
+            gp_config=gp_config,
             point_z_threshold=args.z_threshold,
             checkpoint_dir=args.svgp_checkpoint_dir,
         )
@@ -247,7 +267,7 @@ Note:
     if outlier_method == 'svgp':
         print(f"Outlier:      SVGP (legacy) - device={args.svgp_device}, likelihood={args.svgp_likelihood}")
     elif outlier_method == 'experiment':
-        print(f"Outlier:      Per-experiment GP (recommended) - z_threshold={args.z_threshold}")
+        print(f"Outlier:      Per-experiment GP (recommended) - device={args.svgp_device}, z_threshold={args.z_threshold}")
     else:
         print(f"Outlier:      Disabled (use --outlier-method to enable)")
     if args.svgp_checkpoint_dir:
