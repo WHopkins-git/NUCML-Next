@@ -378,3 +378,221 @@ def calibration_diagnostic(
         'z_mean': np.mean(abs_z),
         'z_std': np.std(valid_z),
     }
+
+
+# =============================================================================
+# PyTorch-Accelerated Calibration Functions (GPU-compatible)
+# =============================================================================
+
+def compute_loo_z_scores_torch(
+    train_x: np.ndarray,
+    train_y: np.ndarray,
+    noise_variance: np.ndarray,
+    lengthscale: float,
+    outputscale: float = 1.0,
+    mean_value: Optional[float] = None,
+    device: str = 'cpu',
+) -> np.ndarray:
+    """
+    Compute LOO z-scores using PyTorch (GPU-accelerated).
+
+    Same algorithm as compute_loo_z_scores but uses PyTorch for GPU support.
+    Falls back to NumPy version if PyTorch is not available.
+
+    Args:
+        train_x: Training inputs, shape (n,).
+        train_y: Training targets, shape (n,).
+        noise_variance: Per-point noise variance, shape (n,).
+        lengthscale: RBF kernel lengthscale.
+        outputscale: RBF kernel outputscale.
+        mean_value: Constant mean value. If None, uses mean(train_y).
+        device: PyTorch device ('cpu' or 'cuda').
+
+    Returns:
+        LOO z-scores, shape (n,).
+    """
+    try:
+        import torch
+    except ImportError:
+        # Fall back to NumPy version
+        return compute_loo_z_scores(
+            train_x, train_y, noise_variance,
+            lengthscale, outputscale, mean_value
+        )
+
+    train_x = np.asarray(train_x).ravel()
+    train_y = np.asarray(train_y).ravel()
+    noise_variance = np.asarray(noise_variance).ravel()
+    n = len(train_x)
+
+    if mean_value is None:
+        mean_value = float(np.mean(train_y))
+
+    # Validate CUDA availability
+    if device == 'cuda' and not torch.cuda.is_available():
+        logger.warning("CUDA requested but not available, falling back to CPU")
+        device = 'cpu'
+
+    torch_device = torch.device(device)
+
+    # Convert to tensors
+    x = torch.tensor(train_x, dtype=torch.float64, device=torch_device)
+    y = torch.tensor(train_y, dtype=torch.float64, device=torch_device)
+    noise_var = torch.tensor(noise_variance, dtype=torch.float64, device=torch_device)
+
+    # Build RBF kernel matrix: K(x, x') = outputscale * exp(-0.5 * ||x - x'||^2 / ls^2)
+    diff = x.unsqueeze(1) - x.unsqueeze(0)  # (n, n)
+    K = outputscale * torch.exp(-0.5 * diff.pow(2) / (lengthscale ** 2))
+
+    # Add noise to diagonal + jitter
+    K = K + torch.diag(noise_var) + 1e-6 * torch.eye(n, dtype=torch.float64, device=torch_device)
+
+    # Cholesky decomposition
+    try:
+        L = torch.linalg.cholesky(K)
+    except RuntimeError:
+        logger.warning("Cholesky failed in LOO computation (torch)")
+        return np.full(n, np.inf)
+
+    # Compute K^{-1} @ residuals
+    residuals = y - mean_value
+    # Solve L @ z = residuals
+    z = torch.linalg.solve_triangular(L, residuals.unsqueeze(1), upper=False).squeeze(1)
+    # Solve L.T @ x = z
+    K_inv_r = torch.linalg.solve_triangular(L.T, z.unsqueeze(1), upper=True).squeeze(1)
+
+    # Compute diagonal of K^{-1}
+    # (K^{-1})_{ii} = sum_j (L^{-1})_{ji}^2
+    L_inv = torch.linalg.solve_triangular(
+        L, torch.eye(n, dtype=torch.float64, device=torch_device), upper=False
+    )
+    K_inv_diag = (L_inv ** 2).sum(dim=0)
+
+    # LOO z-scores
+    z_scores = K_inv_r / torch.sqrt(torch.clamp(K_inv_diag, min=1e-10))
+
+    return z_scores.cpu().numpy()
+
+
+def _wasserstein_loss_torch(
+    lengthscale: float,
+    train_x: np.ndarray,
+    train_y: np.ndarray,
+    noise_variance: np.ndarray,
+    outputscale: float,
+    mean_value: float,
+    device: str = 'cpu',
+) -> float:
+    """
+    Compute Wasserstein calibration loss using PyTorch LOO z-scores.
+    """
+    if lengthscale <= 0:
+        return np.inf
+
+    z_scores = compute_loo_z_scores_torch(
+        train_x, train_y, noise_variance,
+        lengthscale=lengthscale,
+        outputscale=outputscale,
+        mean_value=mean_value,
+        device=device,
+    )
+
+    return compute_wasserstein_calibration(z_scores)
+
+
+def optimize_lengthscale_wasserstein_torch(
+    train_x: np.ndarray,
+    train_y: np.ndarray,
+    noise_variance: np.ndarray,
+    lengthscale_bounds: Tuple[float, float] = (0.01, 10.0),
+    n_grid: int = 20,
+    outputscale: Optional[float] = None,
+    mean_value: Optional[float] = None,
+    device: str = 'cpu',
+) -> Tuple[float, float]:
+    """
+    Find optimal lengthscale by minimizing Wasserstein calibration distance (GPU-accelerated).
+
+    Same algorithm as optimize_lengthscale_wasserstein but uses PyTorch for GPU.
+
+    Args:
+        train_x: Training inputs, shape (n,).
+        train_y: Training targets, shape (n,).
+        noise_variance: Per-point noise variance, shape (n,).
+        lengthscale_bounds: (min, max) search bounds for lengthscale.
+        n_grid: Number of grid points for initial search.
+        outputscale: RBF kernel outputscale. If None, estimated from data.
+        mean_value: Constant mean. If None, uses mean(train_y).
+        device: PyTorch device ('cpu' or 'cuda').
+
+    Returns:
+        (optimal_lengthscale, wasserstein_distance)
+    """
+    train_x = np.asarray(train_x).ravel()
+    train_y = np.asarray(train_y).ravel()
+    noise_variance = np.asarray(noise_variance).ravel()
+
+    # Estimate outputscale from data variance if not provided
+    if outputscale is None:
+        outputscale = np.var(train_y) - np.mean(noise_variance)
+        outputscale = max(outputscale, 0.1)
+
+    if mean_value is None:
+        mean_value = np.mean(train_y)
+
+    # Grid search using PyTorch LOO z-scores
+    ls_grid = np.logspace(
+        np.log10(lengthscale_bounds[0]),
+        np.log10(lengthscale_bounds[1]),
+        n_grid
+    )
+
+    wasserstein_values = []
+    for ls in ls_grid:
+        w = _wasserstein_loss_torch(
+            ls, train_x, train_y, noise_variance, outputscale, mean_value, device
+        )
+        wasserstein_values.append(w)
+
+    wasserstein_values = np.array(wasserstein_values)
+
+    # Find best from grid
+    best_idx = np.argmin(wasserstein_values)
+    best_ls_grid = ls_grid[best_idx]
+    best_w_grid = wasserstein_values[best_idx]
+
+    # If grid search failed completely, return conservative default
+    if not np.isfinite(best_w_grid):
+        logger.warning("Grid search failed, using default lengthscale")
+        default_ls = (lengthscale_bounds[0] * lengthscale_bounds[1]) ** 0.5
+        return default_ls, np.inf
+
+    # Refine using Brent's method
+    if best_idx == 0:
+        refine_bounds = (ls_grid[0] / 2, ls_grid[1])
+    elif best_idx == len(ls_grid) - 1:
+        refine_bounds = (ls_grid[-2], ls_grid[-1] * 2)
+    else:
+        refine_bounds = (ls_grid[best_idx - 1], ls_grid[best_idx + 1])
+
+    refine_bounds = (
+        max(refine_bounds[0], lengthscale_bounds[0]),
+        min(refine_bounds[1], lengthscale_bounds[1])
+    )
+
+    try:
+        result = minimize_scalar(
+            lambda ls: _wasserstein_loss_torch(
+                ls, train_x, train_y, noise_variance, outputscale, mean_value, device
+            ),
+            bounds=refine_bounds,
+            method='bounded',
+            options={'xatol': 1e-3}
+        )
+
+        if result.success and np.isfinite(result.fun) and result.fun < best_w_grid:
+            return result.x, result.fun
+    except Exception as e:
+        logger.debug(f"Brent refinement failed: {e}")
+
+    return best_ls_grid, best_w_grid
