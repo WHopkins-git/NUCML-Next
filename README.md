@@ -96,25 +96,26 @@ python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --test-subset --outlier
 
 **GPU memory management:**
 
-- Large experiments automatically route to CPU when they exceed `--max-gpu-points` (default: 2000)
+- Large experiments automatically route to CPU when they exceed `--max-gpu-points` (default: 40000)
 - If CUDA OOM still occurs, the experiment is automatically retried on CPU
-- Memory usage: n² × 8 bytes per experiment (2000 pts = 32MB, 5000 pts = 200MB)
+- Memory usage: n² × 8 bytes per experiment (10k pts = 800MB, 40k pts = 12.8GB)
+- A 16GB GPU can handle experiments up to ~40,000 points
 
-**Thread control for shared machines:**
+**Resource management for shared machines:**
 
-By default, NumPy/PyTorch use all available CPU cores for linear algebra operations.
-On shared machines, this can cause memory bloat from hundreds of threads. Limit threads
-to reduce memory usage:
+By default, CPU threads are set to **50% of available cores** (shared machine etiquette).
+GPU is unrestricted.
 
 ```bash
-# Use 4 threads (recommended for shared machines)
-python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method experiment --num-threads 4
+# Auto-detects 50% of cores (e.g., 32 threads on 64-core machine)
+python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method experiment --svgp-device cuda
+
+# Override thread count if needed
+python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method experiment --num-threads 16
 
 # Or via environment variable (must be set before script runs)
-NUCML_NUM_THREADS=4 python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method experiment
+NUCML_NUM_THREADS=16 python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method experiment
 ```
-
-As a rule of thumb, use half the available cores on shared machines (e.g., `--num-threads 4` on an 8-core machine).
 
 **Memory-efficient mode** for full-database processing (13M+ points):
 

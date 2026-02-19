@@ -59,7 +59,7 @@ class ExactGPExperimentConfig:
     use_wasserstein_calibration: bool = True
     lengthscale_bounds: Tuple[float, float] = (0.01, 10.0)
     device: str = 'cpu'
-    max_gpu_points: int = 2000
+    max_gpu_points: int = 40000  # 40k points = 12.8 GB kernel matrix, fits in 16GB GPU
 
 
 class ExactGPExperiment:

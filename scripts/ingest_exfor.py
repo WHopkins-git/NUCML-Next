@@ -4,7 +4,11 @@
 # These libraries read environment variables at import time
 # =============================================================================
 import os as _os
-_num_threads = _os.environ.get('NUCML_NUM_THREADS', '4')
+import multiprocessing as _mp
+
+# Auto-detect 50% of CPU cores (shared machine etiquette)
+_default_threads = max(1, _mp.cpu_count() // 2)
+_num_threads = _os.environ.get('NUCML_NUM_THREADS', str(_default_threads))
 _os.environ.setdefault('OMP_NUM_THREADS', _num_threads)
 _os.environ.setdefault('MKL_NUM_THREADS', _num_threads)
 _os.environ.setdefault('OPENBLAS_NUM_THREADS', _num_threads)
@@ -180,12 +184,14 @@ Note:
         default=3.0,
         help='Z-score threshold for flagging point outliers (default: 3.0)'
     )
+    import multiprocessing
+    default_threads = max(1, multiprocessing.cpu_count() // 2)
     parser.add_argument(
         '--num-threads',
         type=int,
-        default=4,
-        help='CPU threads for NumPy/PyTorch linear algebra (default: 4). '
-             'Use half of available cores on shared machines to avoid memory bloat.'
+        default=default_threads,
+        help=f'CPU threads for NumPy/PyTorch linear algebra (default: {default_threads} = 50%% of cores). '
+             'Auto-detects half of available cores for shared machine etiquette.'
     )
 
     # Subset filtering options
@@ -317,7 +323,7 @@ Note:
         print(f"Outlier:      Disabled (use --outlier-method to enable)")
     if args.svgp_checkpoint_dir:
         print(f"Checkpoints:  {args.svgp_checkpoint_dir}")
-    print(f"CPU Threads:  {args.num_threads}")
+    print(f"CPU Threads:  {args.num_threads} (50% of {multiprocessing.cpu_count()} cores)")
     print("="*70 + "\n")
 
     df = ingest_x4(
