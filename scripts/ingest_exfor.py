@@ -139,6 +139,13 @@ Note:
         help='Device for SVGP computation (default: cpu)'
     )
     parser.add_argument(
+        '--max-gpu-points',
+        type=int,
+        default=2000,
+        help='Max points per experiment on GPU; larger experiments use CPU '
+             '(default: 2000). Memory: n² × 8 bytes, so 2000 pts = 32MB'
+    )
+    parser.add_argument(
         '--svgp-checkpoint-dir',
         type=str,
         default=None,
@@ -244,8 +251,11 @@ Note:
                 print(f"         Falling back to CPU.")
                 args.svgp_device = 'cpu'
 
-        # Pass device to GP config for GPU-accelerated fitting
-        gp_config = ExactGPExperimentConfig(device=args.svgp_device)
+        # Pass device and max_gpu_points to GP config for GPU-accelerated fitting
+        gp_config = ExactGPExperimentConfig(
+            device=args.svgp_device,
+            max_gpu_points=args.max_gpu_points,
+        )
         experiment_outlier_config = ExperimentOutlierConfig(
             gp_config=gp_config,
             point_z_threshold=args.z_threshold,

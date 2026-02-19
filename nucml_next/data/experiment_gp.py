@@ -43,6 +43,12 @@ class ExactGPExperimentConfig:
             Wasserstein calibration. If False, use marginal likelihood.
         lengthscale_bounds: (min, max) bounds for lengthscale search.
         device: PyTorch device ('cpu' or 'cuda').
+        max_gpu_points: Experiments with more points than this are
+            automatically routed to CPU to avoid GPU OOM errors.
+            For n points, kernel matrix uses n²×8 bytes (float64):
+            - 2000 pts → 32 MB (safe for most GPUs)
+            - 5000 pts → 200 MB
+            - 10000 pts → 800 MB
     """
     min_points_for_gp: int = 5
     max_epochs: int = 200
@@ -53,6 +59,7 @@ class ExactGPExperimentConfig:
     use_wasserstein_calibration: bool = True
     lengthscale_bounds: Tuple[float, float] = (0.01, 10.0)
     device: str = 'cpu'
+    max_gpu_points: int = 2000
 
 
 class ExactGPExperiment:
@@ -130,6 +137,16 @@ class ExactGPExperiment:
                 f"Need >= {self.config.min_points_for_gp} points to fit GP, got {n}"
             )
 
+        # Proactive GPU memory management: route large experiments to CPU
+        self._effective_device = self.config.device
+        if (self._effective_device == 'cuda' and
+                n > self.config.max_gpu_points):
+            logger.info(
+                f"Experiment with {n} points exceeds max_gpu_points "
+                f"({self.config.max_gpu_points}), using CPU"
+            )
+            self._effective_device = 'cpu'
+
         # Store training data
         self._train_x = log_E
         self._train_y = log_sigma
@@ -174,9 +191,11 @@ class ExactGPExperiment:
         """Optimize lengthscale via Wasserstein calibration distance.
 
         Uses PyTorch-accelerated version when device is 'cuda' for GPU speedup.
+        Uses _effective_device which may be downgraded from config.device
+        for large experiments.
         """
-        # Use PyTorch-accelerated version for GPU or when explicitly requested
-        if self.config.device != 'cpu':
+        # Use PyTorch-accelerated version for GPU
+        if self._effective_device != 'cpu':
             from nucml_next.data.calibration import optimize_lengthscale_wasserstein_torch
 
             self._lengthscale, self.calibration_metric = optimize_lengthscale_wasserstein_torch(
@@ -186,7 +205,7 @@ class ExactGPExperiment:
                 lengthscale_bounds=self.config.lengthscale_bounds,
                 outputscale=self._outputscale,
                 mean_value=self._mean_value,
-                device=self.config.device,
+                device=self._effective_device,
             )
         else:
             # CPU: use NumPy version (slightly faster for small matrices)
@@ -266,8 +285,9 @@ class ExactGPExperiment:
         """Build cached quantities for fast prediction.
 
         Uses PyTorch when device is CUDA for GPU acceleration.
+        Uses _effective_device which may be downgraded for large experiments.
         """
-        if self.config.device != 'cpu':
+        if self._effective_device != 'cpu':
             self._build_prediction_cache_torch()
         else:
             self._build_prediction_cache_numpy()
@@ -290,7 +310,7 @@ class ExactGPExperiment:
         """Build prediction cache using PyTorch (GPU-accelerated)."""
         import torch
 
-        device = self.config.device
+        device = self._effective_device
         if device == 'cuda' and not torch.cuda.is_available():
             logger.warning("CUDA not available, falling back to CPU for prediction cache")
             self._build_prediction_cache_numpy()

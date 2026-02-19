@@ -84,12 +84,21 @@ python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method svgp
 # With GPU acceleration (requires PyTorch with CUDA)
 python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method experiment --svgp-device cuda
 
+# Limit GPU memory: large experiments (>1500 pts) auto-route to CPU
+python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method experiment --svgp-device cuda --max-gpu-points 1500
+
 # With checkpointing (resume interrupted runs)
 python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method experiment --svgp-device cuda --svgp-checkpoint-dir data/checkpoints/
 
 # Full pipeline: test subset + per-experiment outlier detection
 python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --test-subset --outlier-method experiment --z-threshold 3.0
 ```
+
+**GPU memory management:**
+
+- Large experiments automatically route to CPU when they exceed `--max-gpu-points` (default: 2000)
+- If CUDA OOM still occurs, the experiment is automatically retried on CPU
+- Memory usage: n² × 8 bytes per experiment (2000 pts = 32MB, 5000 pts = 200MB)
 
 **Memory-efficient mode** for full-database processing (13M+ points):
 
@@ -101,7 +110,7 @@ EXFOR database on machines with limited RAM (<64GB), use checkpointing:
 python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method experiment --svgp-checkpoint-dir data/checkpoints/ --output data/exfor_processed.parquet
 
 # For GPU processing with memory optimization
-python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method experiment --svgp-device cuda --svgp-checkpoint-dir data/checkpoints/ --output data/exfor_processed.parquet
+python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method experiment --svgp-device cuda --max-gpu-points 1500 --svgp-checkpoint-dir data/checkpoints/ --output data/exfor_processed.parquet
 ```
 
 The checkpointing system automatically clears processed results from memory

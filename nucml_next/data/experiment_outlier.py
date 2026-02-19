@@ -577,13 +577,45 @@ class ExperimentOutlierDetector:
         return result
 
     def _fit_experiment_gp(self, exp_df: pd.DataFrame) -> ExactGPExperiment:
-        """Fit ExactGP to a single experiment."""
+        """Fit ExactGP to a single experiment.
+
+        If CUDA OOM occurs, automatically retries on CPU.
+        """
         log_E = exp_df['log_E'].values
         log_sigma = exp_df['log_sigma'].values
         log_unc = self._get_log_uncertainties(exp_df)
 
         gp = ExactGPExperiment(self.config.gp_config)
-        gp.fit(log_E, log_sigma, log_unc)
+
+        try:
+            gp.fit(log_E, log_sigma, log_unc)
+        except RuntimeError as e:
+            # Check if this is a CUDA OOM error
+            error_msg = str(e).lower()
+            if 'cuda out of memory' in error_msg or 'out of memory' in error_msg:
+                logger.warning(
+                    f"CUDA OOM for experiment with {len(log_E)} points, "
+                    f"retrying on CPU"
+                )
+                # Clear GPU memory before retry
+                try:
+                    import torch
+                    torch.cuda.empty_cache()
+                except ImportError:
+                    pass
+
+                # Create new GP with CPU config
+                cpu_config = ExactGPExperimentConfig(
+                    device='cpu',
+                    min_points_for_gp=self.config.gp_config.min_points_for_gp,
+                    use_wasserstein_calibration=self.config.gp_config.use_wasserstein_calibration,
+                    lengthscale_bounds=self.config.gp_config.lengthscale_bounds,
+                    default_rel_uncertainty=self.config.gp_config.default_rel_uncertainty,
+                )
+                gp = ExactGPExperiment(cpu_config)
+                gp.fit(log_E, log_sigma, log_unc)
+            else:
+                raise  # Re-raise non-OOM errors
 
         return gp
 
