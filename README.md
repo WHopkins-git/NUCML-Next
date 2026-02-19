@@ -100,6 +100,22 @@ python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --test-subset --outlier
 - If CUDA OOM still occurs, the experiment is automatically retried on CPU
 - Memory usage: n² × 8 bytes per experiment (2000 pts = 32MB, 5000 pts = 200MB)
 
+**Thread control for shared machines:**
+
+By default, NumPy/PyTorch use all available CPU cores for linear algebra operations.
+On shared machines, this can cause memory bloat from hundreds of threads. Limit threads
+to reduce memory usage:
+
+```bash
+# Use 4 threads (recommended for shared machines)
+python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method experiment --num-threads 4
+
+# Or via environment variable (must be set before script runs)
+NUCML_NUM_THREADS=4 python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method experiment
+```
+
+As a rule of thumb, use half the available cores on shared machines (e.g., `--num-threads 4` on an 8-core machine).
+
 **Memory-efficient mode** for full-database processing (13M+ points):
 
 The outlier detection step can require significant memory. To process the full

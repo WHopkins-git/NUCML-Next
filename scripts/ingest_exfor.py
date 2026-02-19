@@ -1,4 +1,16 @@
 #!/usr/bin/env python
+# =============================================================================
+# CRITICAL: Thread limits must be set BEFORE importing numpy/torch/scipy
+# These libraries read environment variables at import time
+# =============================================================================
+import os as _os
+_num_threads = _os.environ.get('NUCML_NUM_THREADS', '4')
+_os.environ.setdefault('OMP_NUM_THREADS', _num_threads)
+_os.environ.setdefault('MKL_NUM_THREADS', _num_threads)
+_os.environ.setdefault('OPENBLAS_NUM_THREADS', _num_threads)
+_os.environ.setdefault('NUMEXPR_NUM_THREADS', _num_threads)
+# =============================================================================
+
 """
 EXFOR Data Ingestion Script - Lean Extraction
 ==============================================
@@ -47,6 +59,7 @@ Author: NUCML-Next Team
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -167,6 +180,13 @@ Note:
         default=3.0,
         help='Z-score threshold for flagging point outliers (default: 3.0)'
     )
+    parser.add_argument(
+        '--num-threads',
+        type=int,
+        default=4,
+        help='CPU threads for NumPy/PyTorch linear algebra (default: 4). '
+             'Use half of available cores on shared machines to avoid memory bloat.'
+    )
 
     # Subset filtering options
     parser.add_argument(
@@ -185,6 +205,21 @@ Note:
     )
 
     args = parser.parse_args()
+
+    # Apply thread limits dynamically (supplements the env vars set at module load)
+    # This allows CLI --num-threads to override NUCML_NUM_THREADS env var
+    import os
+    os.environ['OMP_NUM_THREADS'] = str(args.num_threads)
+    os.environ['MKL_NUM_THREADS'] = str(args.num_threads)
+    os.environ['OPENBLAS_NUM_THREADS'] = str(args.num_threads)
+    os.environ['NUMEXPR_NUM_THREADS'] = str(args.num_threads)
+
+    # Also set torch thread limit if available
+    try:
+        import torch
+        torch.set_num_threads(args.num_threads)
+    except ImportError:
+        pass
 
     # Parse z_filter
     z_filter = None
@@ -282,6 +317,7 @@ Note:
         print(f"Outlier:      Disabled (use --outlier-method to enable)")
     if args.svgp_checkpoint_dir:
         print(f"Checkpoints:  {args.svgp_checkpoint_dir}")
+    print(f"CPU Threads:  {args.num_threads}")
     print("="*70 + "\n")
 
     df = ingest_x4(

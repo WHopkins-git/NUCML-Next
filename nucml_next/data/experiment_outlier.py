@@ -228,7 +228,10 @@ class ExperimentOutlierDetector:
                 scored = partial_results[group_key]
             else:
                 scored = self._score_group(group_df, group_key)
-                if not streaming_mode:
+                # Only accumulate partial_results if checkpointing is enabled
+                # (results go directly to result DataFrame on lines below)
+                # This prevents unbounded memory growth when checkpointing is disabled
+                if not streaming_mode and self.config.checkpoint_dir:
                     partial_results[group_key] = scored
 
             if streaming_mode:
@@ -259,6 +262,12 @@ class ExperimentOutlierDetector:
                     torch.cuda.empty_cache()
                 except ImportError:
                     pass
+
+            # Periodic garbage collection to reclaim memory from released objects
+            # (every 100 groups to avoid overhead)
+            if (i + 1) % 100 == 0:
+                import gc
+                gc.collect()
 
             # Progress logging (every 10%)
             if not has_tqdm and n_groups >= 10 and (i + 1) % max(1, n_groups // 10) == 0:
