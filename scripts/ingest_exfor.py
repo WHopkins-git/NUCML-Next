@@ -158,9 +158,9 @@ Note:
     parser.add_argument(
         '--max-gpu-points',
         type=int,
-        default=2000,
+        default=40000,
         help='Max points per experiment on GPU; larger experiments use CPU '
-             '(default: 2000). Memory: n² × 8 bytes, so 2000 pts = 32MB'
+             '(default: 40000). Memory: n² × 8 bytes, so 40k pts = 12.8GB'
     )
     parser.add_argument(
         '--svgp-checkpoint-dir',
