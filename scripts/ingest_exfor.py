@@ -163,6 +163,13 @@ Note:
              '(default: 40000). Memory: n² × 8 bytes, so 40k pts = 12.8GB'
     )
     parser.add_argument(
+        '--max-subsample-points',
+        type=int,
+        default=15000,
+        help='Subsample large experiments to this many points for GP fitting '
+             '(default: 15000). Predictions still made on all points.'
+    )
+    parser.add_argument(
         '--svgp-checkpoint-dir',
         type=str,
         default=None,
@@ -296,6 +303,7 @@ Note:
         gp_config = ExactGPExperimentConfig(
             device=args.svgp_device,
             max_gpu_points=args.max_gpu_points,
+            max_subsample_points=args.max_subsample_points,
         )
         experiment_outlier_config = ExperimentOutlierConfig(
             gp_config=gp_config,

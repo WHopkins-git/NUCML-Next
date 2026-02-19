@@ -60,6 +60,8 @@ class ExactGPExperimentConfig:
     lengthscale_bounds: Tuple[float, float] = (0.01, 10.0)
     device: str = 'cpu'
     max_gpu_points: int = 40000  # 40k points = 12.8 GB kernel matrix, fits in 16GB GPU
+    max_subsample_points: int = 15000  # Subsample large experiments to fit GPU memory
+    subsample_random_state: int = 42  # For reproducibility
 
 
 class ExactGPExperiment:
@@ -147,14 +149,28 @@ class ExactGPExperiment:
             )
             self._effective_device = 'cpu'
 
-        # Store training data
+        # Store energy range for extrapolation detection (from full data)
+        self._log_E_min = log_E.min()
+        self._log_E_max = log_E.max()
+
+        # Subsample large experiments to fit GPU memory
+        # Fit on subsample, but predictions can be made on all points
+        self._is_subsampled = False
+        if n > self.config.max_subsample_points:
+            rng = np.random.RandomState(self.config.subsample_random_state)
+            indices = rng.choice(n, size=self.config.max_subsample_points, replace=False)
+            indices = np.sort(indices)  # Keep energy ordering for stability
+
+            log_E = log_E[indices]
+            log_sigma = log_sigma[indices]
+            log_uncertainties = log_uncertainties[indices]
+            self._is_subsampled = True
+            logger.info(f"Subsampled {n} points to {len(log_E)} for GP fitting")
+
+        # Store (possibly subsampled) training data
         self._train_x = log_E
         self._train_y = log_sigma
         self._noise_variance = log_uncertainties ** 2
-
-        # Store energy range for extrapolation detection
-        self._log_E_min = log_E.min()
-        self._log_E_max = log_E.max()
 
         # Estimate initial hyperparameters
         self._mean_value = np.mean(log_sigma)
