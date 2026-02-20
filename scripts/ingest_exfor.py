@@ -64,6 +64,7 @@ Author: NUCML-Next Team
 
 import argparse
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -355,6 +356,11 @@ Note:
         df = detector.score_dataframe(df)
 
         # Save updated dataframe
+        # Handle case where output_path is a directory (from X4Ingestor's write_to_dataset)
+        output_path = Path(args.output)
+        if output_path.is_dir():
+            print(f"  Removing existing directory: {output_path}")
+            shutil.rmtree(output_path)
         df.to_parquet(args.output, index=False)
 
     print(f"\n✓ Ingestion complete!")
