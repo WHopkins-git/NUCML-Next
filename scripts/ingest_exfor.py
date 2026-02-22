@@ -236,6 +236,15 @@ Note:
              'By default these are EXCLUDED.'
     )
 
+    # Diagnostic mode
+    parser.add_argument(
+        '--diagnostics',
+        action='store_true',
+        default=False,
+        help='Extract additional metadata (Author, Year, ReactionType, FullCode, NDataPoints) '
+             'for interactive inspection. Use with Diagnostics_Interactive_Inspector notebook.'
+    )
+
     args = parser.parse_args()
 
     # Apply thread limits dynamically (supplements the env vars set at module load)
@@ -362,6 +371,9 @@ Note:
         print(f"Filtering:    Excluding {', '.join(filters)}")
     else:
         print(f"Filtering:    Disabled (all data included)")
+    if args.diagnostics:
+        print(f"Diagnostics:  ON (Author, Year, ReactionType, FullCode, NDataPoints)")
+
     print(f"CPU Threads:  {args.num_threads} (50% of {multiprocessing.cpu_count()} cores)")
     print("="*70 + "\n")
 
@@ -374,6 +386,7 @@ Note:
         z_filter=z_filter,
         exclude_non_pure=exclude_non_pure,
         exclude_superseded=exclude_superseded,
+        diagnostics=args.diagnostics,
     )
 
     # Run per-experiment outlier detection if requested

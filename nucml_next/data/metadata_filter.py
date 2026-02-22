@@ -510,6 +510,7 @@ class MetadataFilter:
         exclude_superseded: bool = True,
         sf8_exclude_set: Optional[Set[str]] = None,
         keep_metadata_columns: bool = True,
+        diagnostics: bool = False,
     ) -> pd.DataFrame:
         """
         Enrich DataFrame with reaction metadata and optionally filter.
@@ -523,6 +524,7 @@ class MetadataFilter:
             exclude_superseded: Remove superseded entries (default True)
             sf8_exclude_set: Custom SF8 codes to exclude (default: SF8_EXCLUDE_DEFAULT)
             keep_metadata_columns: Keep sf5, sf6, sf8, is_pure columns in output
+            diagnostics: Include FullCode column in output for interactive inspection
 
         Returns:
             Enriched (and optionally filtered) DataFrame with new columns:
@@ -570,6 +572,8 @@ class MetadataFilter:
         merge_cols = ['DatasetID', 'sf5', 'sf6', 'sf8']
         if 'sf9' in metadata.columns:
             merge_cols.append('sf9')
+        if diagnostics and 'FullCode' in metadata.columns:
+            merge_cols.append('FullCode')
 
         df = df.merge(
             metadata[merge_cols].rename(columns={'DatasetID': join_col}),

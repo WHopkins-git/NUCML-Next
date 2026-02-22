@@ -290,6 +290,7 @@ class X4Ingestor:
         z_filter: Optional[List[int]] = None,
         exclude_non_pure: bool = True,
         exclude_superseded: bool = True,
+        diagnostics: bool = False,
     ):
         """
         Initialize X4 ingestor - extracts lean EXFOR data only.
@@ -317,6 +318,9 @@ class X4Ingestor:
                             calculated/derived). Default: True. This is type filtering,
                             not evaluator bias -- these entries have different units/meaning.
             exclude_superseded: Exclude superseded entries (SPSDD flag). Default: True.
+            diagnostics: Extract additional metadata columns (Author, Year, ReactionType,
+                        FullCode, NDataPoints) for interactive inspection. Default: False.
+                        Use with notebooks/Diagnostics_Interactive_Inspector.ipynb.
 
         Note:
             This ingestor now produces LEAN Parquet files containing only EXFOR measurements.
@@ -335,6 +339,7 @@ class X4Ingestor:
         self.z_filter = z_filter
         self.exclude_non_pure = exclude_non_pure
         self.exclude_superseded = exclude_superseded
+        self.diagnostics = diagnostics
 
         if not self.x4_db_path.exists():
             raise FileNotFoundError(f"X4 database not found: {self.x4_db_path}")
@@ -382,6 +387,7 @@ class X4Ingestor:
                     df,
                     exclude_non_pure=self.exclude_non_pure,
                     exclude_superseded=self.exclude_superseded,
+                    diagnostics=self.diagnostics,
                 )
                 logger.info(f"After metadata filter: {len(df):,} data points")
 
@@ -554,22 +560,43 @@ class X4Ingestor:
         # Query to get dataset metadata and JSON data
         # IMPORTANT: DatasetID is a string (e.g., "30649005S"), so quote properly
         # Extract Proj (projectile) column for explicit neutron/charged particle filtering
-        query = """
-            SELECT
-                ds.DatasetID,
-                ds.zTarg1 as Z,
-                ds.Targ1 as Target,
-                ds.Proj as Projectile,
-                ds.MT,
-                x5.jx5z
-            FROM x4pro_ds ds
-            INNER JOIN x4pro_x5z x5 ON ds.DatasetID = x5.DatasetID
-            WHERE ds.zTarg1 IS NOT NULL
-              AND ds.MT IS NOT NULL
-        """
+        if self.diagnostics:
+            query = """
+                SELECT
+                    ds.DatasetID,
+                    ds.zTarg1 as Z,
+                    ds.Targ1 as Target,
+                    ds.Proj as Projectile,
+                    ds.MT,
+                    ds.year1 as Year,
+                    ds.author1 as Author,
+                    ds.reatyp as ReactionType,
+                    ds.ndat as NDataPoints,
+                    x5.jx5z
+                FROM x4pro_ds ds
+                INNER JOIN x4pro_x5z x5 ON ds.DatasetID = x5.DatasetID
+                WHERE ds.zTarg1 IS NOT NULL
+                  AND ds.MT IS NOT NULL
+            """
+        else:
+            query = """
+                SELECT
+                    ds.DatasetID,
+                    ds.zTarg1 as Z,
+                    ds.Targ1 as Target,
+                    ds.Proj as Projectile,
+                    ds.MT,
+                    x5.jx5z
+                FROM x4pro_ds ds
+                INNER JOIN x4pro_x5z x5 ON ds.DatasetID = x5.DatasetID
+                WHERE ds.zTarg1 IS NOT NULL
+                  AND ds.MT IS NOT NULL
+            """
 
         cursor = conn.cursor()
         cursor.execute(query)
+        # Use cursor.description for column-name-based access
+        col_names = [desc[0] for desc in cursor.description]
         rows = cursor.fetchall()
 
         logger.info(f"Found {len(rows)} datasets with JSON data")
@@ -577,7 +604,14 @@ class X4Ingestor:
         # Parse JSON and extract data points
         all_points = []
 
-        for dataset_id, z, target, projectile, mt, jx5z_str in rows:
+        for row in rows:
+            row_dict = dict(zip(col_names, row))
+            dataset_id = row_dict['DatasetID']
+            z = row_dict['Z']
+            target = row_dict['Target']
+            projectile = row_dict['Projectile']
+            mt = row_dict['MT']
+            jx5z_str = row_dict['jx5z']
             if not jx5z_str:
                 continue
 
@@ -626,7 +660,7 @@ class X4Ingestor:
 
                 # Create data points
                 for i in range(n_points):
-                    all_points.append({
+                    point = {
                         'DatasetID': dataset_id,
                         'Z': z,
                         'A': a,
@@ -636,7 +670,13 @@ class X4Ingestor:
                         'dEn': energy_uncertainties[i],  # Energy uncertainty (eV)
                         'Data': cross_sections[i],
                         'dData': xs_uncertainties[i]  # Cross-section uncertainty (barns)
-                    })
+                    }
+                    if self.diagnostics:
+                        point['Year'] = row_dict.get('Year')
+                        point['Author'] = row_dict.get('Author')
+                        point['ReactionType'] = row_dict.get('ReactionType')
+                        point['NDataPoints'] = row_dict.get('NDataPoints')
+                    all_points.append(point)
 
             except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
                 logger.debug(f"Error parsing dataset {dataset_id}: {e}")
@@ -679,13 +719,20 @@ class X4Ingestor:
         # INNER JOIN between metadata and data tables
         # DatasetID must be quoted as it's a string
         # Extract Proj (projectile) for explicit neutron/charged particle filtering
-        query = """
+        diag_cols = ""
+        if self.diagnostics:
+            diag_cols = """
+                ds.year1 as Year,
+                ds.author1 as Author,
+                ds.reatyp as ReactionType,
+                ds.ndat as NDataPoints,"""
+        query = f"""
             SELECT
                 ds.DatasetID,
                 ds.zTarg1 as Z,
                 ds.Targ1 as Target,
                 ds.Proj as Projectile,
-                ds.MT,
+                ds.MT,{diag_cols}
                 dat.x1 as En,
                 dat.y as Data,
                 dat.dy as dData
@@ -774,6 +821,13 @@ class X4Ingestor:
             'uncertainty': 'Uncertainty',
             'error': 'Uncertainty',
             'd_cross_section': 'Uncertainty',
+
+            # Diagnostic columns (only present when diagnostics=True)
+            'year': 'Year',
+            'author': 'Author',
+            'reactiontype': 'ReactionType',
+            'ndatapoints': 'NDataPoints',
+            'fullcode': 'FullCode',
         }
 
         # Rename columns (case-insensitive)
@@ -815,6 +869,11 @@ class X4Ingestor:
         for mc in metadata_cols:
             if mc in df_norm.columns:
                 final_cols.append(mc)
+        # Preserve diagnostic columns if present (from --diagnostics mode)
+        diagnostic_cols = ['Year', 'Author', 'ReactionType', 'NDataPoints', 'FullCode']
+        for dc in diagnostic_cols:
+            if dc in df_norm.columns:
+                final_cols.append(dc)
         df_norm = df_norm[final_cols]
 
         # Clean data
@@ -1050,6 +1109,7 @@ def ingest_x4(
     z_filter: Optional[List[int]] = None,
     exclude_non_pure: bool = True,
     exclude_superseded: bool = True,
+    diagnostics: bool = False,
 ) -> pd.DataFrame:
     """
     Convenience function for lean X4 ingestion (EXFOR data only).
@@ -1067,6 +1127,8 @@ def ingest_x4(
         exclude_non_pure: Exclude non-pure data (relative, ratio, averaged, non-XS,
                         calculated/derived). Default: True.
         exclude_superseded: Exclude superseded entries. Default: True.
+        diagnostics: Extract additional metadata (Author, Year, ReactionType, FullCode,
+                    NDataPoints) for interactive inspection. Default: False.
 
     Returns:
         Processed DataFrame with EXFOR data (lean, no AME duplication)
@@ -1109,5 +1171,6 @@ def ingest_x4(
         z_filter=z_filter,
         exclude_non_pure=exclude_non_pure,
         exclude_superseded=exclude_superseded,
+        diagnostics=diagnostics,
     )
     return ingestor.ingest()
