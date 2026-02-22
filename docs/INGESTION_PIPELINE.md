@@ -84,6 +84,14 @@ No unit conversion is performed during ingestion.
 DatasetID, Z, A, Projectile, MT, En, dEn, Data, dData
 ```
 
+With `--diagnostics`, these additional columns are extracted from `x4pro_ds`:
+
+```
+Year (year1), Author (author1), ReactionType (reatyp), NDataPoints (ndat)
+```
+
+`FullCode` is added via the `REACODE` table join in MetadataFilter when diagnostics is enabled.
+
 ---
 
 ## 4. Metadata Filtering
@@ -132,6 +140,7 @@ Default filtering applies SF8 Tiers 1+2 plus all SF5, SF6, SF9, and SPSDD rules.
 | (default) | ON | Exclude non-pure and superseded data |
 | `--include-non-pure` | OFF | Keep all data types including non-pure |
 | `--include-superseded` | OFF | Keep superseded entries |
+| `--diagnostics` | OFF | Preserve Author, Year, ReactionType, FullCode, NDataPoints for inspection |
 
 ---
 
@@ -151,6 +160,11 @@ Default filtering applies SF8 Tiers 1+2 plus all SF5, SF6, SF9, and SPSDD rules.
 | `Data` | `CrossSection` |
 | `dData` | `Uncertainty` |
 | (computed) | `N` (= A - Z) |
+| `year1` | `Year` (diagnostics only) |
+| `author1` | `Author` (diagnostics only) |
+| `reatyp` | `ReactionType` (diagnostics only) |
+| `ndat` | `NDataPoints` (diagnostics only) |
+| `fullCode` | `FullCode` (diagnostics only) |
 
 ### Physical Range Filters
 
@@ -269,7 +283,8 @@ Entry, Z, A, N, Projectile, MT,
 Energy, Energy_Uncertainty, CrossSection, Uncertainty,
 sf5, sf6, sf8, sf9, is_pure, data_type,
 log_E, log_sigma, gp_mean, gp_std, z_score,
-experiment_outlier, point_outlier, calibration_metric, experiment_id
+experiment_outlier, point_outlier, calibration_metric, experiment_id,
+Year, Author, ReactionType, FullCode, NDataPoints
 ```
 
 | Column Group | Present When |
@@ -278,6 +293,21 @@ experiment_outlier, point_outlier, calibration_metric, experiment_id
 | Metadata (sf5 through data_type) | Metadata filtering is ON (default) |
 | GP columns (log_E through z_score) | `--outlier-method` is set |
 | Experiment columns (experiment_outlier through experiment_id) | `--outlier-method experiment` |
+| Diagnostic columns (Year through NDataPoints) | `--diagnostics` is set |
+
+### Diagnostic Columns
+
+When `--diagnostics` is set, these additional columns from `x4pro_ds` are preserved through the pipeline:
+
+| Column | Source | Description |
+|--------|--------|-------------|
+| `Year` | `x4pro_ds.year1` | Publication year of the experiment |
+| `Author` | `x4pro_ds.author1` | First author of the experiment |
+| `ReactionType` | `x4pro_ds.reatyp` | X4Pro reaction type code (CS, DAP, RP, etc.) |
+| `FullCode` | `REACODE.fullCode` | Full EXFOR REACTION string for parsing SF subfields |
+| `NDataPoints` | `x4pro_ds.ndat` | Number of data points in the original dataset |
+
+These columns are intended for use with the `Diagnostics_Interactive_Inspector.ipynb` notebook, which provides Plotly hover-over inspection of individual data points.
 
 ---
 
@@ -289,22 +319,53 @@ python scripts/ingest_exfor.py [FLAGS]
 
 ### Full Flag Table
 
+**Core:**
+
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--x4-db` | required | Path to X4Pro SQLite database |
 | `--output` | `data/exfor_processed.parquet` | Output Parquet path |
+
+**Subset filtering:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
 | `--test-subset` | OFF | Use test subset: U (Z=92) + Cl (Z=17) |
 | `--z-filter` | None | Comma-separated Z values (e.g., `79,92,26`) |
+
+**Metadata filtering:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--include-non-pure` | OFF | Include non-pure data (relative, ratio, averaged, etc.) |
+| `--include-superseded` | OFF | Include superseded entries |
+| `--diagnostics` | OFF | Add Author, Year, ReactionType, FullCode, NDataPoints columns for interactive inspection |
+
+**Outlier detection:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
 | `--outlier-method` | None | `experiment` (recommended) or `svgp` (legacy) |
 | `--z-threshold` | 3.0 | Z-score threshold for point outliers |
 | `--svgp-device` | `cpu` | `cpu` or `cuda` |
 | `--max-gpu-points` | 40000 | Max points per experiment on GPU; larger auto-route to CPU |
-| `--max-subsample-points` | 15000 | Subsample large experiments for GP fitting |
+| `--max-subsample-points` | 15000 | Subsample large experiments to this many points for GP fitting |
 | `--svgp-checkpoint-dir` | None | Enable checkpointing for resume on interruption |
 | `--svgp-likelihood` | `student_t` | Likelihood: `student_t`, `heteroscedastic`, `gaussian` |
-| `--include-non-pure` | OFF | Include non-pure data (relative, ratio, averaged, etc.) |
-| `--include-superseded` | OFF | Include superseded entries |
+
+**System:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
 | `--num-threads` | 50% of cores | CPU threads for NumPy/PyTorch linear algebra |
+
+**Deprecated (still accepted, will be removed in a future release):**
+
+| Flag | Replacement | Description |
+|------|-------------|-------------|
+| `--ame2020-dir` | None (AME is loaded at feature-generation time) | Ignored; AME enrichment no longer happens during ingestion |
+| `--run-svgp` | `--outlier-method svgp` | Legacy flag for SVGP outlier detection |
+| `--no-svgp` | (default behaviour) | Explicitly skip outlier detection |
 
 ### Example Commands
 
@@ -330,6 +391,10 @@ python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --z-filter 79,92,26
 # Include all data (no metadata filtering)
 python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db \
     --include-non-pure --include-superseded
+
+# Diagnostic mode (adds hover metadata for interactive inspector)
+python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db \
+    --test-subset --diagnostics
 ```
 
 ---

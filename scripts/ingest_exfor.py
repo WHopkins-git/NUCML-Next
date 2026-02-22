@@ -278,7 +278,7 @@ Note:
     # Validate X4 database
     x4_path = Path(args.x4_db)
     if not x4_path.exists():
-        print(f"❌ Error: X4 database not found: {x4_path}")
+        print(f"ERROR: X4 database not found: {x4_path}")
         print("\nPlease provide a valid X4Pro SQLite database.")
         print("  - Full database: Download from https://www-nds.iaea.org/x4/")
         print("  - Sample database: Use data/x4sqlite1_sample.db (in repository)")
@@ -286,7 +286,7 @@ Note:
 
     # Warn if --ame2020-dir provided (deprecated parameter)
     if args.ame2020_dir:
-        print("\n⚠️  WARNING: --ame2020-dir is deprecated and will be ignored.")
+        print("\nWARNING: --ame2020-dir is deprecated and will be ignored.")
         print("   AME enrichment now happens during feature generation for better performance.")
         print("   Place AME files in data/ and NucmlDataset will load them automatically.\n")
 
@@ -295,7 +295,7 @@ Note:
     if args.run_svgp and not args.no_svgp and outlier_method is None:
         # Legacy --run-svgp flag
         outlier_method = 'svgp'
-        print("⚠️  WARNING: --run-svgp is deprecated. Use --outlier-method svgp instead.\n")
+        print("WARNING: --run-svgp is deprecated. Use --outlier-method svgp instead.\n")
 
     # Build outlier detector config
     svgp_config = None
@@ -408,23 +408,23 @@ Note:
             shutil.rmtree(output_path)
         df.to_parquet(args.output, index=False)
 
-    print(f"\n✓ Ingestion complete!")
-    print(f"✓ Processed {len(df):,} data points")
-    print(f"✓ Saved to: {args.output}")
+    print(f"\n[OK] Ingestion complete!")
+    print(f"[OK] Processed {len(df):,} data points")
+    print(f"[OK] Saved to: {args.output}")
 
     if run_svgp and 'z_score' in df.columns:
         n_outliers = (df['z_score'] > args.z_threshold).sum()
-        print(f"✓ SVGP outlier detection: {n_outliers:,} outliers at z>{args.z_threshold} ({100*n_outliers/len(df):.2f}%)")
+        print(f"[OK] SVGP outlier detection: {n_outliers:,} outliers at z>{args.z_threshold} ({100*n_outliers/len(df):.2f}%)")
     elif run_experiment_outlier and 'z_score' in df.columns:
         n_point_outliers = df['point_outlier'].sum() if 'point_outlier' in df.columns else 0
         n_exp_outliers = df[df['experiment_outlier']]['experiment_id'].nunique() if 'experiment_outlier' in df.columns else 0
-        print(f"✓ Per-experiment outlier detection:")
+        print(f"[OK] Per-experiment outlier detection:")
         print(f"    Point outliers: {n_point_outliers:,} ({100*n_point_outliers/len(df):.2f}%)")
         print(f"    Experiment outliers: {n_exp_outliers} experiments flagged")
     else:
-        print(f"✓ Lean Parquet contains EXFOR data only (no AME duplication)")
-    print(f"\n💡 AME2020/NUBASE2020 enrichment will be added during feature generation")
-    print(f"   Place AME *.mas20.txt files in data/ directory")
+        print(f"[OK] Lean Parquet contains EXFOR data only (no AME duplication)")
+    print(f"\n[NOTE] AME2020/NUBASE2020 enrichment will be added during feature generation")
+    print(f"       Place AME *.mas20.txt files in data/ directory")
     print()
 
 

@@ -348,11 +348,25 @@ class X4Ingestor:
         # Keep this for backward compatibility (parameter is ignored)
         if ame2020_dir:
             logger.warning(
-                "⚠️  ame2020_dir parameter is deprecated and will be ignored.\n"
+                "WARNING: ame2020_dir parameter is deprecated and will be ignored.\n"
                 "   AME enrichment now happens during feature generation for better performance.\n"
                 "   The lean Parquet file will not include AME columns.\n"
                 "   NucmlDataset will load AME files automatically when needed."
             )
+
+    def _z_filter_clause(self, column: str = 'ds.zTarg1') -> str:
+        """Build SQL WHERE clause fragment for Z-filter pushdown.
+
+        When z_filter is set, returns e.g. `` AND ds.zTarg1 IN (17, 92)``
+        so the database does the heavy lifting instead of loading everything
+        into Python memory first.
+
+        No SQL-injection risk: self.z_filter is always List[int] from CLI parsing.
+        """
+        if not self.z_filter:
+            return ""
+        z_list = ', '.join(str(z) for z in self.z_filter)
+        return f" AND {column} IN ({z_list})"
 
     def ingest(self) -> pd.DataFrame:
         """
@@ -374,7 +388,9 @@ class X4Ingestor:
         conn = sqlite3.connect(str(self.x4_db_path))
 
         try:
-            # Extract data points
+            # Extract data points (Z-filter is pushed into SQL when set)
+            if self.z_filter:
+                logger.info(f"Z filter pushdown: extracting only Z in {self.z_filter}")
             df = self._extract_points(conn)
             logger.info(f"Extracted {len(df)} data points")
 
@@ -466,7 +482,7 @@ class X4Ingestor:
         # Strategy 3: Legacy data_points table
         if 'data_points' in tables:
             logger.info("Using legacy data_points table")
-            query = """
+            query = f"""
                 SELECT
                     entry_id,
                     target_z,
@@ -477,7 +493,7 @@ class X4Ingestor:
                     dxs
                 FROM data_points
                 WHERE energy IS NOT NULL
-                  AND xs IS NOT NULL
+                  AND xs IS NOT NULL{self._z_filter_clause('target_z')}
             """
             df = pd.read_sql_query(query, conn)
             return df
@@ -485,7 +501,7 @@ class X4Ingestor:
         # Strategy 4: Separate tables (reactions, energies, cross_sections)
         elif 'reactions' in tables:
             logger.info("Using joined reactions/energies/cross_sections tables")
-            query = """
+            query = f"""
                 SELECT
                     r.entry_id,
                     r.target_z,
@@ -499,7 +515,7 @@ class X4Ingestor:
                 LEFT JOIN cross_sections x ON r.id = x.reaction_id
                 LEFT JOIN uncertainties u ON r.id = u.reaction_id
                 WHERE e.value IS NOT NULL
-                  AND x.value IS NOT NULL
+                  AND x.value IS NOT NULL{self._z_filter_clause('r.target_z')}
             """
             df = pd.read_sql_query(query, conn)
             return df
@@ -592,6 +608,9 @@ class X4Ingestor:
                 WHERE ds.zTarg1 IS NOT NULL
                   AND ds.MT IS NOT NULL
             """
+
+        # Push Z-filter into SQL to avoid loading all 186K datasets into memory
+        query += self._z_filter_clause()
 
         cursor = conn.cursor()
         cursor.execute(query)
@@ -726,6 +745,8 @@ class X4Ingestor:
                 ds.author1 as Author,
                 ds.reatyp as ReactionType,
                 ds.ndat as NDataPoints,"""
+        # Push Z-filter into SQL to avoid loading all data into memory
+        z_clause = self._z_filter_clause()
         query = f"""
             SELECT
                 ds.DatasetID,
@@ -741,7 +762,7 @@ class X4Ingestor:
             WHERE ds.zTarg1 IS NOT NULL
               AND ds.MT IS NOT NULL
               AND dat.x1 IS NOT NULL
-              AND dat.y IS NOT NULL
+              AND dat.y IS NOT NULL{z_clause}
         """
 
         df = pd.read_sql_query(query, conn)

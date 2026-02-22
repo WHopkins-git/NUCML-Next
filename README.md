@@ -63,6 +63,9 @@ python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --test-subset
 # With per-experiment GP outlier detection (recommended)
 python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method experiment
 
+# With diagnostic metadata for interactive inspection
+python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --test-subset --diagnostics
+
 # Include non-pure data for analysis
 python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --include-non-pure
 
@@ -70,17 +73,41 @@ python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --include-non-pure
 python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method experiment --svgp-device cuda --svgp-checkpoint-dir data/checkpoints/
 ```
 
-See `docs/INGESTION_PIPELINE.md` for full details.
+See `docs/INGESTION_PIPELINE.md` for algorithm details and edge-case handling.
+
+### CLI Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--x4-db` | required | Path to X4Pro SQLite database |
+| `--output` | `data/exfor_processed.parquet` | Output Parquet path |
+| `--test-subset` | OFF | Use test subset: U (Z=92) + Cl (Z=17) |
+| `--z-filter` | None | Comma-separated Z values (e.g., `79,92,26`) |
+| `--include-non-pure` | OFF | Include non-pure data (relative, ratio, averaged, etc.) |
+| `--include-superseded` | OFF | Include superseded entries |
+| `--diagnostics` | OFF | Add Author, Year, ReactionType, FullCode, NDataPoints columns for interactive inspection |
+| `--outlier-method` | None | `experiment` (recommended) or `svgp` (legacy) |
+| `--z-threshold` | 3.0 | Z-score threshold for point outliers |
+| `--svgp-device` | `cpu` | `cpu` or `cuda` |
+| `--max-gpu-points` | 40000 | Max points per experiment on GPU; larger auto-route to CPU |
+| `--max-subsample-points` | 15000 | Subsample large experiments for GP fitting |
+| `--svgp-checkpoint-dir` | None | Enable checkpointing for resume on interruption |
+| `--svgp-likelihood` | `student_t` | Likelihood: `student_t`, `heteroscedastic`, `gaussian` |
+| `--num-threads` | 50% of cores | CPU threads for NumPy/PyTorch linear algebra |
+| `--ame2020-dir` | None | DEPRECATED -- ignored (AME loaded at feature-generation time) |
+| `--run-svgp` | OFF | DEPRECATED -- use `--outlier-method svgp` instead |
+| `--no-svgp` | OFF | DEPRECATED -- outlier detection is off by default |
 
 ### Output Schema
 
 ```
 Entry, Z, A, N, Projectile, MT, Energy, CrossSection, Uncertainty,
 Energy_Uncertainty, log_E, log_sigma, sf5, sf6, sf8, sf9, is_pure, data_type,
-gp_mean, gp_std, z_score, experiment_outlier, point_outlier, calibration_metric, experiment_id
+gp_mean, gp_std, z_score, experiment_outlier, point_outlier, calibration_metric, experiment_id,
+Year, Author, ReactionType, FullCode, NDataPoints
 ```
 
-The last 7 columns (`gp_mean` through `experiment_id`) are only present when `--outlier-method experiment` is used.
+The GP columns (`gp_mean` through `experiment_id`) are only present when `--outlier-method experiment` is used. The diagnostic columns (`Year` through `NDataPoints`) are only present when `--diagnostics` is used.
 
 ---
 
@@ -97,14 +124,7 @@ By default, ingestion excludes non-pure EXFOR data. This is **type filtering**, 
 | Calculated/derived/evaluated (SF9=CALC/DERIV/EVAL/RECOM) | Not experimental measurements |
 | Superseded entries (SPSDD flag) | Replaced by newer data |
 
-### CLI Flags
-
-| Flag | Effect |
-|------|--------|
-| `--include-non-pure` | Keep all data types (marks them via `is_pure` column) |
-| `--include-superseded` | Keep superseded entries |
-
-The columns `sf5`, `sf6`, `sf8`, `sf9`, `is_pure`, and `data_type` are always preserved in the output Parquet for downstream analysis.
+Use `--include-non-pure` and `--include-superseded` to override filtering (see CLI Flags table above). The columns `sf5`, `sf6`, `sf8`, `sf9`, `is_pure`, and `data_type` are always preserved in the output Parquet for downstream analysis.
 
 ---
 
@@ -154,6 +174,20 @@ explorer = ThresholdExplorer('data/exfor_processed.parquet')
 explorer.show()  # cascading dropdowns + probability surface + z-score bands
 ```
 
+### Diagnostics Interactive Inspector
+
+For investigating suspicious data clusters, use the Plotly-based diagnostic notebook. Hover over individual points to see Entry ID, author, year, full REACTION string, and more.
+
+```bash
+# Ingest with diagnostic metadata
+python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --test-subset --diagnostics
+
+# Open the notebook
+jupyter notebook notebooks/Diagnostics_Interactive_Inspector.ipynb
+```
+
+The notebook provides cascading Z/A/MT dropdowns with three coloring modes (Uniform, Color by Entry, Color by data_type) and WebGL-accelerated rendering for large datasets.
+
 ---
 
 ## Package Structure
@@ -186,6 +220,7 @@ notebooks/
   01_Database_Statistical_Audit.ipynb
   02_GNN_Transformer_Training.ipynb
   03_OpenMC_Loop_and_Inference.ipynb
+  Diagnostics_Interactive_Inspector.ipynb
 ```
 
 ---
