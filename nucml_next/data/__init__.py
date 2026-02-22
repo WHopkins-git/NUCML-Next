@@ -82,6 +82,10 @@ def __getattr__(name):
     if name == "optimize_lengthscale_wasserstein":
         from nucml_next.data.calibration import optimize_lengthscale_wasserstein
         return optimize_lengthscale_wasserstein
+    # Metadata filter (no heavy dependencies)
+    if name == "MetadataFilter":
+        from nucml_next.data.metadata_filter import MetadataFilter
+        return MetadataFilter
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
@@ -118,4 +122,6 @@ __all__ = [
     "prepare_log_uncertainties",
     "compute_wasserstein_calibration",
     "optimize_lengthscale_wasserstein",
+    # Metadata filter
+    "MetadataFilter",
 ]

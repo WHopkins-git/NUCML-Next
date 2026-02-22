@@ -218,6 +218,24 @@ Note:
              'Example: --z-filter 79,92,26 for Au, U, Fe'
     )
 
+    # Metadata filtering options
+    parser.add_argument(
+        '--include-non-pure',
+        action='store_true',
+        default=False,
+        help='Include non-pure data (relative, ratio, spectrum-averaged, '
+             'non-XS quantities, calculated/derived). '
+             'By default these are EXCLUDED because they have different '
+             'units or meaning than point-wise absolute cross sections.'
+    )
+    parser.add_argument(
+        '--include-superseded',
+        action='store_true',
+        default=False,
+        help='Include superseded entries (SPSDD flag in SUBENT table). '
+             'By default these are EXCLUDED.'
+    )
+
     args = parser.parse_args()
 
     # Apply thread limits dynamically (supplements the env vars set at module load)
@@ -332,6 +350,18 @@ Note:
         print(f"Outlier:      Disabled (use --outlier-method to enable)")
     if args.svgp_checkpoint_dir:
         print(f"Checkpoints:  {args.svgp_checkpoint_dir}")
+    # Metadata filtering status
+    exclude_non_pure = not args.include_non_pure
+    exclude_superseded = not args.include_superseded
+    if exclude_non_pure or exclude_superseded:
+        filters = []
+        if exclude_non_pure:
+            filters.append("non-pure data")
+        if exclude_superseded:
+            filters.append("superseded entries")
+        print(f"Filtering:    Excluding {', '.join(filters)}")
+    else:
+        print(f"Filtering:    Disabled (all data included)")
     print(f"CPU Threads:  {args.num_threads} (50% of {multiprocessing.cpu_count()} cores)")
     print("="*70 + "\n")
 
@@ -342,6 +372,8 @@ Note:
         run_svgp=run_svgp,
         svgp_config=svgp_config,
         z_filter=z_filter,
+        exclude_non_pure=exclude_non_pure,
+        exclude_superseded=exclude_superseded,
     )
 
     # Run per-experiment outlier detection if requested

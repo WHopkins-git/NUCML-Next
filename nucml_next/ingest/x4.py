@@ -288,6 +288,8 @@ class X4Ingestor:
         run_svgp: bool = False,
         svgp_config: Optional[Any] = None,
         z_filter: Optional[List[int]] = None,
+        exclude_non_pure: bool = True,
+        exclude_superseded: bool = True,
     ):
         """
         Initialize X4 ingestor - extracts lean EXFOR data only.
@@ -311,6 +313,10 @@ class X4Ingestor:
             z_filter: Optional list of atomic numbers (Z) to include. Default: None (all elements).
                      Example: [17, 92] for Chlorine and Uranium only.
                      Useful for creating test subsets for faster development/testing.
+            exclude_non_pure: Exclude non-pure data (relative, ratio, averaged, non-XS,
+                            calculated/derived). Default: True. This is type filtering,
+                            not evaluator bias -- these entries have different units/meaning.
+            exclude_superseded: Exclude superseded entries (SPSDD flag). Default: True.
 
         Note:
             This ingestor now produces LEAN Parquet files containing only EXFOR measurements.
@@ -327,6 +333,8 @@ class X4Ingestor:
         self.run_svgp = run_svgp
         self.svgp_config = svgp_config
         self.z_filter = z_filter
+        self.exclude_non_pure = exclude_non_pure
+        self.exclude_superseded = exclude_superseded
 
         if not self.x4_db_path.exists():
             raise FileNotFoundError(f"X4 database not found: {self.x4_db_path}")
@@ -364,6 +372,18 @@ class X4Ingestor:
             # Extract data points
             df = self._extract_points(conn)
             logger.info(f"Extracted {len(df)} data points")
+
+            # Metadata-based pre-filtering (MUST run before _normalize which
+            # renames DatasetID -> Entry; the REACODE join needs DatasetID)
+            if self.exclude_non_pure or self.exclude_superseded:
+                from nucml_next.data.metadata_filter import MetadataFilter
+                mf = MetadataFilter(conn)
+                df = mf.enrich_and_filter(
+                    df,
+                    exclude_non_pure=self.exclude_non_pure,
+                    exclude_superseded=self.exclude_superseded,
+                )
+                logger.info(f"After metadata filter: {len(df):,} data points")
 
             # Normalize schema
             df = self._normalize(df)
@@ -790,6 +810,11 @@ class X4Ingestor:
         # Select and order final columns
         # Note: Energy_Uncertainty added for completeness but rarely used in ML training
         final_cols = ['Entry', 'Z', 'A', 'Projectile', 'MT', 'Energy', 'Energy_Uncertainty', 'CrossSection', 'Uncertainty']
+        # Preserve metadata columns from MetadataFilter if present
+        metadata_cols = ['sf5', 'sf6', 'sf8', 'sf9', 'is_pure', 'data_type']
+        for mc in metadata_cols:
+            if mc in df_norm.columns:
+                final_cols.append(mc)
         df_norm = df_norm[final_cols]
 
         # Clean data
@@ -1023,6 +1048,8 @@ def ingest_x4(
     run_svgp: bool = False,
     svgp_config: Optional[Any] = None,
     z_filter: Optional[List[int]] = None,
+    exclude_non_pure: bool = True,
+    exclude_superseded: bool = True,
 ) -> pd.DataFrame:
     """
     Convenience function for lean X4 ingestion (EXFOR data only).
@@ -1037,6 +1064,9 @@ def ingest_x4(
         svgp_config: SVGPConfig object with SVGP hyperparameters. Default: None.
         z_filter: Optional list of atomic numbers (Z) to include. Default: None (all).
                  Example: [17, 92] for Chlorine and Uranium only.
+        exclude_non_pure: Exclude non-pure data (relative, ratio, averaged, non-XS,
+                        calculated/derived). Default: True.
+        exclude_superseded: Exclude superseded entries. Default: True.
 
     Returns:
         Processed DataFrame with EXFOR data (lean, no AME duplication)
@@ -1062,6 +1092,12 @@ def ingest_x4(
         ...     z_filter=[17, 92],  # Cl=17, U=92
         ...     run_svgp=True,
         ... )
+
+        >>> # Include non-pure data (for analysis/comparison)
+        >>> df = ingest_x4(
+        ...     x4_db_path='data/x4sqlite1.db',
+        ...     exclude_non_pure=False,
+        ... )
     """
     ingestor = X4Ingestor(
         x4_db_path=x4_db_path,
@@ -1071,5 +1107,7 @@ def ingest_x4(
         run_svgp=run_svgp,
         svgp_config=svgp_config,
         z_filter=z_filter,
+        exclude_non_pure=exclude_non_pure,
+        exclude_superseded=exclude_superseded,
     )
     return ingestor.ingest()
