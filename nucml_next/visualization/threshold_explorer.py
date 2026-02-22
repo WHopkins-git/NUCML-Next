@@ -37,7 +37,9 @@ GP_MEAN_COLOR = '#4682B4'      # steel blue
 CONFIDENCE_COLOR = '#4682B4'   # same hue, varied alpha
 OUTLIER_ZONE_CLR = '#CD5C5C'   # coral
 INLIER_COLOR = '#2E8B8B'       # teal
-OUTLIER_COLOR = '#DC143C'      # crimson
+OUTLIER_COLOR = '#DC143C'      # crimson (legacy, kept for compatibility)
+POINT_OUTLIER_COLOR = '#FF8C00'  # dark orange for point outliers (z > threshold)
+DISCREPANT_EXP_COLOR = '#DC143C'  # crimson for discrepant experiments
 INLIER_SIZE = 10
 OUTLIER_SIZE = 30
 
@@ -395,15 +397,21 @@ class ThresholdExplorer:
                 wspace=0.30,
             )
 
-            ax_prob = fig.add_subplot(gs[0, 0])
+            ax_zscore = fig.add_subplot(gs[0, 0])
             ax_all = fig.add_subplot(gs[0, 1])
             ax_filtered = fig.add_subplot(gs[0, 2])
             ax_stats = fig.add_subplot(gs[1, :])
 
             # Draw panels
-            self._draw_probability_surface(ax_prob, df, threshold)
+            self._draw_zscore_heatmap(ax_zscore, df, threshold)
             self._draw_all_data_highlighted(ax_all, df, threshold)
             self._draw_filtered_with_errorbars(ax_filtered, df, threshold)
+
+            # Sync y-axis limits across all 3 main panels
+            y_min = min(ax_zscore.get_ylim()[0], ax_all.get_ylim()[0], ax_filtered.get_ylim()[0])
+            y_max = max(ax_zscore.get_ylim()[1], ax_all.get_ylim()[1], ax_filtered.get_ylim()[1])
+            for ax in [ax_zscore, ax_all, ax_filtered]:
+                ax.set_ylim(y_min, y_max)
 
             # ── Statistics text bar ──────────────────────────────────────
             ax_stats.axis('off')
@@ -546,7 +554,71 @@ class ThresholdExplorer:
             plt.show()
 
     # =====================================================================
-    # Probability surface panel
+    # Z-Score heatmap panel (replaces probability surface)
+    # =====================================================================
+
+    def _draw_zscore_heatmap(
+        self, ax: Axes, df: pd.DataFrame, threshold: float,
+    ) -> None:
+        """Draw data points colored by z-score magnitude.
+
+        Uses RdYlBu_r colormap where:
+        - Blue = low z-score (good fit to GP)
+        - Yellow = moderate z-score
+        - Red = high z-score (outlier)
+        """
+        log_E = df['log_E'].values
+        log_sigma = df['log_sigma'].values
+        z_scores = df['z_score'].values
+
+        # Clip z-scores for colormap range (0 to 2*threshold)
+        z_clipped = np.clip(z_scores, 0, threshold * 2)
+
+        scatter = ax.scatter(
+            log_E, log_sigma,
+            c=z_clipped, cmap='RdYlBu_r',  # Red = high z-score
+            s=INLIER_SIZE * 1.5, alpha=0.7,
+            edgecolors='none',
+            vmin=0, vmax=threshold * 2,
+        )
+        cbar = plt.colorbar(scatter, ax=ax, pad=0.02, shrink=0.9)
+        cbar.set_label('z-score', fontsize=10, family='sans-serif')
+
+        # Add threshold marker on colorbar
+        cbar.ax.axhline(threshold, color='black', linewidth=2, linestyle='--')
+        cbar.ax.text(
+            1.5, threshold, f'z={threshold}',
+            va='center', fontsize=8, family='sans-serif',
+        )
+
+        # ── Energy region vertical spans ─────────────────────────────────
+        y_lo, y_hi = ax.get_ylim()
+        for name, lo_ev, hi_ev, color in ENERGY_REGIONS:
+            lo_log = np.log10(max(lo_ev, 1e-30))
+            hi_log = np.log10(hi_ev)
+            x_min, x_max = log_E.min(), log_E.max()
+            if hi_log < x_min or lo_log > x_max:
+                continue
+            lo_clipped = max(lo_log, x_min)
+            hi_clipped = min(hi_log, x_max)
+            ax.axvspan(lo_clipped, hi_clipped, alpha=0.06, color=color, zorder=0)
+            mid = (lo_clipped + hi_clipped) / 2
+            ax.text(
+                mid, y_hi, name, ha='center', va='bottom', fontsize=7,
+                alpha=0.6, family='sans-serif', style='italic',
+            )
+        ax.set_ylim(y_lo, y_hi)
+
+        # Style
+        ax.set_xlabel(r'$\log_{10}(E)$ [eV]', fontsize=11, family='sans-serif')
+        ax.set_ylabel(r'$\log_{10}(\sigma)$ [b]', fontsize=11, family='sans-serif')
+        ax.set_title('Z-Score Distribution', fontsize=12,
+                     fontweight='bold', family='sans-serif')
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+
+    # =====================================================================
+    # Probability surface panel (legacy, kept for reference)
     # =====================================================================
 
     def _draw_probability_surface(
@@ -793,25 +865,16 @@ class ThresholdExplorer:
     def _draw_all_data_highlighted(
         self, ax: Axes, df: pd.DataFrame, threshold: float,
     ) -> None:
-        """Draw all data points with outliers clearly highlighted (not hidden).
+        """Draw all data points, highlighting only outliers that WILL be removed.
 
-        - Inliers: teal circles (good visibility)
-        - Point outliers (z > threshold): red circles with black edge
-        - Discrepant experiment points: red X markers (if experiment_outlier=True)
-
-        All points remain visible - this panel is for visualization, not filtering.
+        Only highlights outliers based on ENABLED filter settings:
+        - If "Exclude point outliers" is ON: show point outliers in orange
+        - If "Exclude discrepant experiments" is ON: show discrepant exp as red X
+        - Retained points shown translucent in background
         """
         log_E = df['log_E'].values
         log_sigma = df['log_sigma'].values
         z_scores = df['z_score'].values
-
-        # Compute masks
-        point_outlier_mask = z_scores > threshold
-        exp_outlier_mask = (
-            df['experiment_outlier'].values
-            if 'experiment_outlier' in df.columns
-            else np.zeros(len(df), dtype=bool)
-        )
 
         # Color by experiment mode
         color_by_exp = self._w_color_by_experiment.value
@@ -820,37 +883,56 @@ class ThresholdExplorer:
             # Per-experiment coloring mode (delegate to existing method)
             self._draw_experiment_scatter(ax, df, threshold)
         else:
-            # Default mode: show all points with outliers highlighted
+            # Only compute masks for ENABLED filters
+            exclude_points = self._w_exclude_point_outliers.value
+            exclude_exp = self._w_exclude_discrepant.value
 
-            # 1. Inliers (neither point nor experiment outlier)
-            inlier_mask = ~point_outlier_mask & ~exp_outlier_mask
-            if inlier_mask.any():
+            # Point outlier mask: only if filter is enabled
+            point_outlier_mask = (
+                (z_scores > threshold) if exclude_points
+                else np.zeros(len(df), dtype=bool)
+            )
+
+            # Experiment outlier mask: only if filter is enabled
+            exp_outlier_mask = (
+                df['experiment_outlier'].values
+                if (exclude_exp and 'experiment_outlier' in df.columns)
+                else np.zeros(len(df), dtype=bool)
+            )
+
+            # Compute what will be removed vs retained
+            will_be_removed = point_outlier_mask | exp_outlier_mask
+            retained_mask = ~will_be_removed
+
+            # 1. Retained points: translucent background
+            if retained_mask.any():
                 ax.scatter(
-                    log_E[inlier_mask], log_sigma[inlier_mask],
-                    c=INLIER_COLOR, s=INLIER_SIZE * 2, alpha=0.7,
-                    edgecolors='white', linewidths=0.3,
-                    label=f'Inliers ({inlier_mask.sum():,})', zorder=10,
+                    log_E[retained_mask], log_sigma[retained_mask],
+                    c=INLIER_COLOR, s=INLIER_SIZE, alpha=0.3,
+                    edgecolors='none', zorder=5,
+                    label=f'Retained ({retained_mask.sum():,})',
                 )
 
-            # 2. Point outliers (z > threshold, but not experiment outlier)
-            point_only = point_outlier_mask & ~exp_outlier_mask
-            if point_only.any():
-                ax.scatter(
-                    log_E[point_only], log_sigma[point_only],
-                    c=OUTLIER_COLOR, s=OUTLIER_SIZE, alpha=0.9,
-                    edgecolors='black', linewidths=0.8,
-                    marker='o',
-                    label=f'Point outliers z>{threshold} ({point_only.sum():,})', zorder=11,
-                )
+            # 2. Point outliers: orange, opaque foreground (only if filter enabled)
+            if exclude_points:
+                point_only = point_outlier_mask & ~exp_outlier_mask
+                if point_only.any():
+                    ax.scatter(
+                        log_E[point_only], log_sigma[point_only],
+                        c=POINT_OUTLIER_COLOR, s=OUTLIER_SIZE, alpha=0.9,
+                        edgecolors='black', linewidths=0.8,
+                        marker='o', zorder=10,
+                        label=f'Point outliers z>{threshold} ({point_only.sum():,})',
+                    )
 
-            # 3. Experiment outliers (discrepant experiments)
-            if exp_outlier_mask.any():
+            # 3. Discrepant exp: red X, opaque foreground (only if filter enabled)
+            if exclude_exp and exp_outlier_mask.any():
                 ax.scatter(
                     log_E[exp_outlier_mask], log_sigma[exp_outlier_mask],
-                    c=OUTLIER_COLOR, s=OUTLIER_SIZE * 1.2, alpha=0.9,
+                    c=DISCREPANT_EXP_COLOR, s=OUTLIER_SIZE * 1.2, alpha=0.9,
                     edgecolors='darkred', linewidths=1.0,
-                    marker='X',
-                    label=f'Discrepant exp ({exp_outlier_mask.sum():,})', zorder=12,
+                    marker='X', zorder=11,
+                    label=f'Discrepant exp ({exp_outlier_mask.sum():,})',
                 )
 
             ax.legend(loc='best', fontsize=8, frameon=True, framealpha=0.9)
@@ -935,15 +1017,26 @@ class ThresholdExplorer:
 
             if valid_unc.any():
                 # Asymmetric error bars in log space
+                # Cap error bars at MAX_LOG_ERROR to prevent huge bars when unc >= xs
+                MAX_LOG_ERROR = 2.0  # Maximum 2 orders of magnitude
+
                 xs_valid = xs[valid_unc]
                 unc_valid = unc[valid_unc]
                 log_xs_valid = log_xs[valid_unc]
                 filt_log_E_valid = filt_log_E[valid_unc]
 
-                # Upper error: log10(xs + unc) - log10(xs)
+                # Upper error: log10(xs + unc) - log10(xs), capped
                 log_upper = np.log10(np.clip(xs_valid + unc_valid, 1e-30, None)) - log_xs_valid
-                # Lower error: log10(xs) - log10(xs - unc), clamped
-                log_lower = log_xs_valid - np.log10(np.clip(xs_valid - unc_valid, 1e-30, None))
+                log_upper = np.clip(log_upper, 0, MAX_LOG_ERROR)
+
+                # Lower error: when xs - unc <= 0, cap at MAX_LOG_ERROR
+                lower_vals = xs_valid - unc_valid
+                log_lower = np.where(
+                    lower_vals > 0,
+                    log_xs_valid - np.log10(lower_vals),
+                    MAX_LOG_ERROR  # Cap when uncertainty >= value
+                )
+                log_lower = np.clip(log_lower, 0, MAX_LOG_ERROR)
 
                 ax.errorbar(
                     filt_log_E_valid, log_xs_valid,
