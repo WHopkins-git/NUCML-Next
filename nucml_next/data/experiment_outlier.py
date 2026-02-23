@@ -184,15 +184,20 @@ class ExperimentOutlierDetector:
             # No Entry column - assign unique ID per group
             result['experiment_id'] = 'unknown'
 
-        # Group by (Z, A, MT)
-        groups = list(result.groupby(['Z', 'A', 'MT']))
+        # Group by (Z, A, MT) — include Projectile when available so that
+        # different projectile-induced reactions get separate GP fits.
+        group_cols = ['Z', 'A', 'MT']
+        if 'Projectile' in result.columns and result['Projectile'].notna().any():
+            group_cols.append('Projectile')
+
+        groups = list(result.groupby(group_cols))
         n_groups = len(groups)
         self._stats['total_groups'] = n_groups
         self._stats['total_points'] = len(df)
 
         logger.info(
-            f"Experiment outlier detection: {n_groups:,} groups, "
-            f"{len(df):,} points"
+            f"Experiment outlier detection: {n_groups:,} groups "
+            f"(groupby {group_cols}), {len(df):,} points"
         )
 
         # Check for checkpoint to resume from
@@ -217,11 +222,9 @@ class ExperimentOutlierDetector:
             iterator = tqdm(iterator, total=n_groups, desc="Experiment scoring",
                            initial=start_idx)
 
-        for i, ((z, a, mt), group_df) in iterator:
+        for i, (group_key, group_df) in iterator:
             if i < start_idx:
                 continue
-
-            group_key = (z, a, mt)
 
             # Check if already processed (from checkpoint)
             if group_key in partial_results:

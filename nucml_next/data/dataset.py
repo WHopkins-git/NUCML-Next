@@ -429,27 +429,30 @@ class NucmlDataset(TorchDataset):
             initial_rows = len(df)
             print(f"\nApplying post-load filters...")
 
-            # 1. Projectile filtering (neutrons only)
-            # Prefer explicit Projectile column if available, otherwise use MT codes
-            # ALWAYS apply this filter when projectile='neutron' to exclude charged particle reactions
-            if selection.projectile == 'neutron':
+            # 1. Projectile filtering
+            # Use explicit Projectile column if available, otherwise fall back to MT codes
+            proj_codes = selection.get_projectile_filter()
+            if proj_codes is not None:
                 before = len(df)
 
                 # Method 1: Use explicit Projectile column if available (most accurate)
                 if 'Projectile' in df.columns and df['Projectile'].notna().any():
-                    df = df[df['Projectile'] == 'n']  # 'n' = neutron in EXFOR
+                    df_proj_lower = df['Projectile'].str.lower()
+                    df = df[df_proj_lower.isin(proj_codes)]
                     removed = before - len(df)
                     if removed > 0:
-                        print(f"  [OK] Projectile filter (neutrons): Removed {removed:,} non-neutron reactions (using explicit Projectile column)")
+                        print(f"  [OK] Projectile filter ({proj_codes}): Removed {removed:,} reactions (using Projectile column)")
 
-                # Method 2: Fall back to MT code filtering (for legacy data without Projectile)
+                # Method 2: Fall back to MT code filtering (only works for neutrons)
+                elif proj_codes == ['n']:
+                    from nucml_next.data.selection import NEUTRON_MT_CODES
+                    df = df[df['MT'].isin(NEUTRON_MT_CODES)]
+                    removed = before - len(df)
+                    if removed > 0:
+                        print(f"  [OK] Projectile filter (neutrons): Removed {removed:,} reactions (inferred from MT codes)")
                 else:
-                    projectile_mt = selection.get_projectile_mt_filter()
-                    if projectile_mt is not None:
-                        df = df[df['MT'].isin(projectile_mt)]
-                        removed = before - len(df)
-                        if removed > 0:
-                            print(f"  [OK] Projectile filter (neutrons): Removed {removed:,} non-neutron reactions (inferred from MT codes)")
+                    print(f"  [!] Warning: Projectile column not found; cannot filter by {proj_codes}. "
+                          f"All projectile types included.")
 
             # 2. Phase-space holdout (rich criteria or legacy isotope list)
             holdout_cfg = getattr(selection, 'holdout_config', None)

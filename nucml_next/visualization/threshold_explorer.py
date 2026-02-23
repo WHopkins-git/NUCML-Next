@@ -86,7 +86,18 @@ _OPTIONAL_COLUMNS = [
     'experiment_outlier', 'point_outlier', 'experiment_id', 'calibration_metric',
     'Uncertainty',  # For error bars on filtered data plot
     'sf8',          # For RAW data toggle (SF8=RAW = uncorrected measurements)
+    'Projectile',   # For projectile-aware cascade (n, p, d, a, g, etc.)
 ]
+
+# ── Projectile display names ──────────────────────────────────────────────────
+_PROJECTILE_NAMES: Dict[str, str] = {
+    'n': 'n (neutron)', 'p': 'p (proton)', 'd': 'd (deuteron)',
+    't': 't (triton)', 'a': 'α (alpha)', 'g': 'γ (photon)',
+    'he3': '³He', 'HE3': '³He',
+}
+
+def _proj_str(proj: str) -> str:
+    return _PROJECTILE_NAMES.get(proj, _PROJECTILE_NAMES.get(proj.lower(), proj))
 
 
 def _isotope_str(Z: int, A: int) -> str:
@@ -147,6 +158,10 @@ class ThresholdExplorer:
         self._has_experiment_id = 'experiment_id' in self._df.columns or 'Entry' in self._df.columns
         self._has_uncertainty = 'Uncertainty' in self._df.columns
         self._has_sf8 = 'sf8' in self._df.columns
+        self._has_projectile = (
+            'Projectile' in self._df.columns
+            and self._df['Projectile'].notna().any()
+        )
 
         # Validate
         if 'z_score' not in self._df.columns:
@@ -176,10 +191,28 @@ class ThresholdExplorer:
             z: sorted(a_arr.tolist()) for z, a_arr in grouped_a.items()
         }
 
-        grouped_mt = self._df.groupby(['Z', 'A'])['MT'].unique()
+        if self._has_projectile:
+            # Projectile-aware cascade: Z → A → Proj → MT
+            grouped_proj = self._df.groupby(['Z', 'A'])['Projectile'].unique()
+            self._proj_for_za: Dict[Tuple[int, int], List[str]] = {
+                (z, a): sorted(p_arr.tolist())
+                for (z, a), p_arr in grouped_proj.items()
+            }
+            grouped_mt = self._df.groupby(['Z', 'A', 'Projectile'])['MT'].unique()
+            self._mt_for_zap: Dict[Tuple[int, int, str], List[int]] = {
+                (z, a, p): sorted(mt_arr.tolist())
+                for (z, a, p), mt_arr in grouped_mt.items()
+            }
+        else:
+            # Fallback: no Projectile column (old Parquet files)
+            self._proj_for_za = {}
+            self._mt_for_zap = {}
+
+        # Always build mt_for_za (used as fallback and when Projectile absent)
+        grouped_mt_za = self._df.groupby(['Z', 'A'])['MT'].unique()
         self._mt_for_za: Dict[Tuple[int, int], List[int]] = {
             (z, a): sorted(mt_arr.tolist())
-            for (z, a), mt_arr in grouped_mt.items()
+            for (z, a), mt_arr in grouped_mt_za.items()
         }
 
         # ── Build widgets ────────────────────────────────────────────────
@@ -205,6 +238,14 @@ class ThresholdExplorer:
             description='Mass (A):',
             style={'description_width': '80px'},
         )
+        self._w_proj = widgets.Dropdown(
+            description='Projectile:',
+            style={'description_width': '80px'},
+            disabled=not self._has_projectile,
+        )
+        if not self._has_projectile:
+            self._w_proj.options = [('All', '__all__')]
+            self._w_proj.value = '__all__'
         self._w_mt = widgets.Dropdown(
             description='Reaction (MT):',
             style={'description_width': '100px'},
@@ -246,6 +287,7 @@ class ThresholdExplorer:
         # Wire observers
         self._w_z.observe(self._on_z_change, names='value')
         self._w_a.observe(self._on_a_change, names='value')
+        self._w_proj.observe(self._on_proj_change, names='value')
         self._w_mt.observe(self._on_mt_change, names='value')
         self._w_threshold.observe(self._on_threshold_change, names='value')
         self._w_exclude_point_outliers.observe(self._on_filter_change, names='value')
@@ -255,7 +297,7 @@ class ThresholdExplorer:
 
         # Build control rows
         row1 = widgets.HBox(
-            [self._w_z, self._w_a, self._w_mt, self._w_threshold],
+            [self._w_z, self._w_a, self._w_proj, self._w_mt, self._w_threshold],
             layout=widgets.Layout(margin='0 0 5px 0'),
         )
 
@@ -304,7 +346,41 @@ class ThresholdExplorer:
     def _on_a_change(self, change) -> None:
         z = self._w_z.value
         a = self._w_a.value
-        mt_options = self._mt_for_za.get((z, a), [])
+
+        if self._has_projectile:
+            # Update Projectile options for this (Z, A)
+            proj_options = self._proj_for_za.get((z, a), [])
+            proj_labeled = [(_proj_str(p), p) for p in proj_options]
+
+            self._w_proj.unobserve(self._on_proj_change, names='value')
+            self._w_proj.options = proj_labeled
+            if proj_labeled:
+                self._w_proj.value = proj_labeled[0][1]
+            self._w_proj.observe(self._on_proj_change, names='value')
+
+            self._on_proj_change(None)
+        else:
+            # No projectile column — go directly to MT
+            mt_options = self._mt_for_za.get((z, a), [])
+            mt_labeled = [(f'{_mt_str(mt)} ({mt})', mt) for mt in mt_options]
+
+            self._w_mt.unobserve(self._on_mt_change, names='value')
+            self._w_mt.options = mt_labeled
+            if mt_labeled:
+                self._w_mt.value = mt_labeled[0][1]
+            self._w_mt.observe(self._on_mt_change, names='value')
+
+            self._on_mt_change(None)
+
+    def _on_proj_change(self, change) -> None:
+        z = self._w_z.value
+        a = self._w_a.value
+        proj = self._w_proj.value
+
+        if self._has_projectile and proj is not None:
+            mt_options = self._mt_for_zap.get((z, a, proj), [])
+        else:
+            mt_options = self._mt_for_za.get((z, a), [])
 
         mt_labeled = [(f'{_mt_str(mt)} ({mt})', mt) for mt in mt_options]
 
@@ -350,12 +426,15 @@ class ThresholdExplorer:
             - exclude_point_outliers: bool, whether to exclude z > threshold
             - exclude_discrepant_experiments: bool, whether to exclude discrepant experiments
         """
-        return {
+        settings = {
             'z_threshold': self._w_threshold.value,
             'exclude_point_outliers': self._w_exclude_point_outliers.value,
             'exclude_discrepant_experiments': self._w_exclude_discrepant.value,
             'exclude_raw': self._w_exclude_raw.value,
         }
+        if self._has_projectile:
+            settings['projectile'] = self._w_proj.value
+        return settings
 
     # =====================================================================
     # Plot orchestration
@@ -370,21 +449,27 @@ class ThresholdExplorer:
     def _update_plot(self) -> None:
         z = self._w_z.value
         a = self._w_a.value
+        proj = self._w_proj.value
         mt = self._w_mt.value
 
         if z is None or a is None or mt is None:
             return
 
-        group = self._df[
+        mask = (
             (self._df['Z'] == z)
             & (self._df['A'] == a)
             & (self._df['MT'] == mt)
-        ].copy()
+        )
+        if self._has_projectile and proj is not None and proj != '__all__':
+            mask = mask & (self._df['Projectile'] == proj)
+
+        group = self._df[mask].copy()
 
         if len(group) == 0:
             with self._output:
                 self._output.clear_output(wait=True)
-                print(f"No data for {_isotope_str(z, a)} MT={mt}")
+                proj_label = f' {_proj_str(proj)}' if self._has_projectile else ''
+                print(f"No data for {_isotope_str(z, a)}{proj_label} MT={mt}")
             return
 
         # Detect MAD fallback or single-point
@@ -410,6 +495,10 @@ class ThresholdExplorer:
         z, a, mt = int(df['Z'].iloc[0]), int(df['A'].iloc[0]), int(df['MT'].iloc[0])
         iso = _isotope_str(z, a)
         reaction = _mt_str(mt)
+        proj_label = ''
+        if self._has_projectile and 'Projectile' in df.columns and len(df) > 0:
+            proj_val = df['Projectile'].iloc[0]
+            proj_label = f' [{_proj_str(proj_val)}]'
 
         with self._output:
             self._output.clear_output(wait=True)
@@ -471,7 +560,7 @@ class ThresholdExplorer:
             )
 
             fig.suptitle(
-                f'{iso} {reaction} (MT {mt}) -- '
+                f'{iso}{proj_label} {reaction} (MT {mt}) -- '
                 f'Outlier Threshold Explorer (z = {threshold:.1f})',
                 fontsize=13, fontweight='bold', family='sans-serif',
             )
@@ -490,6 +579,10 @@ class ThresholdExplorer:
         z, a, mt = int(df['Z'].iloc[0]), int(df['A'].iloc[0]), int(df['MT'].iloc[0])
         iso = _isotope_str(z, a)
         reaction = _mt_str(mt)
+        proj_label = ''
+        if self._has_projectile and 'Projectile' in df.columns and len(df) > 0:
+            proj_val = df['Projectile'].iloc[0]
+            proj_label = f' [{_proj_str(proj_val)}]'
 
         with self._output:
             self._output.clear_output(wait=True)
@@ -571,7 +664,7 @@ class ThresholdExplorer:
             ax.set_ylabel(r'$\log_{10}(\sigma)$ [b]', fontsize=11,
                           family='sans-serif')
             ax.set_title(
-                f'{iso} {reaction} (MT {mt})',
+                f'{iso}{proj_label} {reaction} (MT {mt})',
                 fontsize=12, fontweight='bold', family='sans-serif',
             )
             ax.legend(fontsize=9, frameon=False)

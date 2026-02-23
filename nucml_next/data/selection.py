@@ -198,7 +198,11 @@ class DataSelection:
     enabling efficient predicate pushdown to PyArrow fragment reading.
 
     Attributes:
-        projectile: Particle type ('neutron', 'all'). Default: 'neutron'
+        projectile: Particle type filter. Default: 'neutron'
+            - 'neutron': Only neutron-induced reactions (alias for 'n')
+            - 'all': All projectiles, no filtering
+            - Single EXFOR code: 'n', 'p', 'd', 'a', 'g', 't', 'he3', etc.
+            - List of codes: ['n', 'p'], ['n', 'a', 'd']
         energy_min: Minimum energy in eV. Default: 1e-5 eV (thermal)
         energy_max: Maximum energy in eV. Default: 2e7 eV (20 MeV)
         mt_mode: Reaction selection mode. Options:
@@ -245,8 +249,9 @@ class DataSelection:
         ... )
     """
 
-    # Projectile selection
-    projectile: str = 'neutron'  # 'neutron' or 'all'
+    # Projectile selection: 'neutron', 'all', a single code ('n','p','d','a','g'),
+    # or a list of codes (['n','p'], ['n','a','d'])
+    projectile: Union[str, List[str]] = 'neutron'
 
     # Energy range (eV)
     energy_min: float = 1e-5   # Thermal neutrons
@@ -279,9 +284,22 @@ class DataSelection:
 
     def __post_init__(self):
         """Validate configuration after initialization."""
-        # Validate projectile
-        if self.projectile not in ['neutron', 'all']:
-            raise ValueError(f"projectile must be 'neutron' or 'all', got '{self.projectile}'")
+        # Normalize projectile to canonical internal form (_projectile_codes)
+        if isinstance(self.projectile, str):
+            if self.projectile == 'neutron':
+                self._projectile_codes: Optional[List[str]] = ['n']
+            elif self.projectile == 'all':
+                self._projectile_codes = None  # no filtering
+            else:
+                self._projectile_codes = [self.projectile.lower()]
+        elif isinstance(self.projectile, (list, tuple)):
+            if not self.projectile:
+                raise ValueError("projectile list must not be empty")
+            self._projectile_codes = [p.lower() for p in self.projectile]
+        else:
+            raise ValueError(
+                f"projectile must be str or list of str, got {type(self.projectile).__name__}"
+            )
 
         # Validate energy range
         if self.energy_min <= 0:
@@ -355,17 +373,38 @@ class DataSelection:
 
         return mt_codes
 
-    def get_projectile_mt_filter(self) -> Optional[Set[int]]:
+    def get_projectile_filter(self) -> Optional[List[str]]:
+        """Return list of EXFOR projectile codes to keep, or None for all.
+
+        Examples:
+            >>> DataSelection(projectile='neutron').get_projectile_filter()
+            ['n']
+            >>> DataSelection(projectile='all').get_projectile_filter()
+            None
+            >>> DataSelection(projectile=['n', 'p']).get_projectile_filter()
+            ['n', 'p']
         """
-        Get MT codes associated with selected projectile.
+        return self._projectile_codes
+
+    def get_projectile_mt_filter(self) -> Optional[Set[int]]:
+        """Get MT codes associated with selected projectile.
+
+        .. deprecated::
+            Use :meth:`get_projectile_filter` instead — it returns explicit
+            projectile codes which are matched against the Projectile column.
+            This method only works for neutron selection.
 
         Returns:
-            Set of MT codes for projectile, or None if 'all'
+            Set of MT codes for neutron projectile, or None if 'all'
         """
-        if self.projectile == 'neutron':
+        if self._projectile_codes == ['n']:
             return NEUTRON_MT_CODES
-        else:
+        elif self._projectile_codes is None:
             return None  # No filtering
+        else:
+            # Non-neutron specific codes: MT-based filtering is unreliable,
+            # caller should use get_projectile_filter() with the Projectile column
+            return None
 
     def should_exclude_isotope(self, z: int, a: int) -> bool:
         """
@@ -384,9 +423,17 @@ class DataSelection:
 
     def __repr__(self) -> str:
         """Readable representation of selection criteria."""
+        # Human-readable projectile description
+        if self._projectile_codes is None:
+            proj_desc = 'all (no filtering)'
+        elif self._projectile_codes == ['n']:
+            proj_desc = 'neutron (n)'
+        else:
+            proj_desc = ', '.join(self._projectile_codes)
+
         lines = [
             "DataSelection(",
-            f"  Projectile: {self.projectile}",
+            f"  Projectile: {proj_desc}",
             f"  Energy: {self.energy_min:.2e} - {self.energy_max:.2e} eV",
             f"  MT mode: {self.mt_mode}",
         ]
