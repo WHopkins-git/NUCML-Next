@@ -83,7 +83,15 @@ SF8_EXCLUDE_OTHER = {
     'ALF',    # alpha = sigma_gamma / sigma_f (ratio)
     'RES',    # Resonance integral (integrated over energy)
     'G',      # g-factor modified (Westcott convention)
+    'S0',     # S-wave neutron strength function (resonance parameter, eV^-1/2)
+    '2G',     # 2g*Gamma_n^0 spin-statistical factor (resonance parameter)
+    'RM',     # R-Matrix parameters (model fit, not direct measurement)
 }
+# NOTE: RAW (uncorrected data), TTA (thick-target approximation), and
+# SDT (measurement technique tag) are intentionally KEPT in the dataset.
+# RAW = real measurements before corrections (69K points);
+# TTA = valid measurement technique for charged particles (17K);
+# SDT = measurement technique descriptor, not a data modifier (2.4K).
 
 # Default: Tiers 1 + 2 (safe, unambiguous exclusions)
 SF8_EXCLUDE_DEFAULT = SF8_EXCLUDE_ABSOLUTE | SF8_EXCLUDE_AVERAGED
@@ -112,14 +120,27 @@ SF9_EXCLUDE = {
 # SF5 branch codes that modify what's being measured
 # =====================================================================
 SF5_EXCLUDE = {
+    # ── Original branch codes ──
     'PRE',    # Pre-neutron-emission (prompt fission, not total)
     'SEC',    # Secondary (post-neutron-emission)
     'TER',    # Ternary (ternary fission)
     'QTR',    # Quaternary
     'DL',     # Delayed (delayed neutrons, not total)
     'PAR',    # Partial (partial cross section to specific level)
-    # Note: PAR is debatable -- it IS a valid cross section, just not total.
-    # Include it for consistency with IAEA Data Explorer default behaviour.
+    # ── Fission-yield branch codes ──
+    'CUM',    # Cumulative yield
+    '(CUM)',  # Cumulative yield (EXFOR bracket notation)
+    '(CUM)/M+',  # Cumulative including metastable
+    'CHN',    # Chain yield
+    'IND',    # Independent yield
+    'UNW',    # Unweighted
+    # ── Level-specific / metastable codes ──
+    '(M)',    # Metastable state only
+    'M+',     # Metastable + ground
+    'EXL',    # Exclusive (specific channel)
+    'POT',    # Potential scattering
+    # ── Numeric level codes (partial XS to excited states) ──
+    '1', '2', '3', '4',
 }
 
 # =====================================================================
@@ -477,8 +498,11 @@ class MetadataFilter:
         sf8 = sf8.strip().upper() if isinstance(sf8, str) and sf8.strip() else None
         sf9 = sf9.strip().upper() if isinstance(sf9, str) and sf9.strip() else None
 
-        is_relative = sf8 in SF8_EXCLUDE_ABSOLUTE
-        is_averaged = sf8 in SF8_EXCLUDE_AVERAGED
+        # Handle compound SF8 codes (e.g. "BRS/REL") by splitting on "/"
+        sf8_tokens = set(sf8.split('/')) if sf8 else set()
+        is_relative = bool(sf8_tokens & SF8_EXCLUDE_ABSOLUTE)
+        is_averaged = bool(sf8_tokens & SF8_EXCLUDE_AVERAGED)
+        is_other_modified = bool(sf8_tokens & SF8_EXCLUDE_OTHER)
         is_ratio = sf6 is not None and 'RAT' in sf6
         is_partial = sf5 in SF5_EXCLUDE if sf5 else False
         is_non_xs = sf6 not in SF6_ACCEPT if sf6 else False
@@ -488,9 +512,10 @@ class MetadataFilter:
             not is_relative
             and not is_averaged
             and not is_ratio
+            and not is_partial
             and not is_non_xs
             and not is_non_experimental
-            and sf8 not in SF8_EXCLUDE_OTHER
+            and not is_other_modified
         )
 
         return {
@@ -593,19 +618,25 @@ class MetadataFilter:
                 df.loc[df[col].isin(['', 'NONE', 'NAN', 'NULL']), col] = None
 
         # Classification flags
-        df['is_relative'] = df['sf8'].isin(SF8_EXCLUDE_ABSOLUTE)
-        df['is_averaged'] = df['sf8'].isin(SF8_EXCLUDE_AVERAGED)
+        # SF8: compound codes like "BRS/REL" must be split on "/" and each
+        # token checked independently (isin() only matches exact strings).
+        sf8_split = df['sf8'].fillna('').str.split('/')
+        sf8_exploded = sf8_split.explode()
+        df['is_relative'] = sf8_exploded.isin(SF8_EXCLUDE_ABSOLUTE).groupby(level=0).any()
+        df['is_averaged'] = sf8_exploded.isin(SF8_EXCLUDE_AVERAGED).groupby(level=0).any()
+        df['is_other_modified'] = sf8_exploded.isin(SF8_EXCLUDE_OTHER).groupby(level=0).any()
+
         df['is_ratio'] = df['sf6'].fillna('').str.contains('RAT', na=False)
         df['is_partial'] = df['sf5'].isin(SF5_EXCLUDE)
         df['is_non_xs'] = ~df['sf6'].isin(SF6_ACCEPT) & df['sf6'].notna()
         df['is_non_experimental'] = df['sf9'].isin(SF9_EXCLUDE)
-        df['is_other_modified'] = df['sf8'].isin(SF8_EXCLUDE_OTHER)
 
         # Pure = experimental, absolute, point-wise cross section, no modifiers
         df['is_pure'] = (
             ~df['is_relative']
             & ~df['is_averaged']
             & ~df['is_ratio']
+            & ~df['is_partial']
             & ~df['is_non_xs']
             & ~df['is_non_experimental']
             & ~df['is_other_modified']

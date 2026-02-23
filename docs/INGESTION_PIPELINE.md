@@ -126,12 +126,108 @@ different units or meaning than point-wise absolute cross sections:
 | SF6 | Whitelist | `SIG`, `WID` |
 | SF8 Tier 1 | Exclude | `REL`, `RAT`, `RTE`, `FCT` |
 | SF8 Tier 2 | Exclude | `MXW`, `SPA`, `FIS`, `AV`, `BRA`, `BRS` |
-| SF8 Tier 3 | Exclude | `ETA`, `ALF`, `RES`, `G` |
-| SF5 | Exclude | `PRE`, `SEC`, `TER`, `QTR`, `DL`, `PAR` |
+| SF8 Tier 3 | Exclude | `ETA`, `ALF`, `RES`, `G`, `S0`, `2G`, `RM` |
+| SF5 | Exclude | `PRE`, `SEC`, `TER`, `QTR`, `DL`, `PAR`, `CUM`, `(CUM)`, `(CUM)/M+`, `CHN`, `IND`, `UNW`, `(M)`, `M+`, `EXL`, `POT`, `1`-`4` |
 | SF9 | Exclude | `CALC`, `DERIV`, `EVAL`, `RECOM` |
 | SPSDD | Exclude | `'1'` (superseded), `'D'` (deprecated) |
 
 Default filtering applies SF8 Tiers 1+2 plus all SF5, SF6, SF9, and SPSDD rules.
+
+**Compound SF8 handling:** EXFOR compound modifiers like `BRS/REL` or `BRA/MSC` are split on `/`
+and each token is checked independently. For example, `BRS/REL` matches both the Tier 2 `BRS`
+(bremsstrahlung) and Tier 1 `REL` (relative) rules.
+
+### Intentionally Kept SF8 Codes
+
+These SF8 modifiers are present in the dataset but are **not excluded** by the filter:
+
+| Code | Count (approx.) | Meaning | Rationale for Keeping |
+|------|-----------------|---------|----------------------|
+| `RAW` | ~69K | Uncorrected (no dead-time, self-absorption corrections) | Real experimental measurements; may have systematic offsets but are valid data. Toggle ON/OFF in ThresholdExplorer. |
+| `TTA` | ~17K | Thick-Target Approximation | Valid measurement technique for charged-particle reactions. The cross section is correct for the target conditions. |
+| `SDT` | ~2.4K | Subtraction of a reference spectrum (measurement technique tag) | Describes the data-reduction method, not a modification of the physical quantity. |
+
+### EXFOR Code Reference
+
+Comprehensive reference of EXFOR REACTION subfield codes encountered in the database,
+their positions, physical meaning, and filter status.
+
+**SF5 (Branch/Qualifier) — Position 5 after residual nucleus:**
+
+| Code | Meaning | Filter Status |
+|------|---------|---------------|
+| `PRE` | Pre-neutron-emission (prompt fission) | **Excluded** |
+| `SEC` | Secondary (post-neutron-emission) | **Excluded** |
+| `TER` | Ternary fission | **Excluded** |
+| `QTR` | Quaternary fission | **Excluded** |
+| `DL` | Delayed (delayed neutrons, not total) | **Excluded** |
+| `PAR` | Partial (cross section to specific level) | **Excluded** |
+| `CUM` | Cumulative yield | **Excluded** |
+| `(CUM)` | Cumulative yield (EXFOR bracket notation) | **Excluded** |
+| `(CUM)/M+` | Cumulative including metastable | **Excluded** |
+| `CHN` | Chain yield | **Excluded** |
+| `IND` | Independent yield | **Excluded** |
+| `UNW` | Unweighted average | **Excluded** |
+| `(M)` | Metastable state only | **Excluded** |
+| `M+` | Metastable + ground | **Excluded** |
+| `EXL` | Exclusive (specific exit channel) | **Excluded** |
+| `POT` | Potential scattering | **Excluded** |
+| `1`-`4` | Numeric level (partial XS to specific excited state) | **Excluded** |
+| *(empty)* | No branch qualifier (total cross section) | **Kept** |
+
+**SF6 (Quantity Parameter) — Position 6:**
+
+| Code | Meaning | Filter Status |
+|------|---------|---------------|
+| `SIG` | Cross section | **Kept** (whitelist) |
+| `WID` | Resonance width | **Kept** (whitelist) |
+| `SIG/RAT` | Cross section ratio | **Excluded** |
+| `DA` | Differential d-sigma/d-Omega | **Excluded** (not in whitelist) |
+| `DE` | Energy differential d-sigma/dE | **Excluded** |
+| `FY` | Fission yield | **Excluded** |
+| `NU` | Neutron multiplicity | **Excluded** |
+| `RI` | Resonance integral | **Excluded** |
+| `ARE` | Resonance area | **Excluded** |
+
+**SF8 (Modifier) — Position 8:**
+
+| Code | Tier | Meaning | Filter Status |
+|------|------|---------|---------------|
+| `REL` | 1 | Relative measurement (arbitrary units) | **Excluded** |
+| `RAT` | 1 | Ratio to another quantity | **Excluded** |
+| `RTE` | 1 | Rate (sigma * v) | **Excluded** |
+| `FCT` | 1 | Arbitrary factor applied | **Excluded** |
+| `MXW` | 2 | Maxwellian-averaged (E = kT) | **Excluded** |
+| `SPA` | 2 | Spectrum-averaged (reactor spectrum) | **Excluded** |
+| `FIS` | 2 | Fission-spectrum averaged | **Excluded** |
+| `AV` | 2 | Averaged over energy interval | **Excluded** |
+| `BRA` | 2 | Bremsstrahlung-spectrum weighted | **Excluded** |
+| `BRS` | 2 | Bremsstrahlung-spectrum weighted (4-pi) | **Excluded** |
+| `ETA` | 3 | eta = nu * sigma_f / sigma_a | **Excluded** |
+| `ALF` | 3 | alpha = sigma_gamma / sigma_f | **Excluded** |
+| `RES` | 3 | Resonance integral | **Excluded** |
+| `G` | 3 | g-factor modified (Westcott) | **Excluded** |
+| `S0` | 3 | S-wave neutron strength function (eV^-1/2) | **Excluded** |
+| `2G` | 3 | 2g * Gamma_n^0 spin-statistical factor | **Excluded** |
+| `RM` | 3 | R-Matrix parameters (model fit) | **Excluded** |
+| `RAW` | — | Uncorrected experimental data | **Kept** (toggle in ThresholdExplorer) |
+| `TTA` | — | Thick-Target Approximation | **Kept** (valid technique) |
+| `SDT` | — | Measurement technique subtraction tag | **Kept** (technique descriptor) |
+| *(empty)* | — | No modifier (standard measurement) | **Kept** |
+
+**SF9 (Data Type) — Position 9:**
+
+| Code | Meaning | Filter Status |
+|------|---------|---------------|
+| `EXP` | Experimental | **Kept** |
+| `CALC` | Calculated (theoretical) | **Excluded** |
+| `DERIV` | Derived from other measurements | **Excluded** |
+| `EVAL` | Evaluated value | **Excluded** |
+| `RECOM` | Recommended value | **Excluded** |
+| *(empty)* | Not specified (assumed experimental) | **Kept** |
+
+**Compound codes:** Common compound SF8 codes like `BRS/REL`, `BRA/REL`, `BRA/MSC`, `SDT/AV`,
+and `SQ/S0` are split on `/` and each token is checked against the exclusion sets above.
 
 ### CLI Flags
 

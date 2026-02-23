@@ -85,6 +85,7 @@ _REQUIRED_COLUMNS = [
 _OPTIONAL_COLUMNS = [
     'experiment_outlier', 'point_outlier', 'experiment_id', 'calibration_metric',
     'Uncertainty',  # For error bars on filtered data plot
+    'sf8',          # For RAW data toggle (SF8=RAW = uncorrected measurements)
 ]
 
 
@@ -145,6 +146,7 @@ class ThresholdExplorer:
         self._has_experiment_outlier = 'experiment_outlier' in self._df.columns
         self._has_experiment_id = 'experiment_id' in self._df.columns or 'Entry' in self._df.columns
         self._has_uncertainty = 'Uncertainty' in self._df.columns
+        self._has_sf8 = 'sf8' in self._df.columns
 
         # Validate
         if 'z_score' not in self._df.columns:
@@ -234,6 +236,12 @@ class ThresholdExplorer:
             style={'description_width': 'initial'},
             disabled=not self._has_experiment_id,
         )
+        self._w_exclude_raw = widgets.Checkbox(
+            value=False,
+            description='Exclude RAW data',
+            style={'description_width': 'initial'},
+            disabled=not self._has_sf8,
+        )
 
         # Wire observers
         self._w_z.observe(self._on_z_change, names='value')
@@ -243,6 +251,7 @@ class ThresholdExplorer:
         self._w_exclude_point_outliers.observe(self._on_filter_change, names='value')
         self._w_exclude_discrepant.observe(self._on_filter_change, names='value')
         self._w_color_by_experiment.observe(self._on_experiment_toggle, names='value')
+        self._w_exclude_raw.observe(self._on_filter_change, names='value')
 
         # Build control rows
         row1 = widgets.HBox(
@@ -255,11 +264,23 @@ class ThresholdExplorer:
             [
                 self._w_exclude_point_outliers,
                 self._w_exclude_discrepant,
+                self._w_exclude_raw,
                 self._w_color_by_experiment,
             ],
-            layout=widgets.Layout(margin='0 0 10px 0'),
+            layout=widgets.Layout(margin='0 0 5px 0'),
         )
-        self._ui = widgets.VBox([row1, row2, self._output])
+
+        # Help text explaining RAW data and discrepant experiments
+        help_text = widgets.HTML(
+            value=(
+                '<div style="font-size:11px; color:#555; margin:0 0 8px 5px; line-height:1.4;">'
+                '<b>RAW</b> = uncorrected experimental measurements (SF8=RAW); real data but may have systematic offsets. '
+                '<b>Discrepant experiments</b> = entire EXFOR entries whose GP posterior deviates from the multi-experiment consensus.'
+                '</div>'
+            ),
+        )
+
+        self._ui = widgets.VBox([row1, row2, help_text, self._output])
 
         # Initialise cascade (triggers A -> MT -> plot)
         self._on_z_change(None)
@@ -333,11 +354,18 @@ class ThresholdExplorer:
             'z_threshold': self._w_threshold.value,
             'exclude_point_outliers': self._w_exclude_point_outliers.value,
             'exclude_discrepant_experiments': self._w_exclude_discrepant.value,
+            'exclude_raw': self._w_exclude_raw.value,
         }
 
     # =====================================================================
     # Plot orchestration
     # =====================================================================
+
+    def _is_raw(self, df: pd.DataFrame) -> np.ndarray:
+        """Return boolean mask for rows where sf8 contains 'RAW'."""
+        if not self._has_sf8 or 'sf8' not in df.columns:
+            return np.zeros(len(df), dtype=bool)
+        return df['sf8'].fillna('').str.contains('RAW', na=False).values
 
     def _update_plot(self) -> None:
         z = self._w_z.value
@@ -886,6 +914,7 @@ class ThresholdExplorer:
             # Only compute masks for ENABLED filters
             exclude_points = self._w_exclude_point_outliers.value
             exclude_exp = self._w_exclude_discrepant.value
+            exclude_raw = self._w_exclude_raw.value
 
             # Point outlier mask: only if filter is enabled
             point_outlier_mask = (
@@ -900,8 +929,14 @@ class ThresholdExplorer:
                 else np.zeros(len(df), dtype=bool)
             )
 
+            # RAW data mask: only if filter is enabled
+            raw_mask = (
+                self._is_raw(df) if exclude_raw
+                else np.zeros(len(df), dtype=bool)
+            )
+
             # Compute what will be removed vs retained
-            will_be_removed = point_outlier_mask | exp_outlier_mask
+            will_be_removed = point_outlier_mask | exp_outlier_mask | raw_mask
             retained_mask = ~will_be_removed
 
             # 1. Retained points: translucent background
@@ -989,6 +1024,9 @@ class ThresholdExplorer:
 
         if self._w_exclude_discrepant.value and 'experiment_outlier' in df.columns:
             mask &= ~df['experiment_outlier'].values
+
+        if self._w_exclude_raw.value:
+            mask &= ~self._is_raw(df)
 
         filtered = df[mask].copy()
         n_filtered = len(filtered)
@@ -1268,6 +1306,8 @@ class ThresholdExplorer:
             remaining_mask &= z_scores <= threshold
         if self._w_exclude_discrepant.value and 'experiment_outlier' in df.columns:
             remaining_mask &= ~df['experiment_outlier'].values
+        if self._w_exclude_raw.value:
+            remaining_mask &= ~self._is_raw(df)
         n_remaining = int(remaining_mask.sum())
 
         stats = {
