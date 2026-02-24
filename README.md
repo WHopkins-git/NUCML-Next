@@ -49,6 +49,18 @@ Download from https://www-nds.iaea.org/amdc/
 
 **Note:** AME files are NOT used at ingestion time. They are loaded at runtime by `NucmlDataset` during feature generation.
 
+### RIPL-3 Level Density (required for Gibbs kernel)
+
+Download from https://www-nds.iaea.org/RIPL-3/levels/
+
+| File | Content |
+|------|---------|
+| `levels-param.data` | CT level density parameters (T, U0) per nuclide |
+
+Place in `data/levels/`. RIPL-3 data is evaluation-independent (nuclear structure,
+not cross-section evaluations). Required only for the physics-informed Gibbs kernel;
+the default RBF kernel works without it.
+
 ---
 
 ## Ingestion Pipeline
@@ -71,6 +83,13 @@ python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --include-non-pure
 
 # Full pipeline with GPU and checkpointing
 python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method experiment --svgp-device cuda --svgp-checkpoint-dir data/checkpoints/
+
+# Full Phase 1-4 GP stack (spline mean + Gibbs kernel + contaminated likelihood + hierarchical refit)
+python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method experiment \
+    --smooth-mean spline \
+    --kernel-type gibbs --ripl-data-path data/levels-param.data \
+    --likelihood contaminated \
+    --hierarchical-refitting
 ```
 
 See `docs/INGESTION_PIPELINE.md` for algorithm details and edge-case handling.
@@ -93,6 +112,11 @@ See `docs/INGESTION_PIPELINE.md` for algorithm details and edge-case handling.
 | `--max-subsample-points` | 15000 | Subsample large experiments for GP fitting |
 | `--svgp-checkpoint-dir` | None | Enable checkpointing for resume on interruption |
 | `--svgp-likelihood` | `student_t` | Likelihood: `student_t`, `heteroscedastic`, `gaussian` |
+| `--smooth-mean` | `constant` | Mean function: `constant` or `spline` (Phase 1) |
+| `--kernel-type` | `rbf` | GP kernel: `rbf` or `gibbs` (Phase 2, needs `--ripl-data-path`) |
+| `--ripl-data-path` | None | Path to RIPL-3 `levels-param.data` (required for `gibbs`) |
+| `--likelihood` | `gaussian` | GP likelihood: `gaussian` or `contaminated` (Phase 3) |
+| `--hierarchical-refitting` | OFF | Two-pass group-constrained refit (Phase 4) |
 | `--num-threads` | 50% of cores | CPU threads for NumPy/PyTorch linear algebra |
 | `--ame2020-dir` | None | DEPRECATED -- ignored (AME loaded at feature-generation time) |
 | `--run-svgp` | OFF | DEPRECATED -- use `--outlier-method svgp` instead |
@@ -103,7 +127,7 @@ See `docs/INGESTION_PIPELINE.md` for algorithm details and edge-case handling.
 ```
 Entry, Z, A, N, Projectile, MT, Energy, CrossSection, Uncertainty,
 Energy_Uncertainty, log_E, log_sigma, sf5, sf6, sf8, sf9, is_pure, data_type,
-gp_mean, gp_std, z_score, experiment_outlier, point_outlier, calibration_metric, experiment_id,
+gp_mean, gp_std, z_score, experiment_outlier, point_outlier, calibration_metric, outlier_probability, experiment_id,
 Year, Author, ReactionType, FullCode, NDataPoints
 ```
 
@@ -163,7 +187,14 @@ Two methods are available via `--outlier-method`:
 | `calibration_metric` | float | Per-experiment Wasserstein distance |
 | `experiment_id` | str | EXFOR Entry identifier |
 
-See `docs/INGESTION_PIPELINE.md` for algorithm details and edge-case handling.
+**Advanced options:**
+
+- **Smooth mean** (`SmoothMeanConfig`): Data-driven consensus trend from pooled EXFOR data. Opt-in via `smooth_mean_type='spline'`. Removes gross energy dependence before GP fitting.
+- **Gibbs kernel** (`KernelConfig`): Physics-informed nonstationary kernel using RIPL-3 level density. Opt-in via `kernel_type='gibbs'`. Adapts lengthscale to nuclear resonance structure.
+- **Robust likelihood** (`LikelihoodConfig`): Contaminated normal mixture for principled outlier identification. Opt-in via `likelihood_type='contaminated'`. Assigns continuous outlier probability per point.
+- **Hierarchical refitting** (`hierarchical_refitting=True`): Two-pass fitting that constrains per-experiment hyperparameters to a group-informed feasible region. Produces more consistent GP fits across experiments within a reaction group.
+
+See `docs/INGESTION_PIPELINE.md` for algorithm details, edge-case handling, and scientific motivation.
 
 ### Interactive Threshold Explorer
 
@@ -198,7 +229,11 @@ nucml_next/
   data/            NucmlDataset, DataSelection, TransformationPipeline,
                    MetadataFilter (metadata_filter.py),
                    ExperimentOutlierDetector (experiment_outlier.py),
-                   SVGPOutlierDetector (outlier_detection.py, legacy)
+                   SVGPOutlierDetector (outlier_detection.py, legacy),
+                   KernelConfig/RBFKernel/GibbsKernel (kernels.py),
+                   RIPL3LevelDensity (ripl_loader.py),
+                   SmoothMeanConfig (smooth_mean.py),
+                   LikelihoodConfig (likelihood.py)
   baselines/       DecisionTreeEvaluator, XGBoostEvaluator
   model/           GNN-Transformer architecture
   physics/         Physics-informed and sensitivity-weighted loss

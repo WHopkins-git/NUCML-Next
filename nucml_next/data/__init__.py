@@ -82,10 +82,42 @@ def __getattr__(name):
     if name == "optimize_lengthscale_wasserstein":
         from nucml_next.data.calibration import optimize_lengthscale_wasserstein
         return optimize_lengthscale_wasserstein
+    # Smooth mean (no heavy dependencies)
+    if name == "SmoothMeanConfig":
+        from nucml_next.data.smooth_mean import SmoothMeanConfig
+        return SmoothMeanConfig
+    if name == "fit_smooth_mean":
+        from nucml_next.data.smooth_mean import fit_smooth_mean
+        return fit_smooth_mean
     # Metadata filter (no heavy dependencies)
     if name == "MetadataFilter":
         from nucml_next.data.metadata_filter import MetadataFilter
         return MetadataFilter
+    # Kernel abstraction (no heavy dependencies beyond numpy)
+    if name == "KernelConfig":
+        from nucml_next.data.kernels import KernelConfig
+        return KernelConfig
+    if name == "RBFKernel":
+        from nucml_next.data.kernels import RBFKernel
+        return RBFKernel
+    if name == "GibbsKernel":
+        from nucml_next.data.kernels import GibbsKernel
+        return GibbsKernel
+    if name == "build_kernel":
+        from nucml_next.data.kernels import build_kernel
+        return build_kernel
+    # RIPL-3 level density loader (no heavy dependencies)
+    if name == "RIPL3LevelDensity":
+        from nucml_next.data.ripl_loader import RIPL3LevelDensity
+        return RIPL3LevelDensity
+    # Kernel-aware calibration functions
+    if name == "optimize_kernel_wasserstein":
+        from nucml_next.data.calibration import optimize_kernel_wasserstein
+        return optimize_kernel_wasserstein
+    # Likelihood (Phase 3)
+    if name == "LikelihoodConfig":
+        from nucml_next.data.likelihood import LikelihoodConfig
+        return LikelihoodConfig
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
@@ -122,6 +154,18 @@ __all__ = [
     "prepare_log_uncertainties",
     "compute_wasserstein_calibration",
     "optimize_lengthscale_wasserstein",
+    # Smooth mean
+    "SmoothMeanConfig",
+    "fit_smooth_mean",
     # Metadata filter
     "MetadataFilter",
+    # Kernel abstraction (Phase 2)
+    "KernelConfig",
+    "RBFKernel",
+    "GibbsKernel",
+    "build_kernel",
+    "RIPL3LevelDensity",
+    "optimize_kernel_wasserstein",
+    # Likelihood (Phase 3)
+    "LikelihoodConfig",
 ]

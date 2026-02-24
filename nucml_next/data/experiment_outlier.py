@@ -22,6 +22,8 @@ Output columns:
     - point_outlier: bool - Individual point anomalous within its experiment
     - z_score: float - Continuous anomaly score (backward compat)
     - calibration_metric: float - Per-experiment Wasserstein distance
+    - outlier_probability: float - Per-point outlier probability from
+        contaminated normal EM (NaN when contaminated likelihood not used)
     - experiment_id: str - EXFOR Entry identifier
     - log_E, log_sigma, gp_mean, gp_std: float - Backward compat columns
 
@@ -73,6 +75,25 @@ class ExperimentOutlierConfig:
         streaming_output: Optional path to write results incrementally to Parquet
             instead of holding in memory. Significantly reduces peak memory for
             large datasets (>5M points).
+        ripl_data_path: Path to RIPL-3 ``levels-param.data`` file.
+            Required for Gibbs kernel (``kernel_config.kernel_type='gibbs'``).
+            If None, the Gibbs kernel will fall back to RBF.
+            Only used when ``gp_config.kernel_config`` is set.
+        s_n_column: DataFrame column name for neutron separation energy
+            (MeV). If present, used directly; otherwise estimated from
+            AME2020 data or a built-in fallback table.
+        hierarchical_refitting: Enable two-pass hierarchical fitting (Phase 4).
+            When True, Pass 2 extracts group-level hyperparameter statistics
+            from Pass 1 fitted GPs, then re-fits each experiment with
+            constrained bounds and shared outputscale. Default False.
+        min_experiments_for_refit: Minimum number of successfully fitted GPs
+            required in a group before hierarchical refitting is attempted.
+            With fewer GPs, IQR-based bounds are unreliable. Default 3.
+        refit_bounds_iqr_margin: IQR multiplier for computing parameter bounds
+            in Pass 2.  Bounds are ``[Q1 - margin*IQR, Q3 + margin*IQR]``.
+            Default 1.0.
+        refit_share_outputscale: When True (default), Pass 2 sets each GP's
+            outputscale to the group median before re-fitting.
     """
     gp_config: ExactGPExperimentConfig = field(default_factory=ExactGPExperimentConfig)
     consensus_config: ConsensusConfig = field(default_factory=ConsensusConfig)
@@ -84,6 +105,13 @@ class ExperimentOutlierConfig:
     n_workers: Optional[int] = None
     clear_caches_after_group: bool = True
     streaming_output: Optional[str] = None
+    ripl_data_path: Optional[str] = None
+    s_n_column: Optional[str] = None
+    # Phase 4: Hierarchical experiment structure
+    hierarchical_refitting: bool = False
+    min_experiments_for_refit: int = 3
+    refit_bounds_iqr_margin: float = 1.0
+    refit_share_outputscale: bool = True
 
 
 class ExperimentOutlierDetector:
@@ -120,11 +148,18 @@ class ExperimentOutlierDetector:
             'discrepant_experiments': 0,   # Experiments flagged as discrepant
             'total_points': 0,
             'total_groups': 0,
+            # Phase 4: Hierarchical refitting
+            'hierarchical_refits': 0,          # Experiments successfully refit
+            'hierarchical_groups': 0,          # Groups where Pass 2 ran
+            'hierarchical_skipped_groups': 0,  # Groups skipped (too few GPs)
         }
 
         # Cached fitted GPs per group (for diagnostics)
         self._fitted_gps: Dict[Tuple, Dict[str, ExactGPExperiment]] = {}
         self._consensus_builders: Dict[Tuple, ConsensusBuilder] = {}
+
+        # RIPL-3 loader (lazy, only when Gibbs kernel is configured)
+        self._ripl_loader = None
 
     def score_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
         """Score all data points with per-experiment GP z-scores.
@@ -174,6 +209,7 @@ class ExperimentOutlierDetector:
         result['experiment_outlier'] = False
         result['point_outlier'] = False
         result['calibration_metric'] = np.nan
+        result['outlier_probability'] = np.nan
         result['experiment_id'] = ''
 
         # Determine experiment identifier column
@@ -248,7 +284,8 @@ class ExperimentOutlierDetector:
             else:
                 # Update result DataFrame (traditional mode)
                 for col in ['gp_mean', 'gp_std', 'z_score', 'experiment_outlier',
-                           'point_outlier', 'calibration_metric', 'experiment_id']:
+                           'point_outlier', 'calibration_metric',
+                           'outlier_probability', 'experiment_id']:
                     if col in scored.columns:
                         result.loc[scored.index, col] = scored[col].values
 
@@ -368,7 +405,7 @@ class ExperimentOutlierDetector:
         # Case 2: Single experiment
         if n_experiments == 1:
             self._stats['single_experiment_groups'] += 1
-            return self._score_single_experiment(result, experiments)
+            return self._score_single_experiment(result, experiments, group_key)
 
         # Case 3: Multiple experiments - build consensus
         self._stats['consensus_groups'] += 1
@@ -410,16 +447,60 @@ class ExperimentOutlierDetector:
 
         return result
 
+    def _assign_outlier_probabilities(
+        self,
+        result: pd.DataFrame,
+        exp_df: pd.DataFrame,
+        gp: 'ExactGPExperiment',
+        also_set_point_outlier: bool = False,
+    ) -> None:
+        """Assign outlier_probability (and optionally point_outlier) from GP.
+
+        Handles subsampled GPs by assigning only to the subsampled rows.
+        Non-subsampled rows retain NaN for outlier_probability and their
+        existing value for point_outlier (typically z-score-based).
+        """
+        if gp.outlier_probabilities is None:
+            return
+
+        if gp.subsample_indices is not None:
+            idx = exp_df.index[gp.subsample_indices]
+        else:
+            idx = exp_df.index
+
+        result.loc[idx, 'outlier_probability'] = gp.outlier_probabilities
+        if also_set_point_outlier:
+            result.loc[idx, 'point_outlier'] = gp.outlier_probabilities > 0.5
+
     def _score_single_experiment(
         self,
         df_group: pd.DataFrame,
         experiments: Dict[str, pd.DataFrame],
+        group_key: Tuple[int, int, int] = None,
     ) -> pd.DataFrame:
-        """Score when only one experiment exists (no consensus possible)."""
+        """Score when only one experiment exists (no consensus possible).
+
+        **Limitation:** When ``smooth_mean_type='spline'`` is configured, the
+        smooth mean for a single-experiment group is fitted to just that
+        experiment.  If the experiment itself is biased, the mean absorbs the
+        bias and outlier detection power is reduced.  For multi-experiment
+        groups the pooled mean dilutes any single experiment's bias.  This is
+        inherent to having only one data source and can only be addressed with
+        cross-isotope information (Phase 4+).
+        """
         result = df_group.copy()
         entry_id = list(experiments.keys())[0]
         exp_df = experiments[entry_id]
         n = len(exp_df)
+
+        # Build kernel config for this group (if Gibbs kernel configured)
+        group_kernel_config = None
+        if group_key is not None:
+            Z, A = group_key[0], group_key[1]
+            S_n = None
+            if self.config.s_n_column and self.config.s_n_column in df_group.columns:
+                S_n = float(df_group[self.config.s_n_column].iloc[0])
+            group_kernel_config = self._build_kernel_config_for_group(Z, A, S_n=S_n)
 
         # Cannot flag experiment as discrepant with no comparison
         result['experiment_outlier'] = False
@@ -427,7 +508,9 @@ class ExperimentOutlierDetector:
         if n >= self.config.gp_config.min_points_for_gp:
             # Fit GP to single experiment
             try:
-                gp = self._fit_experiment_gp(exp_df)
+                gp = self._fit_experiment_gp(
+                    exp_df, kernel_config=group_kernel_config,
+                )
                 self._stats['gp_experiments'] += 1
 
                 mean, std = gp.predict(exp_df['log_E'].values)
@@ -439,6 +522,11 @@ class ExperimentOutlierDetector:
                 result.loc[exp_df.index, 'point_outlier'] = z_scores > self.config.point_z_threshold
                 result.loc[exp_df.index, 'calibration_metric'] = gp.calibration_metric or np.nan
 
+                # Populate outlier probability from contaminated EM
+                self._assign_outlier_probabilities(
+                    result, exp_df, gp, also_set_point_outlier=True,
+                )
+
             except Exception as e:
                 logger.warning(f"GP fit failed for single experiment {entry_id}: {e}")
                 return self._score_with_mad(result)
@@ -447,6 +535,162 @@ class ExperimentOutlierDetector:
             return self._score_with_mad(result)
 
         return result
+
+    # ------------------------------------------------------------------
+    # Phase 4: Hierarchical refitting helpers
+    # ------------------------------------------------------------------
+
+    def _extract_group_hyperparameters(
+        self,
+        fitted_gps: Dict[str, 'ExactGPExperiment'],
+    ) -> Optional[Dict[str, Any]]:
+        """Extract group-level hyperparameter statistics from fitted GPs.
+
+        Collects outputscale and optimisable kernel parameters from each GP,
+        then computes median, Q1 and Q3 per parameter.
+
+        Returns:
+            Dict with keys ``n_experiments``, ``outputscale_median``,
+            ``param_medians``, ``param_q1``, ``param_q3``.
+            Returns ``None`` if fewer than ``min_experiments_for_refit`` GPs.
+        """
+        gps = list(fitted_gps.values())
+        if len(gps) < self.config.min_experiments_for_refit:
+            return None
+
+        outputscales = np.array([gp._outputscale for gp in gps])
+
+        # Collect per-kernel optimisable params (shape: n_experiments × n_params)
+        param_arrays = np.array([
+            gp._kernel.get_optimizable_params() for gp in gps
+        ])  # (n_experiments, n_params)
+
+        return {
+            'n_experiments': len(gps),
+            'outputscale_median': float(np.median(outputscales)),
+            'param_medians': np.median(param_arrays, axis=0),
+            'param_q1': np.percentile(param_arrays, 25, axis=0),
+            'param_q3': np.percentile(param_arrays, 75, axis=0),
+            'n_params': param_arrays.shape[1],
+        }
+
+    def _compute_refit_bounds(
+        self,
+        group_stats: Dict[str, Any],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Compute IQR-based parameter bounds for hierarchical refit.
+
+        Bounds are ``[Q1 - margin*IQR, Q3 + margin*IQR]`` per parameter.
+
+        **Kernel-type-aware clipping:**
+        - RBF (``n_params == 1``): lower clipped to max(lower, 1e-3) —
+          lengthscale must be strictly positive.
+        - Gibbs (``n_params >= 2``): NO clipping — a₀, a₁ can be negative.
+
+        **Degenerate IQR handling:** When all experiments produce identical
+        parameters (IQR = 0), bounds are expanded to [median*0.5, median*2.0]
+        for parameters far from zero, or [median-0.5, median+0.5] for
+        parameters near zero.
+
+        Returns:
+            ``(lower, upper)`` arrays of shape ``(n_params,)``.
+        """
+        margin = self.config.refit_bounds_iqr_margin
+        q1 = group_stats['param_q1']
+        q3 = group_stats['param_q3']
+        medians = group_stats['param_medians']
+        n_params = group_stats['n_params']
+
+        iqr = q3 - q1
+        lower = q1 - margin * iqr
+        upper = q3 + margin * iqr
+
+        # Handle zero-IQR (all identical params) — expand to avoid degenerate bounds
+        for i in range(n_params):
+            if iqr[i] < 1e-12:
+                if np.abs(medians[i]) > 1.0:
+                    # Parameter far from zero: ±50% around median
+                    lower[i] = medians[i] * 0.5
+                    upper[i] = medians[i] * 2.0
+                    # Handle negative medians
+                    if lower[i] > upper[i]:
+                        lower[i], upper[i] = upper[i], lower[i]
+                else:
+                    # Parameter near zero: ±0.5
+                    lower[i] = medians[i] - 0.5
+                    upper[i] = medians[i] + 0.5
+
+        # Kernel-type-aware clipping
+        if n_params == 1:
+            # RBF: lengthscale must be positive
+            lower = np.maximum(lower, 1e-3)
+
+        # Gibbs (n_params >= 2): no clipping — a₀, a₁ can be negative
+
+        return lower, upper
+
+    def _hierarchical_refit(
+        self,
+        fitted_gps: Dict[str, 'ExactGPExperiment'],
+        group_stats: Dict[str, Any],
+        result: 'pd.DataFrame',
+        large_exps: Dict[str, 'pd.DataFrame'],
+    ) -> None:
+        """Re-fit experiments with group-informed constrained bounds.
+
+        For each GP, calls ``refit_with_constraints()`` with:
+        - Shared outputscale (group median) when ``refit_share_outputscale`` is True
+        - Parameter bounds from ``_compute_refit_bounds()``
+
+        Updates the result DataFrame in-place with new predictions.
+        Failures are non-fatal: a warning is logged and Pass 1 results
+        are preserved.
+
+        Args:
+            fitted_gps: Dict of entry_id -> fitted ExactGPExperiment from Pass 1.
+            group_stats: Group-level statistics from ``_extract_group_hyperparameters``.
+            result: The result DataFrame to update in-place.
+            large_exps: Dict of entry_id -> experiment DataFrame (for index lookup).
+        """
+        param_bounds = self._compute_refit_bounds(group_stats)
+        outputscale = (
+            group_stats['outputscale_median']
+            if self.config.refit_share_outputscale
+            else None
+        )
+
+        self._stats['hierarchical_groups'] += 1
+
+        for entry_id, gp in fitted_gps.items():
+            try:
+                gp.refit_with_constraints(
+                    outputscale=outputscale,
+                    param_bounds=param_bounds,
+                )
+                self._stats['hierarchical_refits'] += 1
+
+                # Update predictions in result DataFrame
+                exp_df = large_exps[entry_id]
+                mean, std = gp.predict(exp_df['log_E'].values)
+                z_scores = np.abs(
+                    exp_df['log_sigma'].values - mean
+                ) / np.clip(std, 1e-10, None)
+
+                result.loc[exp_df.index, 'gp_mean'] = mean
+                result.loc[exp_df.index, 'gp_std'] = std
+                result.loc[exp_df.index, 'z_score'] = z_scores
+                result.loc[exp_df.index, 'calibration_metric'] = (
+                    gp.calibration_metric or np.nan
+                )
+
+                # Update outlier probability from EM refit
+                self._assign_outlier_probabilities(result, exp_df, gp)
+
+            except Exception as e:
+                logger.warning(
+                    f"Hierarchical refit failed for experiment {entry_id}: {e}"
+                )
+                # Keep Pass 1 results — non-fatal
 
     def _score_multi_experiment(
         self,
@@ -468,11 +712,36 @@ class ExperimentOutlierDetector:
             else:
                 small_exps[entry_id] = exp_df
 
+        # Compute group-level smooth mean from ALL pooled data (before
+        # per-experiment split).  When smooth_mean_type='constant' (default)
+        # this is a no-op that returns np.mean, preserving existing behaviour.
+        group_mean_fn = None
+        sm_config = self.config.gp_config.smooth_mean_config
+        if sm_config is not None:
+            from nucml_next.data.smooth_mean import fit_smooth_mean
+            _log_E_pool = df_group['log_E'].values
+            _log_sigma_pool = df_group['log_sigma'].values
+            group_mean_fn = fit_smooth_mean(_log_E_pool, _log_sigma_pool, sm_config)
+
+        # Build kernel config with RIPL-3 interpolator for this (Z, A) group.
+        # group_key is (Z, A, MT) or (Z, A, MT, Projectile).
+        Z, A = group_key[0], group_key[1]
+
+        # Try to get S_n from the data if available
+        S_n = None
+        if self.config.s_n_column and self.config.s_n_column in df_group.columns:
+            S_n = float(df_group[self.config.s_n_column].iloc[0])
+
+        group_kernel_config = self._build_kernel_config_for_group(Z, A, S_n=S_n)
+
         # Fit GPs to large experiments
         fitted_gps: Dict[str, ExactGPExperiment] = {}
         for entry_id, exp_df in large_exps.items():
             try:
-                gp = self._fit_experiment_gp(exp_df)
+                gp = self._fit_experiment_gp(
+                    exp_df, mean_fn=group_mean_fn,
+                    kernel_config=group_kernel_config,
+                )
                 fitted_gps[entry_id] = gp
                 self._stats['gp_experiments'] += 1
 
@@ -485,11 +754,24 @@ class ExperimentOutlierDetector:
                 result.loc[exp_df.index, 'z_score'] = z_scores
                 result.loc[exp_df.index, 'calibration_metric'] = gp.calibration_metric or np.nan
 
+                # Populate outlier probability from contaminated EM
+                self._assign_outlier_probabilities(result, exp_df, gp)
+
             except Exception as e:
                 logger.warning(f"GP fit failed for experiment {entry_id}: {e}")
                 # Fall back to MAD for this experiment
                 self._stats['small_experiments'] += 1
                 small_exps[entry_id] = exp_df
+
+        # Pass 2: Hierarchical refitting (opt-in, Phase 4)
+        if self.config.hierarchical_refitting:
+            group_stats = self._extract_group_hyperparameters(fitted_gps)
+            if group_stats is not None:
+                self._hierarchical_refit(
+                    fitted_gps, group_stats, result, large_exps,
+                )
+            else:
+                self._stats['hierarchical_skipped_groups'] += 1
 
         # Build consensus if we have >= 2 fitted GPs
         if len(fitted_gps) >= self.config.consensus_config.min_experiments_for_consensus:
@@ -580,16 +862,150 @@ class ExperimentOutlierDetector:
                 for col in ['gp_mean', 'gp_std', 'z_score', 'point_outlier']:
                     result.loc[exp_df.index, col] = scored[col].values
 
-        # Compute point outliers based on z-scores
-        valid_z = np.isfinite(result['z_score'])
-        result.loc[valid_z, 'point_outlier'] = (
-            result.loc[valid_z, 'z_score'] > self.config.point_z_threshold
+        # Compute point outliers:
+        # If contaminated likelihood produced outlier_probability, use that.
+        # Otherwise fall back to z-score threshold.
+        has_outlier_prob = np.isfinite(result['outlier_probability'])
+        if has_outlier_prob.any():
+            result.loc[has_outlier_prob, 'point_outlier'] = (
+                result.loc[has_outlier_prob, 'outlier_probability'] > 0.5
+            )
+        # z-score fallback for points without outlier probability
+        no_outlier_prob = ~has_outlier_prob & np.isfinite(result['z_score'])
+        result.loc[no_outlier_prob, 'point_outlier'] = (
+            result.loc[no_outlier_prob, 'z_score'] > self.config.point_z_threshold
         )
 
         return result
 
-    def _fit_experiment_gp(self, exp_df: pd.DataFrame) -> ExactGPExperiment:
+    def _ensure_ripl_loaded(self) -> None:
+        """Lazy-load RIPL-3 data on first use (only if Gibbs kernel configured)."""
+        if self._ripl_loader is not None:
+            return
+
+        kc = self.config.gp_config.kernel_config
+        if kc is None or kc.kernel_type != 'gibbs':
+            return
+
+        from nucml_next.data.ripl_loader import RIPL3LevelDensity
+
+        path = self.config.ripl_data_path
+        self._ripl_loader = RIPL3LevelDensity(path)
+
+        if self._ripl_loader.n_nuclides > 0:
+            logger.info(
+                f"RIPL-3 loaded: {self._ripl_loader.n_nuclides} nuclides "
+                f"(for Gibbs kernel)"
+            )
+        else:
+            logger.warning(
+                "RIPL-3 data not found or empty; Gibbs kernel will "
+                "fall back to RBF for all groups"
+            )
+
+    def _build_kernel_config_for_group(
+        self,
+        Z: int,
+        A: int,
+        S_n: Optional[float] = None,
+    ) -> Optional[Any]:
+        """Build a kernel config with injected RIPL-3 interpolator for (Z, A).
+
+        If the base kernel_config is None (default RBF), returns None
+        (preserving exact backward-compatible behaviour).
+
+        If Gibbs kernel is configured, injects the RIPL-3 log_D interpolator
+        for the compound nucleus (Z, A+1) — since neutron capture on target
+        (Z, A) produces compound nucleus (Z, A+1).
+
+        Args:
+            Z: Proton number of the **target** nucleus.
+            A: Mass number of the **target** nucleus.
+            S_n: Neutron separation energy in MeV.  If None, a rough
+                estimate is used.
+
+        Returns:
+            KernelConfig with RIPL-3 interpolator injected, or None.
+        """
+        from dataclasses import replace
+
+        base_kc = self.config.gp_config.kernel_config
+        if base_kc is None:
+            return None
+
+        if base_kc.kernel_type != 'gibbs':
+            return base_kc
+
+        # Ensure RIPL-3 is loaded
+        self._ensure_ripl_loaded()
+        if self._ripl_loader is None:
+            return base_kc
+
+        # Compound nucleus = target + neutron
+        Z_compound = Z
+        A_compound = A + 1
+
+        # Get S_n (neutron separation energy)
+        if S_n is None:
+            # Default: use a rough estimate (~8 MeV for medium nuclei,
+            # ~6 MeV for actinides). This is used only if S_n is not
+            # provided in the DataFrame.
+            S_n = self._estimate_s_n(Z, A)
+
+        # Get RIPL-3 interpolator for compound nucleus
+        interpolator = self._ripl_loader.get_log_D_interpolator(
+            Z_compound, A_compound, S_n=S_n
+        )
+
+        if interpolator is None:
+            logger.debug(
+                f"No RIPL-3 data for compound ({Z_compound}, {A_compound}); "
+                f"falling back to RBF for this group"
+            )
+            return base_kc
+
+        # Inject interpolator into a copy of the kernel config
+        return replace(base_kc, ripl_log_D_interpolator=interpolator)
+
+    def _estimate_s_n(self, Z: int, A: int) -> float:
+        """Rough estimate of neutron separation energy S_n in MeV.
+
+        Uses a simple empirical formula.  This is only a fallback when
+        S_n is not provided.  For accurate results, pass S_n from AME2020.
+
+        Returns S_n in MeV.
+        """
+        # Simple parabolic approximation:
+        # S_n ≈ 15.5 - 0.017*A for beta-stable nuclei (decent for A > 30)
+        # with an even-odd correction
+        S_n = 15.5 - 0.017 * (A + 1)  # A+1 is compound nucleus
+
+        # Even-odd pairing correction: even-N compound nuclei have higher S_n
+        N_compound = (A + 1) - Z
+        if N_compound % 2 == 0:
+            S_n += 1.0  # Even-N: higher S_n (paired neutron)
+        else:
+            S_n -= 0.5  # Odd-N: lower S_n
+
+        # Clamp to physically reasonable range
+        S_n = max(3.0, min(S_n, 12.0))
+        return S_n
+
+    def _fit_experiment_gp(
+        self,
+        exp_df: pd.DataFrame,
+        mean_fn=None,
+        kernel_config=None,
+    ) -> ExactGPExperiment:
         """Fit ExactGP to a single experiment.
+
+        Args:
+            exp_df: DataFrame for one experiment.
+            mean_fn: Optional pre-computed mean function from pooled group
+                data.  Passed through to ``ExactGPExperiment.fit()``.
+            kernel_config: Optional kernel config with RIPL-3 interpolator
+                injected for this specific (Z, A) group.  If provided,
+                overrides ``gp_config.kernel_config`` for this experiment.
 
         If CUDA OOM occurs, automatically retries on CPU.
         """
@@ -597,10 +1013,16 @@ class ExperimentOutlierDetector:
         log_sigma = exp_df['log_sigma'].values
         log_unc = self._get_log_uncertainties(exp_df)
 
-        gp = ExactGPExperiment(self.config.gp_config)
+        # Build per-experiment GP config (with optional kernel override)
+        gp_config = self.config.gp_config
+        if kernel_config is not None and kernel_config is not gp_config.kernel_config:
+            from dataclasses import replace as dc_replace
+            gp_config = dc_replace(gp_config, kernel_config=kernel_config)
+
+        gp = ExactGPExperiment(gp_config)
 
         try:
-            gp.fit(log_E, log_sigma, log_unc)
+            gp.fit(log_E, log_sigma, log_unc, mean_fn=mean_fn)
         except RuntimeError as e:
             # Check if this is a CUDA OOM error
             error_msg = str(e).lower()
@@ -623,9 +1045,11 @@ class ExperimentOutlierDetector:
                     use_wasserstein_calibration=self.config.gp_config.use_wasserstein_calibration,
                     lengthscale_bounds=self.config.gp_config.lengthscale_bounds,
                     default_rel_uncertainty=self.config.gp_config.default_rel_uncertainty,
+                    smooth_mean_config=self.config.gp_config.smooth_mean_config,
+                    kernel_config=kernel_config or self.config.gp_config.kernel_config,
                 )
                 gp = ExactGPExperiment(cpu_config)
-                gp.fit(log_E, log_sigma, log_unc)
+                gp.fit(log_E, log_sigma, log_unc, mean_fn=mean_fn)
             else:
                 raise  # Re-raise non-OOM errors
 
@@ -662,7 +1086,7 @@ class ExperimentOutlierDetector:
         # Serialize results
         serializable_results = {}
         for key, df in results.items():
-            serializable_results[key] = {
+            data = {
                 'index': df.index.tolist(),
                 'gp_mean': df['gp_mean'].values.tolist(),
                 'gp_std': df['gp_std'].values.tolist(),
@@ -672,6 +1096,9 @@ class ExperimentOutlierDetector:
                 'calibration_metric': df['calibration_metric'].values.tolist(),
                 'experiment_id': df['experiment_id'].values.tolist(),
             }
+            if 'outlier_probability' in df.columns:
+                data['outlier_probability'] = df['outlier_probability'].values.tolist()
+            serializable_results[key] = data
 
         with open(checkpoint_path, 'wb') as f:
             pickle.dump({
@@ -707,7 +1134,7 @@ class ExperimentOutlierDetector:
             # Deserialize results
             partial_results = {}
             for key, data in checkpoint['results'].items():
-                scored_df = pd.DataFrame({
+                df_data = {
                     'gp_mean': data['gp_mean'],
                     'gp_std': data['gp_std'],
                     'z_score': data['z_score'],
@@ -715,7 +1142,10 @@ class ExperimentOutlierDetector:
                     'point_outlier': data['point_outlier'],
                     'calibration_metric': data['calibration_metric'],
                     'experiment_id': data['experiment_id'],
-                }, index=data['index'])
+                }
+                if 'outlier_probability' in data:
+                    df_data['outlier_probability'] = data['outlier_probability']
+                scored_df = pd.DataFrame(df_data, index=data['index'])
                 partial_results[key] = scored_df
 
             logger.info(f"Loaded checkpoint: group {group_idx}")

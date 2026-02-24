@@ -454,6 +454,20 @@ class NucmlDataset(TorchDataset):
                     print(f"  [!] Warning: Projectile column not found; cannot filter by {proj_codes}. "
                           f"All projectile types included.")
 
+            # 1b. Spectrum-averaged data filter (sf8-based)
+            if getattr(selection, 'exclude_spectrum_averaged', False):
+                if 'sf8' in df.columns:
+                    from nucml_next.data.selection import SPECTRUM_AVERAGED_SF8
+                    before = len(df)
+                    # Split compound sf8 codes (e.g. 'BRA/REL') and check each token
+                    sf8_tokens = df['sf8'].fillna('').str.split('/')
+                    is_spectrum_avg = sf8_tokens.explode().isin(SPECTRUM_AVERAGED_SF8).groupby(level=0).any()
+                    df = df[~is_spectrum_avg]
+                    removed = before - len(df)
+                    if removed > 0:
+                        print(f"  [OK] Spectrum-averaged filter: Removed {removed:,} "
+                              f"non-monoenergetic measurements (sf8 in MXW/SPA/FIS/...)")
+
             # 2. Phase-space holdout (rich criteria or legacy isotope list)
             holdout_cfg = getattr(selection, 'holdout_config', None)
             if holdout_cfg is not None and holdout_cfg.rules:

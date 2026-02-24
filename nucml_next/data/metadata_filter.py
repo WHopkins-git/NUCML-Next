@@ -87,11 +87,12 @@ SF8_EXCLUDE_OTHER = {
     '2G',     # 2g*Gamma_n^0 spin-statistical factor (resonance parameter)
     'RM',     # R-Matrix parameters (model fit, not direct measurement)
 }
-# NOTE: RAW (uncorrected data), TTA (thick-target approximation), and
-# SDT (measurement technique tag) are intentionally KEPT in the dataset.
-# RAW = real measurements before corrections (69K points);
-# TTA = valid measurement technique for charged particles (17K);
-# SDT = measurement technique descriptor, not a data modifier (2.4K).
+# NOTE: RAW (uncorrected data) is intentionally KEPT in the dataset.
+# RAW = real measurements before corrections (69K points).
+# SDT (d-T spectrum averaged, 2.4K) and TTA (thick-target averaged, 17K)
+# are kept during ingestion classification but excluded at load time by
+# default via DataSelection.exclude_spectrum_averaged (see selection.py
+# SPECTRUM_AVERAGED_SF8).
 
 # Default: Tiers 1 + 2 (safe, unambiguous exclusions)
 SF8_EXCLUDE_DEFAULT = SF8_EXCLUDE_ABSOLUTE | SF8_EXCLUDE_AVERAGED

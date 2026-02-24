@@ -20,7 +20,7 @@ Usage:
 import logging
 import warnings
 from dataclasses import dataclass, field
-from typing import Tuple, Optional, Dict, Any
+from typing import Tuple, Optional, Dict, Any, Callable
 
 import numpy as np
 
@@ -49,6 +49,22 @@ class ExactGPExperimentConfig:
             - 2000 pts → 32 MB (safe for most GPUs)
             - 5000 pts → 200 MB
             - 10000 pts → 800 MB
+        smooth_mean_config: Configuration for smooth mean function.
+            When ``smooth_mean_type='constant'`` (the default), behaviour
+            is identical to the original constant-mean GP.  Set to
+            ``'spline'`` for a data-driven consensus smooth mean.
+        kernel_config: Configuration for the GP kernel.
+            ``None`` (default) uses a standard RBF kernel, preserving
+            exact pre-Phase-2 behaviour.  Set to a ``KernelConfig`` with
+            ``kernel_type='gibbs'`` and an injected RIPL-3 interpolator
+            for physics-informed nonstationary lengthscale.
+            See ``nucml_next.data.kernels`` for details.
+        likelihood_config: Configuration for the GP likelihood model.
+            ``None`` (default) uses pure Gaussian noise, preserving
+            exact pre-Phase-3 behaviour.  Set to a ``LikelihoodConfig``
+            with ``likelihood_type='contaminated'`` for robust outlier
+            identification via EM.
+            See ``nucml_next.data.likelihood`` for details.
     """
     min_points_for_gp: int = 5
     max_epochs: int = 200
@@ -62,6 +78,9 @@ class ExactGPExperimentConfig:
     max_gpu_points: int = 40000  # 40k points = 12.8 GB kernel matrix, fits in 16GB GPU
     max_subsample_points: int = 15000  # Subsample large experiments to fit GPU memory
     subsample_random_state: int = 42  # For reproducibility
+    smooth_mean_config: Any = None  # SmoothMeanConfig, lazy to avoid circular import
+    kernel_config: Any = None  # KernelConfig from kernels.py; None = RBF default
+    likelihood_config: Any = None  # LikelihoodConfig; None = Gaussian (no EM)
 
 
 class ExactGPExperiment:
@@ -98,11 +117,24 @@ class ExactGPExperiment:
         # Fitted GP parameters
         self._lengthscale: Optional[float] = None
         self._outputscale: Optional[float] = None
-        self._mean_value: Optional[float] = None
+        self._mean_value = None  # float or np.ndarray (array when smooth mean is used)
+        self._mean_fn: Optional[Callable] = None  # mean function: log_E -> log_sigma
+        self._kernel = None  # Kernel object (built in fit())
 
         # Cached Cholesky factor for fast predictions
         self._L: Optional[np.ndarray] = None
         self._alpha: Optional[np.ndarray] = None  # K^{-1} @ (y - mean)
+
+        # Contaminated normal EM results (Phase 3)
+        self._outlier_probabilities: Optional[np.ndarray] = None
+        self._noise_variance_effective: Optional[np.ndarray] = None
+
+        # Transient: parameter bounds for hierarchical refit (Phase 4)
+        # Set by refit_with_constraints(), cleared after use
+        self._refit_param_bounds = None
+
+        # Subsample tracking (set by fit() when subsampling occurs)
+        self._subsample_indices: Optional[np.ndarray] = None
 
         # Energy range (for extrapolation detection)
         self._log_E_min: Optional[float] = None
@@ -113,6 +145,7 @@ class ExactGPExperiment:
         log_E: np.ndarray,
         log_sigma: np.ndarray,
         log_uncertainties: np.ndarray,
+        mean_fn: Optional[Callable] = None,
     ) -> 'ExactGPExperiment':
         """
         Fit GP with heteroscedastic noise and calibrated lengthscale.
@@ -122,6 +155,10 @@ class ExactGPExperiment:
             log_sigma: log10(CrossSection) values, shape (n,).
             log_uncertainties: Noise std in log-space, shape (n,).
                 Typically: 0.434 * (Uncertainty / CrossSection)
+            mean_fn: Optional pre-computed mean function (e.g. from pooled
+                group data).  ``mean_fn(log_E) -> log_sigma_mean``.
+                If None, a mean function is computed from this experiment's
+                data using ``config.smooth_mean_config``.
 
         Returns:
             self (for method chaining)
@@ -156,11 +193,13 @@ class ExactGPExperiment:
         # Subsample large experiments to fit GPU memory
         # Fit on subsample, but predictions can be made on all points
         self._is_subsampled = False
+        self._subsample_indices = None
         if n > self.config.max_subsample_points:
             rng = np.random.RandomState(self.config.subsample_random_state)
             indices = rng.choice(n, size=self.config.max_subsample_points, replace=False)
             indices = np.sort(indices)  # Keep energy ordering for stability
 
+            self._subsample_indices = indices
             log_E = log_E[indices]
             log_sigma = log_sigma[indices]
             log_uncertainties = log_uncertainties[indices]
@@ -172,72 +211,133 @@ class ExactGPExperiment:
         self._train_y = log_sigma
         self._noise_variance = log_uncertainties ** 2
 
+        # Compute mean function: either from provided function, config, or constant
+        if mean_fn is not None:
+            self._mean_fn = mean_fn
+        else:
+            from nucml_next.data.smooth_mean import fit_smooth_mean, SmoothMeanConfig
+            sm_config = self.config.smooth_mean_config
+            if sm_config is None:
+                sm_config = SmoothMeanConfig()  # constant mean (default)
+            self._mean_fn = fit_smooth_mean(log_E, log_sigma, sm_config)
+
+        # Evaluate mean at training points (scalar for constant, array for spline)
+        self._mean_value = self._mean_fn(log_E)
+
         # Estimate initial hyperparameters
-        self._mean_value = np.mean(log_sigma)
         data_range = log_E.max() - log_E.min()
         initial_lengthscale = data_range / 5  # Reasonable default
 
-        # Estimate outputscale from data variance minus noise
-        signal_var = np.var(log_sigma) - np.mean(self._noise_variance)
+        # Estimate outputscale from residual variance minus noise
+        residuals_for_var = log_sigma - self._mean_value
+        signal_var = np.var(residuals_for_var) - np.mean(self._noise_variance)
         self._outputscale = max(signal_var, 0.1)
 
-        # Optimize lengthscale
+        # Build kernel object (outputscale injected, not optimised)
+        from nucml_next.data.kernels import build_kernel, KernelConfig
+        if self.config.kernel_config is not None:
+            self._kernel = build_kernel(self.config.kernel_config)
+        else:
+            self._kernel = build_kernel(KernelConfig(
+                lengthscale=initial_lengthscale,
+            ))
+        self._kernel.config.outputscale = self._outputscale
+
+        # Optimize kernel parameters (lengthscale for RBF, or a₀/a₁ for Gibbs)
         if self.config.use_wasserstein_calibration:
             self._fit_with_wasserstein_calibration()
         else:
             self._fit_with_marginal_likelihood(initial_lengthscale)
 
+        # Sync _lengthscale from kernel for backward-compatible diagnostics
+        if hasattr(self._kernel.config, 'lengthscale'):
+            self._lengthscale = self._kernel.config.lengthscale
+
         # Build cached quantities for fast prediction
         self._build_prediction_cache()
+
+        # Run contaminated normal EM if configured (updates L, alpha in-place)
+        self._run_contaminated_em()
 
         self.is_fitted = True
 
         # Store hyperparameters for diagnostics
+        # mean: store scalar for JSON-serialisable diagnostics
+        mean_for_diag = (
+            float(np.mean(self._mean_value))
+            if not np.isscalar(self._mean_value)
+            else self._mean_value
+        )
         self.hyperparameters = {
             'lengthscale': self._lengthscale,
             'outputscale': self._outputscale,
-            'mean': self._mean_value,
+            'mean': mean_for_diag,
             'noise_mean': np.mean(self._noise_variance) ** 0.5,
             'n_points': n,
         }
+        # Add kernel-specific params for diagnostics
+        self.hyperparameters.update(self._kernel.get_all_params())
+        # Add contaminated EM diagnostics if available
+        if self._outlier_probabilities is not None:
+            self.hyperparameters['n_outliers'] = int(
+                np.sum(self._outlier_probabilities > 0.5)
+            )
+            self.hyperparameters['max_outlier_prob'] = float(
+                np.max(self._outlier_probabilities)
+            )
 
         return self
 
     def _fit_with_wasserstein_calibration(self) -> None:
-        """Optimize lengthscale via Wasserstein calibration distance.
+        """Optimize kernel parameters via Wasserstein calibration distance.
 
-        Uses PyTorch-accelerated version when device is 'cuda' for GPU speedup.
+        Delegates to ``optimize_kernel_wasserstein`` (NumPy) or
+        ``optimize_kernel_wasserstein_torch`` (GPU), which dispatches
+        automatically:
+        - RBF (1 param): Grid + Brent search over lengthscale
+        - Gibbs (2 params): Grid-initialised Nelder-Mead over (a₀, a₁)
+
         Uses _effective_device which may be downgraded from config.device
         for large experiments.
-        """
-        # Use PyTorch-accelerated version for GPU
-        if self._effective_device != 'cpu':
-            from nucml_next.data.calibration import optimize_lengthscale_wasserstein_torch
 
-            self._lengthscale, self.calibration_metric = optimize_lengthscale_wasserstein_torch(
+        When ``self._refit_param_bounds`` is set (by ``refit_with_constraints``),
+        passes the bounds through to the optimiser for constrained search.
+        """
+        bounds_override = getattr(self, '_refit_param_bounds', None)
+
+        if self._effective_device != 'cpu':
+            from nucml_next.data.calibration import optimize_kernel_wasserstein_torch
+
+            self._kernel, self.calibration_metric = optimize_kernel_wasserstein_torch(
                 self._train_x,
                 self._train_y,
                 self._noise_variance,
-                lengthscale_bounds=self.config.lengthscale_bounds,
-                outputscale=self._outputscale,
+                kernel=self._kernel,
                 mean_value=self._mean_value,
+                lengthscale_bounds=self.config.lengthscale_bounds,
                 device=self._effective_device,
+                param_bounds=bounds_override,
             )
         else:
-            # CPU: use NumPy version (slightly faster for small matrices)
-            from nucml_next.data.calibration import optimize_lengthscale_wasserstein
+            from nucml_next.data.calibration import optimize_kernel_wasserstein
 
-            self._lengthscale, self.calibration_metric = optimize_lengthscale_wasserstein(
+            self._kernel, self.calibration_metric = optimize_kernel_wasserstein(
                 self._train_x,
                 self._train_y,
                 self._noise_variance,
-                lengthscale_bounds=self.config.lengthscale_bounds,
-                outputscale=self._outputscale,
+                kernel=self._kernel,
                 mean_value=self._mean_value,
+                lengthscale_bounds=self.config.lengthscale_bounds,
+                param_bounds=bounds_override,
             )
 
+        # Sync _lengthscale for backward compatibility
+        self._lengthscale = self._kernel.get_all_params().get(
+            'lengthscale', self._kernel.get_optimizable_params()[0]
+        )
+
         logger.debug(
-            f"Wasserstein calibration: ls={self._lengthscale:.4f}, "
+            f"Wasserstein calibration: params={self._kernel.get_all_params()}, "
             f"W={self.calibration_metric:.4f}"
         )
 
@@ -281,21 +381,39 @@ class ExactGPExperiment:
     def _compute_kernel_matrix(
         self,
         x1: np.ndarray,
-        lengthscale: float,
-        outputscale: float,
+        lengthscale: float = None,
+        outputscale: float = None,
         x2: Optional[np.ndarray] = None,
     ) -> np.ndarray:
-        """Compute RBF kernel matrix."""
-        if x2 is None:
-            x2 = x1
+        """Compute kernel matrix.
 
-        x1 = np.asarray(x1).ravel()
-        x2 = np.asarray(x2).ravel()
+        When a kernel object is available (``self._kernel``), delegates to
+        ``kernel.compute_matrix()``.  Falls back to inline RBF for the
+        marginal-likelihood path (which passes explicit lengthscale/outputscale).
 
-        diff = x1[:, None] - x2[None, :]
-        K = outputscale * np.exp(-0.5 * diff ** 2 / lengthscale ** 2)
+        Args:
+            x1: First input array.
+            lengthscale: Explicit lengthscale (used by MLL path only).
+                If None, uses the kernel object.
+            outputscale: Explicit outputscale (used by MLL path only).
+                If None, uses the kernel object.
+            x2: Second input array. If None, uses x1.
 
-        return K
+        Returns:
+            Kernel matrix of shape (len(x1), len(x2)).
+        """
+        # If explicit parameters are given (MLL path), use inline RBF
+        # to avoid mutating the kernel object during optimisation.
+        if lengthscale is not None and outputscale is not None:
+            if x2 is None:
+                x2 = x1
+            x1 = np.asarray(x1).ravel()
+            x2 = np.asarray(x2).ravel()
+            diff = x1[:, None] - x2[None, :]
+            return outputscale * np.exp(-0.5 * diff ** 2 / lengthscale ** 2)
+
+        # Delegate to kernel object
+        return self._kernel.compute_matrix(x1, x2)
 
     def _build_prediction_cache(self) -> None:
         """Build cached quantities for fast prediction.
@@ -309,10 +427,11 @@ class ExactGPExperiment:
             self._build_prediction_cache_numpy()
 
     def _build_prediction_cache_numpy(self) -> None:
-        """Build prediction cache using NumPy (CPU)."""
-        K = self._compute_kernel_matrix(
-            self._train_x, self._lengthscale, self._outputscale
-        )
+        """Build prediction cache using NumPy (CPU).
+
+        Uses the kernel object to build the covariance matrix.
+        """
+        K = self._kernel.compute_matrix(self._train_x, self._train_x)
         K += np.diag(self._noise_variance)
         K += np.eye(len(self._train_x)) * 1e-6
 
@@ -323,7 +442,10 @@ class ExactGPExperiment:
         )
 
     def _build_prediction_cache_torch(self) -> None:
-        """Build prediction cache using PyTorch (GPU-accelerated)."""
+        """Build prediction cache using PyTorch (GPU-accelerated).
+
+        Uses the kernel object's PyTorch path to build the covariance matrix.
+        """
         import torch
 
         device = self._effective_device
@@ -339,9 +461,8 @@ class ExactGPExperiment:
         x = torch.tensor(self._train_x, dtype=torch.float64, device=torch_device)
         noise_var = torch.tensor(self._noise_variance, dtype=torch.float64, device=torch_device)
 
-        # Build kernel matrix
-        diff = x.unsqueeze(1) - x.unsqueeze(0)
-        K = self._outputscale * torch.exp(-0.5 * diff.pow(2) / (self._lengthscale ** 2))
+        # Build kernel matrix via kernel object
+        K = self._kernel.compute_matrix_torch(x, x, device=device)
         K = K + torch.diag(noise_var) + 1e-6 * torch.eye(n, dtype=torch.float64, device=torch_device)
 
         # Cholesky decomposition
@@ -357,6 +478,162 @@ class ExactGPExperiment:
         # Store back as NumPy arrays (predictions will be on CPU)
         self._L = L.cpu().numpy()
         self._alpha = alpha.cpu().numpy()
+
+    def _run_contaminated_em(self) -> None:
+        """Run contaminated normal EM after initial Cholesky build.
+
+        When ``likelihood_config`` is set to ``'contaminated'``, this
+        method recomputes the kernel matrix, runs the EM algorithm to
+        identify outlier points, and updates ``self._L`` and
+        ``self._alpha`` in-place with the EM-refined effective noise.
+
+        When ``likelihood_config`` is None or ``'gaussian'``, this is
+        a no-op.
+        """
+        lc = self.config.likelihood_config
+        if lc is None or lc.likelihood_type != 'contaminated':
+            return
+
+        from nucml_next.data.likelihood import (
+            run_contaminated_em,
+            run_contaminated_em_torch,
+        )
+
+        if self._effective_device != 'cpu':
+            import torch
+
+            device = self._effective_device
+            x_t = torch.tensor(
+                self._train_x, dtype=torch.float64, device=device
+            )
+            K_kernel = self._kernel.compute_matrix_torch(
+                x_t, x_t, device=device
+            )
+            sigma_eff_sq, outlier_prob, L = run_contaminated_em_torch(
+                K_kernel, self._train_y, self._noise_variance,
+                self._mean_value, lc,
+            )
+        else:
+            K_kernel = self._kernel.compute_matrix(
+                self._train_x, self._train_x
+            )
+            sigma_eff_sq, outlier_prob, L = run_contaminated_em(
+                K_kernel, self._train_y, self._noise_variance,
+                self._mean_value, lc,
+            )
+
+        # Update cached Cholesky and alpha with EM-refined noise
+        self._L = L
+        residuals = self._train_y - np.asarray(self._mean_value)
+        self._alpha = np.linalg.solve(L.T, np.linalg.solve(L, residuals))
+
+        self._outlier_probabilities = outlier_prob
+        self._noise_variance_effective = sigma_eff_sq
+
+        n_outliers = int(np.sum(outlier_prob > 0.5))
+        logger.debug(
+            f"Contaminated EM: {n_outliers}/{len(outlier_prob)} points "
+            f"flagged (prob > 0.5), max_prob={np.max(outlier_prob):.4f}"
+        )
+
+    @property
+    def outlier_probabilities(self) -> Optional[np.ndarray]:
+        """Per-point outlier probabilities from contaminated normal EM.
+
+        Returns None if contaminated likelihood was not used.
+        """
+        return self._outlier_probabilities
+
+    @property
+    def subsample_indices(self) -> Optional[np.ndarray]:
+        """Indices into the original input arrays selected for training.
+
+        Returns None if no subsampling occurred (all points were used).
+        When not None, ``len(subsample_indices) == len(outlier_probabilities)``.
+        """
+        return self._subsample_indices
+
+    def refit_with_constraints(
+        self,
+        outputscale: Optional[float] = None,
+        param_bounds: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+    ) -> 'ExactGPExperiment':
+        """Re-fit kernel parameters with constrained bounds (Phase 4).
+
+        Used by the hierarchical refitting pass to re-optimise each experiment's
+        kernel parameters within a group-informed feasible region while
+        optionally sharing the group median outputscale.
+
+        Skips data preparation (input validation, subsampling, mean function
+        estimation — all preserved from Pass 1) and only re-runs: kernel
+        parameter optimisation → Cholesky factorisation → optional EM.
+
+        Args:
+            outputscale: If not None, override the outputscale before re-fitting.
+                Typically set to the group median outputscale.
+            param_bounds: If not None, a tuple ``(lower, upper)`` of 1-D arrays
+                with shape ``(n_optimizable_params,)``.  The kernel optimiser
+                will constrain its search to these bounds.
+
+        Returns:
+            self (for chaining).
+
+        Raises:
+            RuntimeError: If ``fit()`` has not been called yet.
+        """
+        if not self.is_fitted:
+            raise RuntimeError(
+                "Must call fit() before refit_with_constraints()"
+            )
+
+        # Update outputscale if requested (shared group outputscale)
+        if outputscale is not None:
+            self._outputscale = outputscale
+            self._kernel.config.outputscale = outputscale
+
+        # Set transient bounds for the optimiser
+        self._refit_param_bounds = param_bounds
+        try:
+            # Re-optimise kernel parameters within constrained bounds
+            self._fit_with_wasserstein_calibration()
+        finally:
+            # Always clear transient bounds
+            self._refit_param_bounds = None
+
+        # Sync _lengthscale from kernel for backward-compatible diagnostics
+        if hasattr(self._kernel.config, 'lengthscale'):
+            self._lengthscale = self._kernel.config.lengthscale
+
+        # Rebuild cached Cholesky factor and alpha
+        self._build_prediction_cache()
+
+        # Re-run contaminated normal EM if configured
+        self._run_contaminated_em()
+
+        # Rebuild hyperparameters dict (replicating fit() pattern)
+        mean_for_diag = (
+            float(np.mean(self._mean_value))
+            if not np.isscalar(self._mean_value)
+            else self._mean_value
+        )
+        n = len(self._train_x)
+        self.hyperparameters = {
+            'lengthscale': self._lengthscale,
+            'outputscale': self._outputscale,
+            'mean': mean_for_diag,
+            'noise_mean': np.mean(self._noise_variance) ** 0.5,
+            'n_points': n,
+        }
+        self.hyperparameters.update(self._kernel.get_all_params())
+        if self._outlier_probabilities is not None:
+            self.hyperparameters['n_outliers'] = int(
+                np.sum(self._outlier_probabilities > 0.5)
+            )
+            self.hyperparameters['max_outlier_prob'] = float(
+                np.max(self._outlier_probabilities)
+            )
+
+        return self
 
     def predict(
         self,
@@ -377,16 +654,15 @@ class ExactGPExperiment:
         log_E_query = np.asarray(log_E_query).ravel()
 
         # Cross-covariance between query and training points
-        K_star = self._compute_kernel_matrix(
-            log_E_query, self._lengthscale, self._outputscale, self._train_x
-        )
+        K_star = self._kernel.compute_matrix(log_E_query, self._train_x)
 
-        # Mean prediction: mu + K_* @ alpha
-        mean = self._mean_value + K_star @ self._alpha
+        # Mean prediction: mu(query) + K_* @ alpha
+        query_mean = self._mean_fn(log_E_query)
+        mean = query_mean + K_star @ self._alpha
 
         # Variance prediction: K_** - K_* @ K^{-1} @ K_*^T
         # K_** is the prior variance at query points (diagonal only)
-        K_star_star = self._outputscale  # Diagonal of prior covariance
+        K_star_star = self._kernel.prior_variance()
 
         # v = L^{-1} @ K_*^T
         v = np.linalg.solve(self._L, K_star.T)
@@ -430,7 +706,9 @@ class ExactGPExperiment:
 
         from nucml_next.data.calibration import compute_loo_z_scores_from_cholesky
 
-        mean = np.full(len(self._train_y), self._mean_value)
+        mean = np.asarray(self._mean_value)
+        if mean.ndim == 0:
+            mean = np.full(len(self._train_y), float(mean))
         return compute_loo_z_scores_from_cholesky(
             self._L, self._train_y, mean
         )

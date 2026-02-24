@@ -133,6 +133,13 @@ different units or meaning than point-wise absolute cross sections:
 
 Default filtering applies SF8 Tiers 1+2 plus all SF5, SF6, SF9, and SPSDD rules.
 
+**Load-time spectrum-averaged filter:** In addition to ingestion-time filtering above,
+`DataSelection(exclude_spectrum_averaged=True)` (the default) removes remaining
+spectrum-averaged data at load time. This covers SF8 codes MXW, SPA, FIS, AV, BRA, BRS
+(already excluded at ingestion Tier 2) **plus** SDT, FST, and TTA (kept during ingestion
+but excluded at load time). Set `exclude_spectrum_averaged=False` to include all sf8 types.
+See `selection.py → SPECTRUM_AVERAGED_SF8`.
+
 **Compound SF8 handling:** EXFOR compound modifiers like `BRS/REL` or `BRA/MSC` are split on `/`
 and each token is checked independently. For example, `BRS/REL` matches both the Tier 2 `BRS`
 (bremsstrahlung) and Tier 1 `REL` (relative) rules.
@@ -144,8 +151,8 @@ These SF8 modifiers are present in the dataset but are **not excluded** by the f
 | Code | Count (approx.) | Meaning | Rationale for Keeping |
 |------|-----------------|---------|----------------------|
 | `RAW` | ~69K | Uncorrected (no dead-time, self-absorption corrections) | Real experimental measurements; may have systematic offsets but are valid data. Toggle ON/OFF in ThresholdExplorer. |
-| `TTA` | ~17K | Thick-Target Approximation | Valid measurement technique for charged-particle reactions. The cross section is correct for the target conditions. |
-| `SDT` | ~2.4K | Subtraction of a reference spectrum (measurement technique tag) | Describes the data-reduction method, not a modification of the physical quantity. |
+| `TTA` | ~17K | Thick-Target Approximation | Kept during ingestion but **excluded at load time** by default (`exclude_spectrum_averaged=True`). Set `False` to include. |
+| `SDT` | ~2.4K | d-T spectrum averaged | Kept during ingestion but **excluded at load time** by default (`exclude_spectrum_averaged=True`). Set `False` to include. |
 
 ### EXFOR Code Reference
 
@@ -211,8 +218,9 @@ their positions, physical meaning, and filter status.
 | `2G` | 3 | 2g * Gamma_n^0 spin-statistical factor | **Excluded** |
 | `RM` | 3 | R-Matrix parameters (model fit) | **Excluded** |
 | `RAW` | — | Uncorrected experimental data | **Kept** (toggle in ThresholdExplorer) |
-| `TTA` | — | Thick-Target Approximation | **Kept** (valid technique) |
-| `SDT` | — | Measurement technique subtraction tag | **Kept** (technique descriptor) |
+| `TTA` | — | Thick-Target Approximation | **Kept** at ingestion; **excluded at load time** by default |
+| `SDT` | — | d-T spectrum averaged | **Kept** at ingestion; **excluded at load time** by default |
+| `FST` | — | Fast-reactor spectrum averaged | **Excluded at load time** (`exclude_spectrum_averaged`) |
 | *(empty)* | — | No modifier (standard measurement) | **Kept** |
 
 **SF9 (Data Type) — Position 9:**
@@ -293,7 +301,7 @@ Selected with `--outlier-method experiment`.
 | Aspect | Detail |
 |--------|--------|
 | Approach | Fits independent Exact GPs to each experiment (Entry) within a (Z, A, MT) group |
-| Kernel | Matern 5/2 with heteroscedastic noise from measurement uncertainties |
+| Kernel | RBF (default) with heteroscedastic noise; Gibbs nonstationary kernel available via `KernelConfig(kernel_type='gibbs')` with RIPL-3 physics-informed lengthscale (see 6.2) |
 | Calibration | Wasserstein distance between LOO |z|-scores and half-normal distribution |
 | Consensus | Weighted median of per-experiment GP posteriors at common energy grid |
 | Experiment flagging | Flagged if > 20% of grid points have |z| > 2 vs consensus |
@@ -345,6 +353,296 @@ ELSE (n_experiments >= 2):
     ELSE:
         -> All experiments small - MAD within each
 ```
+
+### 6.1 Smooth Mean (Phase 1)
+
+**Motivation.** A constant mean `mu = mean(log_sigma)` forces the GP residual to contain
+5+ orders of magnitude of energy-dependent trend (1/v baseline at thermal energies,
+resonance peaks in the keV region, threshold rise toward the MeV continuum). A single
+stationary lengthscale cannot simultaneously capture narrow resonances and smooth 1/v
+structure. Subtracting a smooth trend first lets the GP model only deviations from the
+gross energy envelope.
+
+**Algorithm.** Iterative reweighted cubic B-spline (`scipy.interpolate.UnivariateSpline`)
+fitted in log-E vs log-sigma space:
+
+1. Pool all experiments in a (Z, A, MT) group before per-experiment splitting.
+2. Sort by log-E, filter NaN/inf.
+3. Fit initial spline with smoothing factor `s = n * Var(y)` to force O(10) knots,
+   capturing only gross energy dependence.
+4. Compute residuals, estimate robust scale via MAD (Median Absolute Deviation).
+5. Downweight points with |residual| > 3 * MAD (Huber-like soft clipping).
+6. Refit spline with updated weights. Iterate up to 5 times or until convergence
+   (max change < 1e-4).
+
+**Smoothing factor override.** The scipy default `s ~ n` allows up to n knots, which
+can trace individual resonances for small groups (50-200 points). We override with
+`s = n * Var(y)`, producing ~10 knots that capture only the gross energy-dependent
+envelope (1/v, threshold rise, giant resonances), not individual narrow resonances.
+
+**Evaluation independence.** The smooth mean is computed from EXFOR data itself,
+not from evaluated nuclear data libraries (ENDF/B, JEFF, JENDL). This preserves
+the tool's role as an independent quality assessment resource for evaluators.
+
+**Group-level pooling.** The smooth mean is computed from ALL experiments' pooled data
+before per-experiment GP fits. The pooled mean from multiple measurements provides a
+robust baseline that dilutes any single experiment's systematic bias.
+
+**Single-experiment limitation.** For groups with only one experiment, the smooth mean
+is fitted to just that experiment. If the experiment is biased, the mean absorbs the
+bias and outlier detection power is reduced. This is inherent to Phase 1 and requires
+cross-isotope information (Phase 4+) to address.
+
+**Configuration.** `SmoothMeanConfig(smooth_mean_type='spline')` opts in. Default
+`'constant'` preserves exact pre-Phase-1 behaviour.
+
+### 6.2 Kernel Abstraction & Physics-Informed Gibbs Kernel (Phase 2)
+
+**The fundamental problem.** A stationary RBF kernel `K(x,x') = sigma^2 exp(-dx^2 / 2l^2)`
+uses a single lengthscale l across all energies. Nuclear cross-sections have structure at
+vastly different scales: narrow resonances (Gamma ~ 0.1 eV) in the resolved resonance
+region (RRR) and smooth MeV-scale trends in the continuum. No single l works for both
+regimes. For U-235 fission, this mismatch produces a 55% false-positive rate at z > 3
+(expected 0.3% for a calibrated GP).
+
+**Kernel abstraction.** All GP code now delegates kernel computation to a `Kernel` object
+(abstract base class in `nucml_next.data.kernels`). The RBF formula, previously hardcoded
+in 4 locations (`experiment_gp.py` lines 311, 374; `calibration.py` lines 170, 448), is
+encapsulated in `RBFKernel`. New kernels can be added by subclassing `Kernel` without
+modifying the GP or calibration code.
+
+**Gibbs kernel.** Nonstationary kernel with position-dependent lengthscale:
+
+    K(xi, xj) = sigma^2 * sqrt(2 li lj / (li^2 + lj^2)) * exp(-(xi - xj)^2 / (li^2 + lj^2))
+
+This reduces to RBF when li = lj = l (constant). The energy-dependent lengthscale
+l(log_E) adapts automatically: short near narrow resonances, long in smooth regions.
+
+**Physics-informed lengthscale from RIPL-3.** The optimal GP lengthscale should track
+the mean level spacing D(E) ~ 1/rho(E), where rho is the nuclear level density.
+RIPL-3 provides Constant Temperature (CT) level density parameters (T, U0) per nuclide
+from nuclear structure data (discrete level schemes, neutron resonances). These are
+evaluation-independent.
+
+CT formula:
+
+    rho(E_x) = (1/T) * exp((E_x - U0) / T)
+    D(E_x) = T * exp(-(E_x - U0) / T)
+
+where E_x = S_n + E_n is the compound nucleus excitation energy (S_n = neutron
+separation energy, E_n = incident neutron energy).
+
+**Lengthscale parameterization:**
+
+    l(log_E) = softplus(log D(E) + a0 + a1 * log_E)
+
+Only 2 free parameters (a0, a1) on top of the physics. The RIPL-3 data does the heavy
+lifting: it captures the 10^6 dynamic range from narrow resonances (D ~ 0.1 eV) to
+smooth continuum (D ~ 10^5 eV). The correction terms handle the fact that the optimal
+GP lengthscale is not exactly D(E) but is proportional to it.
+
+**Why not polynomial or piecewise?** A polynomial in log E has one extremum (for degree 2),
+too rigid for the RRR-to-URR transition, with 3 parameters trying to span 10^6 dynamic
+range. Piecewise linear requires arbitrary knot placement unless one uses nuclear structure
+information that RIPL-3 already encodes explicitly. The RIPL-3 approach lets physics
+determine the shape with minimal free parameters.
+
+**CT formula floor.** The CT formula diverges when S_n + E_n < U0 (unphysical regime).
+A floor is applied: `D(E) = max(D_computed, D(S_n))`, where D(S_n) is the mean level
+spacing at the neutron separation energy. This ensures the GP lengthscale never exceeds
+the thermal-region value, which is physically the smoothest region.
+
+**S_n computation.** The neutron separation energy is needed to convert incident neutron
+energy to compound nucleus excitation energy. It can be computed from AME2020 mass
+excess data (already available via `AME2020Loader`): `S_n = M(Z,A) + M_n - M(Z,A+1)`.
+A rough empirical fallback is used when AME2020 data is not available.
+
+**Wasserstein calibration.** The correction parameters (a0, a1) are optimised via
+Nelder-Mead on the Wasserstein distance between LOO |z|-scores and the half-normal
+distribution. For RBF, this is unchanged (1D Brent search over lengthscale). For Gibbs,
+it is a 2D search that converges reliably given the physical initialisation.
+
+**Outputscale.** Estimated from `Var(residuals) - mean(noise)`, never optimised.
+Consistent across both RBF and Gibbs kernels.
+
+**Data source:**
+
+| File | Content | Source |
+|------|---------|--------|
+| `data/levels/levels-param.data` | CT parameters (T, U0) per nuclide | [IAEA RIPL-3](https://www-nds.iaea.org/RIPL-3/) |
+
+**Configuration.** `KernelConfig(kernel_type='gibbs')` opts in. Default `None` (or
+`kernel_type='rbf'`) preserves exact pre-Phase-2 behaviour.
+
+**Injection path.** The RIPL-3 interpolator flows through the system as follows:
+
+    ExperimentOutlierDetector._score_multi_experiment(group_key=(Z, A, MT))
+      -> _build_kernel_config_for_group(Z, A)
+        -> RIPL3LevelDensity.get_log_D_interpolator(Z, A+1, S_n)  [compound nucleus]
+        -> KernelConfig(ripl_log_D_interpolator=interpolator)
+      -> _fit_experiment_gp(exp_df, kernel_config=...)
+        -> ExactGPExperiment(config_with_kernel)
+          -> build_kernel(config.kernel_config)  ->  GibbsKernel or RBF
+
+The kernel object never loads files or knows about (Z, A). File I/O happens once in
+the RIPL-3 loader; all subsequent calls use closures over precomputed parameters.
+
+### 6.3 Robust Likelihood — Contaminated Normal (Phase 3)
+
+**Motivation.** The default Gaussian noise model `K += diag(σᵢ²)` treats every
+data point as equally trustworthy. When a point is a genuine outlier (transcription
+error, wrong units, corrupted digitisation), the GP treats the discrepancy as signal.
+This distorts the posterior mean, inflates prediction uncertainty for nearby points,
+and produces unreliable z-scores. A contaminated normal mixture provides principled
+outlier identification without distorting the GP posterior.
+
+**Model.** Each observation is modeled as a two-component Gaussian mixture:
+
+```
+p(yᵢ | fᵢ) = (1-ε)·N(yᵢ; fᵢ, σᵢ²) + ε·N(yᵢ; fᵢ, κ·σᵢ²)
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| ε | 0.05 | Prior contamination fraction (fixed) |
+| κ | 10.0 | Noise inflation for outlier component (fixed) |
+
+Both ε and κ are fixed (not optimized) — a design choice for simplicity and robustness.
+The outlier component has κ times the noise variance, making it "listen less" to outlier
+points during GP fitting.
+
+**EM algorithm.** After kernel optimization and initial Cholesky factorisation, the EM
+loop iterates:
+
+1. **M-step:** Compute effective noise `σ_eff² = σᵢ²·(1 + wᵢ·(κ-1))` from current
+   outlier weights `wᵢ`. Rebuild `K_noisy = K_kernel + diag(σ_eff²) + jitter·I`.
+   Cholesky factorize and solve for `alpha`.
+2. **E-step:** Compute posterior residuals `eᵢ = σ_eff²[i]·alpha[i]`. Compute
+   log-likelihood ratio of outlier vs inlier components. Update outlier weights
+   via log-space sigmoid: `wᵢ = σ(log(ε/(1-ε)) + log_r)`.
+3. **Convergence:** Stop when `max|wᵢ_new - wᵢ_old| < tol` (default 1e-3, max 10 iterations).
+
+The E-step uses log-space computation with clamped exponents for numerical stability.
+
+**Integration.** The EM runs *after* the initial `_build_prediction_cache()` call in
+`ExactGPExperiment.fit()`. It updates `self._L` and `self._alpha` in-place with the
+EM-refined effective noise. Crucially, `predict()` and `get_loo_z_scores()` are **not
+modified** — they automatically become robust because they use the EM-updated Cholesky
+factor and alpha vector.
+
+**Output.** The `outlier_probability` column (continuous float in [0, 1]) gives the
+posterior contamination weight per point. When the contaminated likelihood is active,
+`point_outlier` is set to `outlier_probability > 0.5` (replacing the z-score threshold).
+Points without outlier probability (e.g., from MAD fallback) still use the z-score
+threshold.
+
+**Configuration.** Opt-in via `LikelihoodConfig(likelihood_type='contaminated')`.
+The default `likelihood_type='gaussian'` preserves exact pre-Phase-3 behaviour with
+no EM and no `outlier_probability` column. Implementation in
+`nucml_next.data.likelihood`.
+
+### 6.4 Hierarchical Experiment Structure (Phase 4)
+
+#### Motivation
+
+When fitting independent GPs to multiple experiments within a (Z, A, MT) group,
+each experiment's hyperparameters (lengthscale, outputscale, and — for the Gibbs
+kernel — the correction parameters a₀, a₁) are estimated from that experiment's
+data alone. For small experiments (10–50 data points spanning a narrow energy
+range), the Wasserstein-calibrated lengthscale can be poorly constrained: the
+optimisation landscape may be flat, or a local minimum may produce a physically
+implausible lengthscale (e.g. a lengthscale shorter than the energy spacing, or
+longer than the entire energy range). The outputscale, estimated as
+`Var(residuals) − mean(noise)`, is similarly noisy for small experiments.
+
+This heterogeneity in hyperparameters has three consequences:
+
+1. **Inconsistent predictions.** Two experiments measuring the same cross section
+   at overlapping energies can produce very different GP posteriors, making
+   consensus building unreliable.
+2. **Gibbs correction drift.** The a₀ and a₁ parameters of the Gibbs kernel
+   encode corrections to the RIPL-3 level density. These should be consistent
+   across experiments of the same nucleus, as they describe nuclear structure
+   rather than experimental conditions. Independent fitting allows them to
+   absorb experiment-specific noise.
+3. **Small-experiment fragility.** Experiments with few data points tend to
+   produce extreme lengthscales that cause either over-fitting (short
+   lengthscale) or over-smoothing (long lengthscale), both degrading outlier
+   detection.
+
+#### Algorithm: Two-Pass Hierarchical Fitting
+
+**Pass 1** (unchanged): Fit all experiments independently using the existing
+Wasserstein-calibrated pipeline (kernel optimisation → Cholesky → optional EM).
+This produces one `ExactGPExperiment` object per experiment with independently
+estimated hyperparameters.
+
+**Pass 2** (new, opt-in via `hierarchical_refitting=True`):
+
+1. **Extract group statistics.** From all successfully fitted GPs in the group
+   (minimum `min_experiments_for_refit`, default 3), collect:
+   - Outputscale values → compute group median
+   - Kernel optimisable parameters (lengthscale for RBF; a₀, a₁ for Gibbs) →
+     compute per-parameter Q1, median, Q3
+
+2. **Compute constrained bounds.** For each kernel parameter:
+   ```
+   IQR = Q3 − Q1
+   lower = Q1 − margin × IQR
+   upper = Q3 + margin × IQR
+   ```
+   where `margin = refit_bounds_iqr_margin` (default 1.0). This is the standard
+   IQR-based outlier fence used in robust statistics (with the conventional
+   factor of 1.5 replaced by a configurable margin).
+
+   **Kernel-type-aware clipping.** RBF lengthscale bounds are floored at 1e-3
+   (lengthscale must be strictly positive). Gibbs correction parameters a₀, a₁
+   are NOT clipped — they can take any real value, as a negative a₀ means the
+   GP lengthscale is shorter than the RIPL-3 prediction.
+
+   **Degenerate IQR handling.** When all experiments produce identical parameters
+   (IQR = 0), bounds are expanded to [median × 0.5, median × 2.0] for positive
+   parameters, or [median − 0.5, median + 0.5] for parameters near zero.
+
+3. **Re-fit each experiment.** Call `refit_with_constraints()` on each GP with:
+   - Shared outputscale: group median (when `refit_share_outputscale=True`)
+   - Parameter bounds: the IQR-based bounds computed above
+   - Same Wasserstein optimiser, but the search is now constrained to the
+     group-informed feasible region
+
+   The refit skips data preparation (input validation, subsampling, mean function
+   estimation — all preserved from Pass 1) and only re-runs: kernel parameter
+   optimisation → Cholesky factorisation → optional EM.
+
+4. **Update predictions.** The refit GPs produce updated `gp_mean`, `gp_std`,
+   `z_score`, `calibration_metric`, and `outlier_probability` values that replace
+   the Pass 1 predictions in the result DataFrame.
+
+**Ordering.** Pass 2 runs BEFORE consensus building. This is important because
+the consensus builder receives the refit GPs with more consistent hyperparameters,
+producing a tighter and more reliable consensus posterior. Discrepancy detection
+(experiment-level flagging) then operates on the improved consensus.
+
+#### Failure Handling
+
+Refit failure for any individual experiment is non-fatal: a warning is logged and
+the Pass 1 results are preserved. This ensures one problematic experiment cannot
+block the group.
+
+When fewer than `min_experiments_for_refit` GPs are successfully fitted in Pass 1,
+Pass 2 is skipped entirely for that group (IQR from 2 points is the full range —
+too unreliable for constraint estimation).
+
+#### Configuration
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `hierarchical_refitting` | `False` | Enable two-pass fitting |
+| `min_experiments_for_refit` | `3` | Min GPs for reliable group statistics |
+| `refit_bounds_iqr_margin` | `1.0` | IQR multiplier for bound width |
+| `refit_share_outputscale` | `True` | Share group median outputscale in Pass 2 |
+
+Default `False` preserves exact pre-Phase-4 behaviour.
 
 ### Legacy SVGP
 
@@ -448,6 +746,11 @@ python scripts/ingest_exfor.py [FLAGS]
 | `--max-subsample-points` | 15000 | Subsample large experiments to this many points for GP fitting |
 | `--svgp-checkpoint-dir` | None | Enable checkpointing for resume on interruption |
 | `--svgp-likelihood` | `student_t` | Likelihood: `student_t`, `heteroscedastic`, `gaussian` |
+| `--smooth-mean` | `constant` | Mean function for per-experiment GP: `constant` or `spline` (§6.1) |
+| `--kernel-type` | `rbf` | GP kernel: `rbf` or `gibbs` (§6.2, requires `--ripl-data-path`) |
+| `--ripl-data-path` | None | Path to RIPL-3 `levels-param.data` file (required for `gibbs`) |
+| `--likelihood` | `gaussian` | GP likelihood: `gaussian` or `contaminated` (§6.3) |
+| `--hierarchical-refitting` | OFF | Enable two-pass group-constrained refit (§6.4) |
 
 **System:**
 
@@ -491,6 +794,20 @@ python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db \
 # Diagnostic mode (adds hover metadata for interactive inspector)
 python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db \
     --test-subset --diagnostics
+
+# Full Phase 1-4 GP stack
+python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db \
+    --outlier-method experiment \
+    --smooth-mean spline \
+    --kernel-type gibbs --ripl-data-path data/levels-param.data \
+    --likelihood contaminated \
+    --hierarchical-refitting
+
+# Contaminated likelihood + hierarchical refit (no Gibbs kernel)
+python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db \
+    --outlier-method experiment \
+    --likelihood contaminated \
+    --hierarchical-refitting
 ```
 
 ---

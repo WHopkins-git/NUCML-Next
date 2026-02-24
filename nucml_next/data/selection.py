@@ -22,6 +22,25 @@ from typing import Any, Optional, List, Tuple, Set, Literal, Union
 import numpy as np
 
 
+# SF8 codes indicating spectrum-averaged (non-monoenergetic) data.
+# These measure an average over a broad energy spectrum — the "energy"
+# value is a characteristic energy (e.g. kT), not the actual incident energy.
+# Excluding these is the load-time equivalent of the IAEA "Exclude non pure data" toggle.
+SPECTRUM_AVERAGED_SF8 = {
+    'MXW',      # Maxwellian averaged
+    'SPA',      # Spectrum averaged (reactor)
+    'SDT',      # d-T spectrum averaged
+    'FST',      # Fast reactor spectrum
+    'FIS',      # Fission spectrum averaged
+    'TTA',      # Thick-target averaged
+    'BRA',      # Bremsstrahlung averaged
+    'BRS',      # Bremsstrahlung spectrum
+    'AV',       # Averaged over energy interval
+}
+# Compound codes (e.g. BRA/REL, SDT/AV) are handled by splitting on '/'
+# and checking each token against this set.
+
+
 # MT Code Categories (based on ENDF-6 format manual)
 # Reference: https://www.oecd-nea.org/dbdata/data/manual-endf/endf102.pdf
 
@@ -264,6 +283,9 @@ class DataSelection:
     # Exclusion rules
     exclude_bookkeeping: bool = True  # Exclude MT 0 (undefined/non-standard data only)
 
+    # Spectrum-averaged data exclusion (IAEA "Exclude non pure data" equivalent)
+    exclude_spectrum_averaged: bool = True   # Exclude MXW, SPA, FIS, AV, BRA, BRS, SDT, FST, TTA
+
     # Data validity
     drop_invalid: bool = True  # Drop NaN or non-positive cross-sections
 
@@ -469,6 +491,7 @@ class DataSelection:
             lines.append(f"  Outlier filter: z_threshold={self.z_threshold}, action={action}")
 
         lines.append(f"  Drop invalid: {self.drop_invalid}")
+        lines.append(f"  Exclude spectrum-averaged: {self.exclude_spectrum_averaged}")
         lines.append(")")
 
         return "\n".join(lines)

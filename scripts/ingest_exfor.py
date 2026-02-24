@@ -192,6 +192,50 @@ Note:
         default=3.0,
         help='Z-score threshold for flagging point outliers (default: 3.0)'
     )
+
+    # Phase 1–4 GP enhancement flags (only used with --outlier-method experiment)
+    parser.add_argument(
+        '--smooth-mean',
+        type=str,
+        default='constant',
+        choices=['constant', 'spline'],
+        help='Mean function type for per-experiment GP (default: constant). '
+             '"spline" fits a data-driven consensus trend before GP fitting.'
+    )
+    parser.add_argument(
+        '--kernel-type',
+        type=str,
+        default='rbf',
+        choices=['rbf', 'gibbs'],
+        help='GP kernel type (default: rbf). '
+             '"gibbs" uses a physics-informed nonstationary kernel based on '
+             'RIPL-3 nuclear level density (requires --ripl-data-path).'
+    )
+    parser.add_argument(
+        '--ripl-data-path',
+        type=str,
+        default=None,
+        help='Path to RIPL-3 levels-param.data file (required for --kernel-type gibbs). '
+             'Without this, Gibbs kernel falls back to RBF.'
+    )
+    parser.add_argument(
+        '--likelihood',
+        type=str,
+        default='gaussian',
+        choices=['gaussian', 'contaminated'],
+        help='GP likelihood type (default: gaussian). '
+             '"contaminated" uses a contaminated normal mixture for principled '
+             'outlier identification, producing per-point outlier_probability.'
+    )
+    parser.add_argument(
+        '--hierarchical-refitting',
+        action='store_true',
+        default=False,
+        help='Enable two-pass hierarchical fitting: Pass 1 fits independently, '
+             'Pass 2 re-fits with group-informed constrained bounds and shared '
+             'outputscale. Produces more consistent GP fits across experiments.'
+    )
+
     import multiprocessing
     default_threads = max(1, multiprocessing.cpu_count() // 2)
     parser.add_argument(
@@ -327,16 +371,44 @@ Note:
                 print(f"         Falling back to CPU.")
                 args.svgp_device = 'cpu'
 
-        # Pass device and max_gpu_points to GP config for GPU-accelerated fitting
+        # Warn if Gibbs kernel requested without RIPL data
+        if args.kernel_type == 'gibbs' and not args.ripl_data_path:
+            print("WARNING: --kernel-type gibbs requires --ripl-data-path. "
+                  "Gibbs kernel will fall back to RBF without RIPL-3 data.")
+
+        # Phase 1: Smooth mean config
+        smooth_mean_config = None
+        if args.smooth_mean == 'spline':
+            from nucml_next.data.smooth_mean import SmoothMeanConfig
+            smooth_mean_config = SmoothMeanConfig(smooth_mean_type='spline')
+
+        # Phase 2: Kernel config
+        kernel_config = None
+        if args.kernel_type == 'gibbs':
+            from nucml_next.data.kernels import KernelConfig
+            kernel_config = KernelConfig(kernel_type='gibbs')
+
+        # Phase 3: Likelihood config
+        likelihood_config = None
+        if args.likelihood == 'contaminated':
+            from nucml_next.data.likelihood import LikelihoodConfig
+            likelihood_config = LikelihoodConfig(likelihood_type='contaminated')
+
+        # Build GP and detector configs with all phase settings
         gp_config = ExactGPExperimentConfig(
             device=args.svgp_device,
             max_gpu_points=args.max_gpu_points,
             max_subsample_points=args.max_subsample_points,
+            smooth_mean_config=smooth_mean_config,
+            kernel_config=kernel_config,
+            likelihood_config=likelihood_config,
         )
         experiment_outlier_config = ExperimentOutlierConfig(
             gp_config=gp_config,
             point_z_threshold=args.z_threshold,
             checkpoint_dir=args.svgp_checkpoint_dir,
+            ripl_data_path=args.ripl_data_path,
+            hierarchical_refitting=args.hierarchical_refitting,
         )
 
     run_svgp = outlier_method == 'svgp'
@@ -354,7 +426,17 @@ Note:
     if outlier_method == 'svgp':
         print(f"Outlier:      SVGP (legacy) - device={args.svgp_device}, likelihood={args.svgp_likelihood}")
     elif outlier_method == 'experiment':
-        print(f"Outlier:      Per-experiment GP (recommended) - device={args.svgp_device}, z_threshold={args.z_threshold}")
+        features = []
+        if args.smooth_mean != 'constant':
+            features.append(f"mean={args.smooth_mean}")
+        if args.kernel_type != 'rbf':
+            features.append(f"kernel={args.kernel_type}")
+        if args.likelihood != 'gaussian':
+            features.append(f"likelihood={args.likelihood}")
+        if args.hierarchical_refitting:
+            features.append("hierarchical")
+        feat_str = f", features=[{', '.join(features)}]" if features else ""
+        print(f"Outlier:      Per-experiment GP - device={args.svgp_device}, z_threshold={args.z_threshold}{feat_str}")
     else:
         print(f"Outlier:      Disabled (use --outlier-method to enable)")
     if args.svgp_checkpoint_dir:
