@@ -160,6 +160,19 @@ class TestComputeLengthscaleFromResiduals:
         signal = result(query)
         assert np.all(np.isfinite(signal))
 
+    def test_small_experiment_no_crash(self):
+        """Experiment with 10-14 points should not crash (argpartition bug)."""
+        rng = np.random.RandomState(42)
+        mean_fn = lambda x: np.full_like(x, 1.0)
+
+        for n in [10, 11, 12, 13, 14]:
+            log_E = np.sort(rng.uniform(0, 6, n))
+            log_sigma = 1.0 + rng.normal(0, 0.1, n)
+            result = compute_lengthscale_from_residuals(log_E, log_sigma, mean_fn)
+            assert result is not None, f"Should succeed for n={n}"
+            signal = result(np.array([3.0]))
+            assert np.all(np.isfinite(signal)), f"Signal should be finite for n={n}"
+
     def test_output_range(self):
         """All softplus(signal) values within [min_l, max_l]."""
         log_E, log_sigma, mean_fn = _make_synthetic_data()

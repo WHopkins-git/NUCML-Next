@@ -383,8 +383,11 @@ def compute_lengthscale_from_residuals(
             # Expand to k-nearest neighbours
             distances = np.abs(x - x[i])
             k = min(min_window_points, n)
-            idx = np.argpartition(distances, k)[:k]
-            r_local = r[idx]
+            if k >= n:
+                r_local = r  # Use all points
+            else:
+                idx = np.argpartition(distances, k)[:k]
+                r_local = r[idx]
         else:
             r_local = r[mask]
 
