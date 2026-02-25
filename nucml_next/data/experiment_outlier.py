@@ -82,6 +82,11 @@ class ExperimentOutlierConfig:
         s_n_column: DataFrame column name for neutron separation energy
             (MeV). If present, used directly; otherwise estimated from
             AME2020 data or a built-in fallback table.
+        gibbs_lengthscale_source: Lengthscale source for Gibbs kernel.
+            ``'data'`` computes from local residual variability (requires
+            ``smooth_mean_type='spline'``).  ``'ripl'`` uses RIPL-3 level
+            density (requires ``ripl_data_path``).  ``'auto'`` tries data
+            first, falls back to RIPL-3.  Default ``'data'``.
         hierarchical_refitting: Enable two-pass hierarchical fitting (Phase 4).
             When True, Pass 2 extracts group-level hyperparameter statistics
             from Pass 1 fitted GPs, then re-fits each experiment with
@@ -107,6 +112,8 @@ class ExperimentOutlierConfig:
     streaming_output: Optional[str] = None
     ripl_data_path: Optional[str] = None
     s_n_column: Optional[str] = None
+    # Data-driven lengthscale source for Gibbs kernel
+    gibbs_lengthscale_source: str = 'data'  # 'data' | 'ripl' | 'auto'
     # Phase 4: Hierarchical experiment structure
     hierarchical_refitting: bool = False
     min_experiments_for_refit: int = 3
@@ -472,6 +479,39 @@ class ExperimentOutlierDetector:
         if also_set_point_outlier:
             result.loc[idx, 'point_outlier'] = gp.outlier_probabilities > 0.5
 
+    def _build_data_lengthscale(self, log_E, log_sigma, mean_fn):
+        """Compute data-driven lengthscale interpolator from residuals.
+
+        Returns ``None`` if:
+        - ``gibbs_lengthscale_source`` is ``'ripl'`` (explicitly skip data)
+        - Smooth mean is not spline (cannot compute residuals)
+        - Kernel is not Gibbs
+        - Data is too sparse (< 10 points)
+
+        Args:
+            log_E: log₁₀(Energy) values.
+            log_sigma: log₁₀(CrossSection) values.
+            mean_fn: Smooth mean function (from ``fit_smooth_mean``).
+
+        Returns:
+            Callable or None.
+        """
+        source = self.config.gibbs_lengthscale_source
+        if source == 'ripl':
+            return None  # User explicitly wants RIPL-3 only
+
+        sm_config = self.config.gp_config.smooth_mean_config
+        kc = self.config.gp_config.kernel_config
+        if (mean_fn is None
+                or sm_config is None
+                or sm_config.smooth_mean_type != 'spline'
+                or kc is None
+                or kc.kernel_type != 'gibbs'):
+            return None
+
+        from nucml_next.data.smooth_mean import compute_lengthscale_from_residuals
+        return compute_lengthscale_from_residuals(log_E, log_sigma, mean_fn)
+
     def _score_single_experiment(
         self,
         df_group: pd.DataFrame,
@@ -502,6 +542,28 @@ class ExperimentOutlierDetector:
                 S_n = float(df_group[self.config.s_n_column].iloc[0])
             group_kernel_config = self._build_kernel_config_for_group(Z, A, S_n=S_n)
 
+        # Compute smooth mean for single experiment
+        single_mean_fn = None
+        sm_config = self.config.gp_config.smooth_mean_config
+        if sm_config is not None:
+            from nucml_next.data.smooth_mean import fit_smooth_mean
+            _log_E = exp_df['log_E'].values
+            _log_sigma = exp_df['log_sigma'].values
+            single_mean_fn = fit_smooth_mean(_log_E, _log_sigma, sm_config)
+
+        # Inject data-driven lengthscale if available
+        if group_kernel_config is not None:
+            data_ls_fn = self._build_data_lengthscale(
+                exp_df['log_E'].values, exp_df['log_sigma'].values,
+                single_mean_fn,
+            )
+            if data_ls_fn is not None:
+                from dataclasses import replace
+                group_kernel_config = replace(
+                    group_kernel_config,
+                    data_lengthscale_interpolator=data_ls_fn,
+                )
+
         # Cannot flag experiment as discrepant with no comparison
         result['experiment_outlier'] = False
 
@@ -509,7 +571,8 @@ class ExperimentOutlierDetector:
             # Fit GP to single experiment
             try:
                 gp = self._fit_experiment_gp(
-                    exp_df, kernel_config=group_kernel_config,
+                    exp_df, mean_fn=single_mean_fn,
+                    kernel_config=group_kernel_config,
                 )
                 self._stats['gp_experiments'] += 1
 
@@ -733,6 +796,20 @@ class ExperimentOutlierDetector:
             S_n = float(df_group[self.config.s_n_column].iloc[0])
 
         group_kernel_config = self._build_kernel_config_for_group(Z, A, S_n=S_n)
+
+        # Inject data-driven lengthscale if available
+        if group_kernel_config is not None:
+            _log_E_pool = df_group['log_E'].values
+            _log_sigma_pool = df_group['log_sigma'].values
+            data_ls_fn = self._build_data_lengthscale(
+                _log_E_pool, _log_sigma_pool, group_mean_fn,
+            )
+            if data_ls_fn is not None:
+                from dataclasses import replace
+                group_kernel_config = replace(
+                    group_kernel_config,
+                    data_lengthscale_interpolator=data_ls_fn,
+                )
 
         # Fit GPs to large experiments
         fitted_gps: Dict[str, ExactGPExperiment] = {}

@@ -63,8 +63,15 @@ class KernelConfig:
         (min, max) bounds for the effective lengthscale after softplus.
     ripl_log_D_interpolator : callable or None
         Injected callable: ``log₁₀(E [eV]) → log₁₀(D [eV])``.
-        Required for Gibbs kernel.  When None and kernel_type='gibbs',
-        ``build_kernel()`` falls back to RBF with a warning.
+        Used by Gibbs kernel for RIPL-3-based lengthscale.
+        When both this and ``data_lengthscale_interpolator`` are None and
+        kernel_type='gibbs', ``build_kernel()`` falls back to RBF.
+    data_lengthscale_interpolator : callable or None
+        Injected callable: ``log₁₀(E [eV]) → signal`` where
+        ``softplus(signal + a₀ + a₁·log_E)`` gives the lengthscale.
+        Computed from local residual variability by
+        ``compute_lengthscale_from_residuals()``.
+        **Takes priority over ``ripl_log_D_interpolator``** when both set.
     """
     kernel_type: str = 'rbf'
     outputscale: float = 1.0
@@ -73,6 +80,7 @@ class KernelConfig:
     gibbs_correction_a1: float = 0.0
     gibbs_lengthscale_bounds: Tuple[float, float] = (0.01, 10.0)
     ripl_log_D_interpolator: Optional[Callable] = None
+    data_lengthscale_interpolator: Optional[Callable] = None
 
 
 class Kernel(ABC):
@@ -224,22 +232,34 @@ def _softplus_torch(x):
 
 
 class GibbsKernel(Kernel):
-    """Nonstationary Gibbs kernel with physics-informed lengthscale.
+    """Nonstationary Gibbs kernel with energy-dependent lengthscale.
 
     K(xᵢ, xⱼ) = σ² · √(2ℓᵢℓⱼ / (ℓᵢ² + ℓⱼ²)) · exp(−(xᵢ−xⱼ)² / (ℓᵢ²+ℓⱼ²))
 
     where the energy-dependent lengthscale is:
 
-        ℓ(log_E) = softplus(log_D(log_E) + a₀ + a₁ · log_E)
+        ℓ(log_E) = softplus(signal(log_E) + a₀ + a₁ · log_E)
 
-    and ``log_D`` is the RIPL-3 mean level spacing interpolator injected
-    via ``config.ripl_log_D_interpolator``.
+    The *signal* function is provided by one of two sources (in priority
+    order):
+
+    1. **Data-driven** (``config.data_lengthscale_interpolator``): Computed
+       from local residual variability via
+       ``compute_lengthscale_from_residuals()``.  Returns
+       ``softplus_inverse(ℓ_desired)`` so that with default ``a₀=a₁=0``
+       the round-trip is exact.
+
+    2. **RIPL-3** (``config.ripl_log_D_interpolator``): Mean level spacing
+       ``log₁₀(D [eV])`` from nuclear structure data.
 
     ``n_optimizable_params = 2`` (a₀, a₁).
     """
 
     def _compute_lengthscales(self, x: np.ndarray) -> np.ndarray:
-        """Compute ℓ(x) for each point using RIPL-3 + corrections.
+        """Compute ℓ(x) for each point using data-driven or RIPL-3 signal.
+
+        Prefers ``data_lengthscale_interpolator`` when available; otherwise
+        falls back to ``ripl_log_D_interpolator``.
 
         Parameters
         ----------
@@ -251,8 +271,10 @@ class GibbsKernel(Kernel):
         ell : ndarray, shape (n,)
             Lengthscale at each point.
         """
-        log_D = self.config.ripl_log_D_interpolator(x)
-        raw = log_D + self.config.gibbs_correction_a0 + self.config.gibbs_correction_a1 * x
+        interpolator = (self.config.data_lengthscale_interpolator
+                        or self.config.ripl_log_D_interpolator)
+        signal = interpolator(x)
+        raw = signal + self.config.gibbs_correction_a0 + self.config.gibbs_correction_a1 * x
         ell = _softplus(raw)
         # Apply bounds
         lb, ub = self.config.gibbs_lengthscale_bounds
@@ -260,15 +282,22 @@ class GibbsKernel(Kernel):
         return ell
 
     def _compute_lengthscales_torch(self, x):
-        """PyTorch version of lengthscale computation."""
+        """PyTorch version of lengthscale computation.
+
+        Prefers ``data_lengthscale_interpolator`` when available; otherwise
+        falls back to ``ripl_log_D_interpolator``.
+        """
         import torch
 
-        # Evaluate RIPL-3 interpolator on CPU numpy, then convert
-        x_np = x.detach().cpu().numpy()
-        log_D_np = self.config.ripl_log_D_interpolator(x_np)
-        log_D = torch.tensor(log_D_np, dtype=x.dtype, device=x.device)
+        interpolator = (self.config.data_lengthscale_interpolator
+                        or self.config.ripl_log_D_interpolator)
 
-        raw = log_D + self.config.gibbs_correction_a0 + self.config.gibbs_correction_a1 * x
+        # Evaluate interpolator on CPU numpy, then convert
+        x_np = x.detach().cpu().numpy()
+        signal_np = interpolator(x_np)
+        signal = torch.tensor(signal_np, dtype=x.dtype, device=x.device)
+
+        raw = signal + self.config.gibbs_correction_a0 + self.config.gibbs_correction_a1 * x
         ell = _softplus_torch(raw)
         lb, ub = self.config.gibbs_lengthscale_bounds
         ell = torch.clamp(ell, lb, ub)
@@ -376,9 +405,12 @@ def build_kernel(config: Optional[KernelConfig] = None) -> Kernel:
         return RBFKernel(config)
 
     if config.kernel_type == 'gibbs':
-        if config.ripl_log_D_interpolator is None:
+        interpolator = (config.data_lengthscale_interpolator
+                        or config.ripl_log_D_interpolator)
+        if interpolator is None:
             logger.warning(
-                "Gibbs kernel requested but no RIPL-3 interpolator provided; "
+                "Gibbs kernel requested but no lengthscale interpolator "
+                "provided (neither data-driven nor RIPL-3); "
                 "falling back to RBF kernel"
             )
             return RBFKernel(config)

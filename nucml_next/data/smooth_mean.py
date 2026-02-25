@@ -277,3 +277,163 @@ def _deduplicate_sorted(x: np.ndarray, y: np.ndarray) -> tuple:
     y_averaged = np.array([np.mean(g) for g in y_groups])
 
     return x_unique, y_averaged
+
+
+# ---------------------------------------------------------------------------
+# Data-driven lengthscale estimation
+# ---------------------------------------------------------------------------
+
+def _softplus_inverse(x: np.ndarray) -> np.ndarray:
+    """Inverse of softplus: log(exp(x) - 1).  Numerically stable.
+
+    For large x, softplus(x) ≈ x, so softplus_inverse(x) ≈ x.
+    For small x, use log(expm1(x)) directly.
+
+    Args:
+        x: Input values (must be > 0 for valid output).
+
+    Returns:
+        Array of same shape with softplus_inverse(x).
+    """
+    x = np.asarray(x, dtype=float)
+    return np.where(x > 20, x, np.log(np.expm1(np.clip(x, 1e-10, 20))))
+
+
+def compute_lengthscale_from_residuals(
+    log_E: np.ndarray,
+    log_sigma: np.ndarray,
+    mean_fn: Callable[[np.ndarray], np.ndarray],
+    window_fraction: float = 0.1,
+    min_window_points: int = 15,
+    smoothing_factor: float = 1.0,
+    min_lengthscale: float = 0.02,
+    max_lengthscale: float = 2.0,
+) -> Optional[Callable[[np.ndarray], np.ndarray]]:
+    """Compute energy-dependent lengthscale from local residual variability.
+
+    Estimates the Gibbs kernel lengthscale at each energy from how volatile
+    the smooth-mean residuals are locally.  Where residuals are noisy
+    (e.g. the resolved resonance region), the lengthscale is short; where
+    residuals are smooth (thermal, continuum), the lengthscale is long.
+
+    The returned callable maps ``log₁₀(E [eV])`` to a *signal* value such
+    that ``softplus(signal + a₀ + a₁·log_E)`` yields the desired
+    lengthscale.  With default Gibbs corrections ``a₀ = a₁ = 0``, this
+    gives ``softplus(softplus_inverse(ℓ)) = ℓ`` exactly.
+
+    Args:
+        log_E: log₁₀(Energy) values, shape (n,).
+        log_sigma: log₁₀(CrossSection) values, shape (n,).
+        mean_fn: Smooth mean function (from ``fit_smooth_mean``).
+        window_fraction: Half-width of the rolling window as a fraction
+            of the total energy range (in log₁₀ decades).
+        min_window_points: Minimum number of neighbours in a window.
+            If the energy window contains fewer, expand to k-nearest.
+        smoothing_factor: Controls the MAD → lengthscale mapping steepness.
+            Higher values make the lengthscale drop faster with variability.
+        min_lengthscale: Floor for the output lengthscale.
+        max_lengthscale: Ceiling for the output lengthscale.
+
+    Returns:
+        Callable ``log_E_query → signal_values`` compatible with
+        ``GibbsKernel._compute_lengthscales()``, or ``None`` if the data
+        is too sparse (fewer than 10 points).
+    """
+    from scipy.interpolate import interp1d
+    from scipy.ndimage import median_filter
+
+    log_E = np.asarray(log_E, dtype=float).ravel()
+    log_sigma = np.asarray(log_sigma, dtype=float).ravel()
+
+    # Edge case: too few points
+    if len(log_E) < 10:
+        return None
+
+    # Filter NaN/inf
+    valid = np.isfinite(log_E) & np.isfinite(log_sigma)
+    log_E = log_E[valid]
+    log_sigma = log_sigma[valid]
+
+    if len(log_E) < 10:
+        return None
+
+    # 1. Sort by energy
+    order = np.argsort(log_E)
+    x = log_E[order]
+    y = log_sigma[order]
+
+    # 2. Compute residuals from smooth mean
+    r = y - mean_fn(x)
+
+    n = len(x)
+
+    # 3. Rolling MAD in adaptive energy window
+    energy_range = x[-1] - x[0]
+    half_width = max(energy_range * window_fraction, 0.1)
+
+    mad = np.empty(n)
+    for i in range(n):
+        # Energy-based window
+        lo = x[i] - half_width
+        hi = x[i] + half_width
+        mask = (x >= lo) & (x <= hi)
+        n_in_window = mask.sum()
+
+        if n_in_window < min_window_points:
+            # Expand to k-nearest neighbours
+            distances = np.abs(x - x[i])
+            k = min(min_window_points, n)
+            idx = np.argpartition(distances, k)[:k]
+            r_local = r[idx]
+        else:
+            r_local = r[mask]
+
+        # MAD with consistency constant
+        med_local = np.median(r_local)
+        mad[i] = np.median(np.abs(r_local - med_local)) * 1.4826
+
+    # 4. MAD → lengthscale (inverse relationship)
+    positive_mad = mad[mad > 0]
+    if len(positive_mad) == 0:
+        # All identical residuals → uniform max lengthscale
+        signal = np.full(n, _softplus_inverse(np.array([max_lengthscale]))[0])
+        interpolator = interp1d(
+            x, signal,
+            kind='linear',
+            fill_value=(signal[0], signal[-1]),
+            bounds_error=False,
+        )
+        return interpolator
+
+    median_mad = np.median(positive_mad)
+    ell = max_lengthscale * np.exp(-smoothing_factor * mad / median_mad)
+    ell = np.clip(ell, min_lengthscale, max_lengthscale)
+
+    # 5. Smooth the lengthscale profile with median filter
+    # Use a wide window (≈10% of points, min 3, max 51, must be odd)
+    filter_size = max(3, min(51, n // 10))
+    if filter_size % 2 == 0:
+        filter_size += 1
+    ell_smooth = median_filter(ell, size=filter_size)
+
+    # 6. Convert to softplus-compatible signal
+    signal = _softplus_inverse(ell_smooth)
+
+    # 7. Build interpolator
+    # De-duplicate x to avoid interp1d errors with repeated energies
+    x_unique, indices = np.unique(x, return_index=True)
+    signal_unique = signal[indices]
+
+    if len(x_unique) < 2:
+        # Degenerate: only one unique energy
+        const_signal = float(signal_unique[0])
+        return lambda log_E_q: np.full(np.asarray(log_E_q).shape, const_signal)
+
+    interpolator = interp1d(
+        x_unique, signal_unique,
+        kind='linear',
+        fill_value=(signal_unique[0], signal_unique[-1]),
+        bounds_error=False,
+    )
+
+    return interpolator

@@ -212,10 +212,21 @@ Note:
              'RIPL-3 nuclear level density (requires --ripl-data-path).'
     )
     parser.add_argument(
+        '--gibbs-lengthscale-source',
+        type=str,
+        default='data',
+        choices=['data', 'ripl', 'auto'],
+        help='Lengthscale source for Gibbs kernel (default: data). '
+             '"data" computes from local residual variability (requires --smooth-mean spline). '
+             '"ripl" uses RIPL-3 level density (requires --ripl-data-path). '
+             '"auto" tries data first, falls back to RIPL-3.'
+    )
+    parser.add_argument(
         '--ripl-data-path',
         type=str,
         default=None,
-        help='Path to RIPL-3 levels-param.data file (required for --kernel-type gibbs). '
+        help='Path to RIPL-3 levels-param.data file (required for --kernel-type gibbs '
+             'with --gibbs-lengthscale-source ripl). '
              'Without this, Gibbs kernel falls back to RBF.'
     )
     parser.add_argument(
@@ -371,10 +382,15 @@ Note:
                 print(f"         Falling back to CPU.")
                 args.svgp_device = 'cpu'
 
-        # Warn if Gibbs kernel requested without RIPL data
-        if args.kernel_type == 'gibbs' and not args.ripl_data_path:
-            print("WARNING: --kernel-type gibbs requires --ripl-data-path. "
-                  "Gibbs kernel will fall back to RBF without RIPL-3 data.")
+        # Warn about Gibbs kernel requirements
+        if args.kernel_type == 'gibbs':
+            ls_src = args.gibbs_lengthscale_source
+            if ls_src in ('data', 'auto') and args.smooth_mean == 'constant':
+                print("WARNING: --gibbs-lengthscale-source data requires --smooth-mean spline. "
+                      "Will fall back to RIPL-3 or RBF.")
+            if ls_src == 'ripl' and not args.ripl_data_path:
+                print("WARNING: --gibbs-lengthscale-source ripl requires --ripl-data-path. "
+                      "Gibbs kernel will fall back to RBF.")
 
         # Phase 1: Smooth mean config
         smooth_mean_config = None
@@ -408,6 +424,7 @@ Note:
             point_z_threshold=args.z_threshold,
             checkpoint_dir=args.svgp_checkpoint_dir,
             ripl_data_path=args.ripl_data_path,
+            gibbs_lengthscale_source=args.gibbs_lengthscale_source,
             hierarchical_refitting=args.hierarchical_refitting,
         )
 
@@ -430,7 +447,7 @@ Note:
         if args.smooth_mean != 'constant':
             features.append(f"mean={args.smooth_mean}")
         if args.kernel_type != 'rbf':
-            features.append(f"kernel={args.kernel_type}")
+            features.append(f"kernel={args.kernel_type}({args.gibbs_lengthscale_source})")
         if args.likelihood != 'gaussian':
             features.append(f"likelihood={args.likelihood}")
         if args.hierarchical_refitting:
