@@ -297,12 +297,44 @@ class ExactGPExperiment:
         - RBF (1 param): Grid + Brent search over lengthscale
         - Gibbs (2 params): Grid-initialised Nelder-Mead over (a₀, a₁)
 
+        **Data-driven Gibbs short-circuit:** When the kernel has a
+        ``data_lengthscale_interpolator`` (from ``compute_lengthscale_from_residuals``),
+        the base profile already captures the physics.  Optimising (a₀, a₁)
+        destroys the profile (e.g. a₀≈-3, a₁≈-1.4 collapses ℓ to 10⁻⁶).
+        Instead, fix a₀=a₁=0 and compute Wasserstein metric once.
+
         Uses _effective_device which may be downgraded from config.device
         for large experiments.
 
         When ``self._refit_param_bounds`` is set (by ``refit_with_constraints``),
         passes the bounds through to the optimiser for constrained search.
         """
+        # Data-driven Gibbs: skip (a₀, a₁) optimisation — profile IS the lengthscale
+        if (hasattr(self._kernel, 'config')
+                and getattr(self._kernel.config, 'data_lengthscale_interpolator', None) is not None):
+            self._kernel.set_optimizable_params(
+                np.zeros(self._kernel.n_optimizable_params())
+            )
+            # Compute Wasserstein metric once (for diagnostics / hierarchical stats)
+            from nucml_next.data.calibration import (
+                compute_loo_z_scores_kernel,
+                compute_wasserstein_calibration,
+            )
+            z = compute_loo_z_scores_kernel(
+                self._train_x, self._train_y, self._noise_variance,
+                self._kernel, self._mean_value,
+            )
+            self.calibration_metric = compute_wasserstein_calibration(z)
+            # _lengthscale stores a₀=0.0 here — misleading for Gibbs (ℓ varies
+            # by energy) but harmless; only used for diagnostics dict.
+            self._lengthscale = self._kernel.get_all_params().get(
+                'lengthscale', self._kernel.get_optimizable_params()[0]
+            )
+            logger.debug(
+                f"Data-driven Gibbs: a₀=a₁=0, W={self.calibration_metric:.4f}"
+            )
+            return
+
         bounds_override = getattr(self, '_refit_param_bounds', None)
 
         if self._effective_device != 'cpu':

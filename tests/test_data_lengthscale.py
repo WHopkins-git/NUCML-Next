@@ -296,6 +296,45 @@ class TestGibbsWithDataInterpolator:
         kernel = build_kernel(config)
         assert isinstance(kernel, GibbsKernel)
 
+    def test_data_driven_skips_optimization(self):
+        """When data_lengthscale_interpolator is set, a₀=a₁ stay at 0."""
+        from nucml_next.data.experiment_gp import (
+            ExactGPExperiment,
+            ExactGPExperimentConfig,
+        )
+
+        rng = np.random.RandomState(42)
+        n = 60
+        log_E = np.sort(rng.uniform(0, 6, n))
+        trend = 2.0 - 0.3 * log_E
+        log_sigma = trend + rng.normal(0, 0.1, n)
+        log_unc = np.full(n, 0.05)
+
+        mean_fn = fit_smooth_mean(
+            log_E, log_sigma, SmoothMeanConfig(smooth_mean_type='spline'),
+        )
+        data_interp = compute_lengthscale_from_residuals(
+            log_E, log_sigma, mean_fn,
+        )
+
+        config = ExactGPExperimentConfig(
+            kernel_config=KernelConfig(
+                kernel_type='gibbs',
+                data_lengthscale_interpolator=data_interp,
+            ),
+        )
+        gp = ExactGPExperiment(config)
+        gp.fit(log_E, log_sigma, log_unc, mean_fn=mean_fn)
+
+        # a₀ and a₁ should be exactly 0 (not optimised)
+        params = gp._kernel.get_optimizable_params()
+        assert params[0] == 0.0, f"a₀ should be 0, got {params[0]}"
+        assert params[1] == 0.0, f"a₁ should be 0, got {params[1]}"
+
+        # Calibration metric should still be computed
+        assert gp.calibration_metric is not None
+        assert np.isfinite(gp.calibration_metric)
+
 
 # ===========================================================================
 # End-to-end integration tests
