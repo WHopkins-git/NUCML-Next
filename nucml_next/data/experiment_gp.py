@@ -241,7 +241,12 @@ class ExactGPExperiment:
             self._kernel = build_kernel(KernelConfig(
                 lengthscale=initial_lengthscale,
             ))
-        self._kernel.config.outputscale = self._outputscale
+        # When outputscale_fn is set, the kernel uses σ(xᵢ)·σ(xⱼ) instead of
+        # the scalar outputscale.  Don't overwrite the fn's effect.
+        # self._outputscale is still stored for diagnostics regardless.
+        if (self.config.kernel_config is None
+                or self.config.kernel_config.outputscale_fn is None):
+            self._kernel.config.outputscale = self._outputscale
 
         # Optimize kernel parameters (lengthscale for RBF, or a₀/a₁ for Gibbs)
         if self.config.use_wasserstein_calibration:

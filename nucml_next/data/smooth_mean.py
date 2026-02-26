@@ -299,6 +299,55 @@ def _softplus_inverse(x: np.ndarray) -> np.ndarray:
     return np.where(x > 20, x, np.log(np.expm1(np.clip(x, 1e-10, 20))))
 
 
+def _compute_rolling_mad(
+    x: np.ndarray,
+    r: np.ndarray,
+    window_fraction: float = 0.1,
+    min_window_points: int = 15,
+) -> np.ndarray:
+    """Rolling MAD of residuals in adaptive energy windows.
+
+    Shared helper for ``compute_lengthscale_from_residuals()`` and
+    ``compute_outputscale_from_residuals()``.
+
+    Args:
+        x: Sorted energy values, shape (n,).
+        r: Residuals from smooth mean (same order as x), shape (n,).
+        window_fraction: Half-width of the rolling window as a fraction
+            of the total energy range.
+        min_window_points: Minimum number of neighbours in a window.
+
+    Returns:
+        Array of MAD * 1.4826 (robust std estimate) at each point, shape (n,).
+    """
+    n = len(x)
+    energy_range = x[-1] - x[0]
+    half_width = max(energy_range * window_fraction, 0.1)
+
+    mad = np.empty(n)
+    for i in range(n):
+        lo = x[i] - half_width
+        hi = x[i] + half_width
+        mask = (x >= lo) & (x <= hi)
+        n_in_window = mask.sum()
+
+        if n_in_window < min_window_points:
+            distances = np.abs(x - x[i])
+            k = min(min_window_points, n)
+            if k >= n:
+                r_local = r  # Use all points
+            else:
+                idx = np.argpartition(distances, k)[:k]
+                r_local = r[idx]
+        else:
+            r_local = r[mask]
+
+        med_local = np.median(r_local)
+        mad[i] = np.median(np.abs(r_local - med_local)) * 1.4826
+
+    return mad
+
+
 def compute_lengthscale_from_residuals(
     log_E: np.ndarray,
     log_sigma: np.ndarray,
@@ -368,32 +417,7 @@ def compute_lengthscale_from_residuals(
     n = len(x)
 
     # 3. Rolling MAD in adaptive energy window
-    energy_range = x[-1] - x[0]
-    half_width = max(energy_range * window_fraction, 0.1)
-
-    mad = np.empty(n)
-    for i in range(n):
-        # Energy-based window
-        lo = x[i] - half_width
-        hi = x[i] + half_width
-        mask = (x >= lo) & (x <= hi)
-        n_in_window = mask.sum()
-
-        if n_in_window < min_window_points:
-            # Expand to k-nearest neighbours
-            distances = np.abs(x - x[i])
-            k = min(min_window_points, n)
-            if k >= n:
-                r_local = r  # Use all points
-            else:
-                idx = np.argpartition(distances, k)[:k]
-                r_local = r[idx]
-        else:
-            r_local = r[mask]
-
-        # MAD with consistency constant
-        med_local = np.median(r_local)
-        mad[i] = np.median(np.abs(r_local - med_local)) * 1.4826
+    mad = _compute_rolling_mad(x, r, window_fraction, min_window_points)
 
     # 4. MAD → lengthscale (inverse relationship)
     positive_mad = mad[mad > 0]
@@ -448,19 +472,22 @@ def compute_outputscale_from_residuals(
     mean_fn: Callable[[np.ndarray], np.ndarray],
     window_fraction: float = 0.1,
     min_window_points: int = 15,
-    min_outputscale_std: float = 0.1,
-    max_outputscale_std: float = 5.0,
+    min_outputscale: float = 0.05,
+    max_outputscale: float = 3.0,
+    floor_multiplier: float = 1.5,
 ) -> Optional[Callable[[np.ndarray], np.ndarray]]:
-    """Compute energy-dependent outputscale (std dev) from local residual variability.
+    """Compute energy-dependent GP outputscale from local residual variability.
 
-    Estimates σ(E) — the GP prior standard deviation — at each energy from
-    how volatile the smooth-mean residuals are locally.  Where residuals are
-    large (resonance region, peaks deviate orders of magnitude), σ is large;
-    where residuals are small (thermal, continuum), σ is small.
+    The returned callable maps ``log₁₀(E [eV])`` to σ(E), the local amplitude
+    (standard deviation scale) the GP should use as its prior.
 
-    The returned callable maps ``log₁₀(E [eV])`` to σ(E) values.  The kernel
-    uses ``K(xᵢ, xⱼ) = σ(xᵢ)·σ(xⱼ)·K_unit(xᵢ, xⱼ)`` so that the prior
-    variance at each energy is σ(E)² — energy-appropriate.
+    In regions where cross-sections vary wildly (resonances, fission threshold),
+    σ is large → GP has wide uncertainty → doesn't flag structure as outliers.
+    In smooth regions (thermal, high-energy continuum), σ is small → GP is
+    sensitive → genuine outliers are caught.
+
+    The kernel uses ``K(xᵢ, xⱼ) = σ(xᵢ)·σ(xⱼ)·K_unit(xᵢ, xⱼ)`` so the
+    prior variance at energy E is σ(E)².
 
     Args:
         log_E: log₁₀(Energy) values, shape (n,).
@@ -469,8 +496,11 @@ def compute_outputscale_from_residuals(
         window_fraction: Half-width of the rolling window as a fraction
             of the total energy range (in log₁₀ decades).
         min_window_points: Minimum number of neighbours in a window.
-        min_outputscale_std: Floor for σ(E).
-        max_outputscale_std: Ceiling for σ(E).
+        min_outputscale: Floor on σ(E). Prevents zero in very smooth regions.
+        max_outputscale: Ceiling on σ(E). Prevents absurd values.
+        floor_multiplier: σ(E) = max(MAD × floor_multiplier, min_outputscale).
+            The multiplier > 1 ensures the GP prior is slightly wider than the
+            observed variability, so typical scatter is not flagged.
 
     Returns:
         Callable ``log_E_query → σ(log_E_query)`` array, or ``None`` if the
@@ -505,41 +535,19 @@ def compute_outputscale_from_residuals(
     n = len(x)
 
     # 3. Rolling MAD in adaptive energy window
-    energy_range = x[-1] - x[0]
-    half_width = max(energy_range * window_fraction, 0.1)
+    mad = _compute_rolling_mad(x, r, window_fraction, min_window_points)
 
-    sigma_local = np.empty(n)
-    for i in range(n):
-        # Energy-based window
-        lo = x[i] - half_width
-        hi = x[i] + half_width
-        mask = (x >= lo) & (x <= hi)
-        n_in_window = mask.sum()
+    # 4. Scale by floor_multiplier and clip to [min, max]
+    #    floor_multiplier > 1 makes the GP prior wider than observed scatter,
+    #    preventing typical variability from triggering outlier flags.
+    sigma = np.clip(mad * floor_multiplier, min_outputscale, max_outputscale)
 
-        if n_in_window < min_window_points:
-            # Expand to k-nearest neighbours
-            distances = np.abs(x - x[i])
-            k = min(min_window_points, n)
-            if k >= n:
-                r_local = r  # Use all points
-            else:
-                idx = np.argpartition(distances, k)[:k]
-                r_local = r[idx]
-        else:
-            r_local = r[mask]
-
-        # MAD with consistency constant → robust std estimate
-        med_local = np.median(r_local)
-        sigma_local[i] = np.median(np.abs(r_local - med_local)) * 1.4826
-
-    # 4. Clip to [min, max]
-    sigma_local = np.clip(sigma_local, min_outputscale_std, max_outputscale_std)
-
-    # 5. Smooth with median filter (same logic as lengthscale)
+    # 5. Smooth with median filter
     filter_size = max(3, min(51, n // 10))
     if filter_size % 2 == 0:
         filter_size += 1
-    sigma_smooth = median_filter(sigma_local, size=filter_size)
+    sigma_smooth = median_filter(sigma, size=filter_size)
+    sigma_smooth = np.clip(sigma_smooth, min_outputscale, max_outputscale)
 
     # 6. Build interpolator
     x_unique, indices = np.unique(x, return_index=True)

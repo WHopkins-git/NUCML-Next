@@ -72,13 +72,14 @@ class KernelConfig:
         Computed from local residual variability by
         ``compute_lengthscale_from_residuals()``.
         **Takes priority over ``ripl_log_D_interpolator``** when both set.
-    data_outputscale_interpolator : callable or None
+    outputscale_fn : callable or None
         Injected callable: ``log₁₀(E [eV]) → σ(E)`` (standard deviation).
         Computed from local residual variability by
         ``compute_outputscale_from_residuals()``.
         When set, the kernel computes
         ``K(xᵢ,xⱼ) = σ(xᵢ)·σ(xⱼ)·K_unit(xᵢ,xⱼ)``
         and the scalar ``outputscale`` field is ignored.
+        Works with both RBF and Gibbs kernels.
     """
     kernel_type: str = 'rbf'
     outputscale: float = 1.0
@@ -88,7 +89,7 @@ class KernelConfig:
     gibbs_lengthscale_bounds: Tuple[float, float] = (0.01, 10.0)
     ripl_log_D_interpolator: Optional[Callable] = None
     data_lengthscale_interpolator: Optional[Callable] = None
-    data_outputscale_interpolator: Optional[Callable] = None
+    outputscale_fn: Optional[Callable] = None
 
 
 class Kernel(ABC):
@@ -172,13 +173,13 @@ class Kernel(ABC):
     ) -> Union[float, np.ndarray]:
         """Prior variance K(x, x).
 
-        When ``data_outputscale_interpolator`` is set and ``x`` is provided,
+        When ``outputscale_fn`` is set and ``x`` is provided,
         returns σ(x)² as an array (energy-dependent prior variance).
         Otherwise returns the scalar ``outputscale``.
         """
         if (x is not None
-                and self.config.data_outputscale_interpolator is not None):
-            sigma = self.config.data_outputscale_interpolator(
+                and self.config.outputscale_fn is not None):
+            sigma = self.config.outputscale_fn(
                 np.asarray(x, dtype=float).ravel()
             )
             return sigma ** 2
@@ -211,9 +212,9 @@ class RBFKernel(Kernel):
         diff = x1[:, None] - x2[None, :]
 
         # Energy-dependent or scalar outputscale
-        if self.config.data_outputscale_interpolator is not None:
-            sigma1 = self.config.data_outputscale_interpolator(x1)  # (n1,)
-            sigma2 = self.config.data_outputscale_interpolator(x2)  # (n2,)
+        if self.config.outputscale_fn is not None:
+            sigma1 = self.config.outputscale_fn(x1)  # (n1,)
+            sigma2 = self.config.outputscale_fn(x2)  # (n2,)
             scale = sigma1[:, None] * sigma2[None, :]               # (n1, n2)
         else:
             scale = self.config.outputscale  # scalar
@@ -232,11 +233,11 @@ class RBFKernel(Kernel):
         diff = x1.unsqueeze(1) - x2.unsqueeze(0)
 
         # Energy-dependent or scalar outputscale
-        if self.config.data_outputscale_interpolator is not None:
+        if self.config.outputscale_fn is not None:
             x1_np = x1.detach().cpu().numpy()
             x2_np = x2.detach().cpu().numpy()
-            s1_np = self.config.data_outputscale_interpolator(x1_np)
-            s2_np = self.config.data_outputscale_interpolator(x2_np)
+            s1_np = self.config.outputscale_fn(x1_np)
+            s2_np = self.config.outputscale_fn(x2_np)
             s1 = torch.tensor(s1_np, dtype=x1.dtype, device=x1.device)
             s2 = torch.tensor(s2_np, dtype=x2.dtype, device=x2.device)
             scale = s1.unsqueeze(1) * s2.unsqueeze(0)  # (n1, n2)
@@ -377,9 +378,9 @@ class GibbsKernel(Kernel):
 
         # Exponential factor: exp(-(xi - xj)² / (li² + lj²))
         # Energy-dependent or scalar outputscale
-        if self.config.data_outputscale_interpolator is not None:
-            sigma1 = self.config.data_outputscale_interpolator(x1)  # (n1,)
-            sigma2 = self.config.data_outputscale_interpolator(x2)  # (n2,)
+        if self.config.outputscale_fn is not None:
+            sigma1 = self.config.outputscale_fn(x1)  # (n1,)
+            sigma2 = self.config.outputscale_fn(x2)  # (n2,)
             scale = sigma1[:, None] * sigma2[None, :]               # (n1, n2)
         else:
             scale = self.config.outputscale  # scalar
@@ -409,11 +410,11 @@ class GibbsKernel(Kernel):
         diff = x1.unsqueeze(1) - x2.unsqueeze(0)
 
         # Energy-dependent or scalar outputscale
-        if self.config.data_outputscale_interpolator is not None:
+        if self.config.outputscale_fn is not None:
             x1_np = x1.detach().cpu().numpy()
             x2_np = x2.detach().cpu().numpy()
-            s1_np = self.config.data_outputscale_interpolator(x1_np)
-            s2_np = self.config.data_outputscale_interpolator(x2_np)
+            s1_np = self.config.outputscale_fn(x1_np)
+            s2_np = self.config.outputscale_fn(x2_np)
             s1 = torch.tensor(s1_np, dtype=x1.dtype, device=x1.device)
             s2 = torch.tensor(s2_np, dtype=x2.dtype, device=x2.device)
             scale = s1.unsqueeze(1) * s2.unsqueeze(0)  # (n1, n2)

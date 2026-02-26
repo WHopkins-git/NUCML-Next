@@ -515,7 +515,15 @@ class ExperimentOutlierDetector:
     def _build_data_outputscale(self, log_E, log_sigma, mean_fn):
         """Compute data-driven outputscale interpolator from residuals.
 
-        Returns ``None`` under the same conditions as ``_build_data_lengthscale``.
+        Returns ``None`` if:
+        - ``gibbs_lengthscale_source`` is ``'ripl'`` (explicitly skip data)
+        - Smooth mean is not spline (cannot compute residuals)
+        - Kernel type is not 'gibbs' or 'rbf'
+        - Data is too sparse (< 10 points)
+
+        Unlike ``_build_data_lengthscale()``, this works with **both** RBF
+        and Gibbs kernels — the energy-dependent outputscale is orthogonal
+        to the kernel choice.
 
         The returned callable maps ``log₁₀(E) → σ(E)`` (standard deviation)
         so the kernel uses ``K(xᵢ,xⱼ) = σ(xᵢ)·σ(xⱼ)·K_unit(xᵢ,xⱼ)``,
@@ -531,7 +539,7 @@ class ExperimentOutlierDetector:
                 or sm_config is None
                 or sm_config.smooth_mean_type != 'spline'
                 or kc is None
-                or kc.kernel_type != 'gibbs'):
+                or kc.kernel_type not in ('gibbs', 'rbf')):
             return None
 
         from nucml_next.data.smooth_mean import compute_outputscale_from_residuals
@@ -592,7 +600,7 @@ class ExperimentOutlierDetector:
                 from dataclasses import replace
                 group_kernel_config = replace(
                     group_kernel_config,
-                    data_outputscale_interpolator=data_os_fn,
+                    outputscale_fn=data_os_fn,
                 )
 
         # Cannot flag experiment as discrepant with no comparison
@@ -848,7 +856,7 @@ class ExperimentOutlierDetector:
                 from dataclasses import replace
                 group_kernel_config = replace(
                     group_kernel_config,
-                    data_outputscale_interpolator=data_os_fn,
+                    outputscale_fn=data_os_fn,
                 )
 
         # Fit GPs to large experiments

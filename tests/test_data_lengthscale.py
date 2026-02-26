@@ -493,20 +493,38 @@ class TestComputeOutputscaleFromResiduals:
         )
 
     def test_output_range(self):
-        """All σ values within [min_std, max_std]."""
+        """All σ values within [min_outputscale, max_outputscale]."""
         log_E, log_sigma, mean_fn = _make_synthetic_data(n=200)
-        min_std, max_std = 0.05, 3.0
+        min_os, max_os = 0.05, 3.0
         result = compute_outputscale_from_residuals(
             log_E, log_sigma, mean_fn,
-            min_outputscale_std=min_std,
-            max_outputscale_std=max_std,
+            min_outputscale=min_os,
+            max_outputscale=max_os,
         )
         assert result is not None
 
         query = np.linspace(0, 6, 100)
         sigma = result(query)
-        assert np.all(sigma >= min_std - 1e-10)
-        assert np.all(sigma <= max_std + 1e-10)
+        assert np.all(sigma >= min_os - 1e-10)
+        assert np.all(sigma <= max_os + 1e-10)
+
+    def test_constant_data_returns_floor(self):
+        """All identical log_sigma → returns min_outputscale everywhere."""
+        rng = np.random.RandomState(42)
+        log_E = np.sort(rng.uniform(0, 6, 50))
+        log_sigma = np.full(50, 1.5)  # perfectly constant
+        mean_fn = lambda x: np.full_like(x, 1.5)
+
+        min_os = 0.05
+        result = compute_outputscale_from_residuals(
+            log_E, log_sigma, mean_fn,
+            min_outputscale=min_os,
+        )
+        assert result is not None
+        query = np.linspace(0.5, 5.5, 20)
+        sigma = result(query)
+        # All values should be at the floor (MAD = 0 → clipped to min)
+        np.testing.assert_allclose(sigma, min_os, atol=1e-10)
 
     def test_few_points_returns_none(self):
         """Fewer than 10 points returns None."""
@@ -521,7 +539,7 @@ class TestEnergyDependentOutputscaleKernel:
     """Tests for kernel integration with energy-dependent outputscale."""
 
     def test_gibbs_kernel_psd_with_outputscale_interp(self):
-        """GibbsKernel with data_outputscale_interpolator produces PSD matrix."""
+        """GibbsKernel with outputscale_fn produces PSD matrix."""
         from scipy.interpolate import interp1d
 
         # Create lengthscale interpolator
@@ -546,7 +564,7 @@ class TestEnergyDependentOutputscaleKernel:
         config = KernelConfig(
             kernel_type='gibbs',
             data_lengthscale_interpolator=ls_interp,
-            data_outputscale_interpolator=os_interp,
+            outputscale_fn=os_interp,
         )
         kernel = GibbsKernel(config)
         x = np.linspace(0.5, 5.5, 30)
@@ -576,7 +594,7 @@ class TestEnergyDependentOutputscaleKernel:
         config = KernelConfig(
             kernel_type='rbf',
             outputscale=1.0,
-            data_outputscale_interpolator=os_interp,
+            outputscale_fn=os_interp,
         )
         from nucml_next.data.kernels import RBFKernel
         kernel = RBFKernel(config)
@@ -616,7 +634,7 @@ class TestEnergyDependentOutputscaleKernel:
             kernel_config=KernelConfig(
                 kernel_type='gibbs',
                 data_lengthscale_interpolator=data_ls,
-                data_outputscale_interpolator=data_os,
+                outputscale_fn=data_os,
             ),
         )
         gp = ExactGPExperiment(config)
@@ -630,3 +648,81 @@ class TestEnergyDependentOutputscaleKernel:
         assert np.all(np.isfinite(mean))
         assert np.all(np.isfinite(std))
         assert np.all(std > 0)
+
+    def test_rbf_energy_dependent_outputscale(self):
+        """RBFKernel with outputscale_fn: K_diag varies, PSD."""
+        from scipy.interpolate import interp1d
+        from nucml_next.data.kernels import RBFKernel
+
+        x_grid = np.linspace(0, 6, 20)
+        sigma_vals = np.linspace(0.2, 2.0, 20)
+        os_interp = interp1d(
+            x_grid, sigma_vals, kind='linear',
+            fill_value=(sigma_vals[0], sigma_vals[-1]),
+            bounds_error=False,
+        )
+
+        config = KernelConfig(
+            kernel_type='rbf',
+            lengthscale=1.0,
+            outputscale_fn=os_interp,
+        )
+        kernel = RBFKernel(config)
+        x = np.linspace(0.5, 5.5, 30)
+        K = kernel.compute_matrix(x)
+
+        # PSD check
+        eigvals = np.linalg.eigvalsh(K)
+        assert np.all(eigvals >= -1e-10), f"Min eigenvalue: {eigvals.min()}"
+
+        # Diagonal = σ(x)² (RBF unit kernel is 1 on diagonal)
+        diag = np.diag(K)
+        expected_diag = os_interp(x) ** 2
+        np.testing.assert_allclose(diag, expected_diag, rtol=1e-10)
+
+        # K_diag should NOT be constant
+        assert diag.max() / diag.min() > 2.0, "K_diag should vary"
+
+    def test_outputscale_fn_overrides_scalar(self):
+        """When outputscale_fn is set, scalar outputscale has no effect."""
+        from scipy.interpolate import interp1d
+        from nucml_next.data.kernels import RBFKernel
+
+        x_grid = np.linspace(0, 6, 10)
+        sigma_vals = np.full(10, 0.5)  # constant σ = 0.5
+        os_interp = interp1d(
+            x_grid, sigma_vals, kind='linear',
+            fill_value=(0.5, 0.5), bounds_error=False,
+        )
+
+        x = np.array([1.0, 3.0, 5.0])
+
+        # With outputscale_fn: scalar should be irrelevant
+        config1 = KernelConfig(outputscale=999.0, outputscale_fn=os_interp)
+        k1 = RBFKernel(config1)
+        K1 = k1.compute_matrix(x)
+
+        config2 = KernelConfig(outputscale=0.001, outputscale_fn=os_interp)
+        k2 = RBFKernel(config2)
+        K2 = k2.compute_matrix(x)
+
+        # Matrices should be identical (scalar is ignored)
+        np.testing.assert_allclose(K1, K2, rtol=1e-10)
+        # Diagonal should be σ² = 0.25
+        np.testing.assert_allclose(np.diag(K1), 0.25, rtol=1e-10)
+
+    def test_no_outputscale_fn_uses_scalar(self):
+        """When outputscale_fn is None, scalar outputscale is used (backward compat)."""
+        from nucml_next.data.kernels import RBFKernel
+
+        x = np.array([1.0, 3.0, 5.0])
+
+        config = KernelConfig(outputscale=2.5, outputscale_fn=None)
+        kernel = RBFKernel(config)
+        K = kernel.compute_matrix(x)
+
+        # Diagonal should be exactly outputscale = 2.5
+        np.testing.assert_allclose(np.diag(K), 2.5, rtol=1e-10)
+
+        # prior_variance without x should return scalar
+        assert kernel.prior_variance() == 2.5
