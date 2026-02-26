@@ -512,6 +512,31 @@ class ExperimentOutlierDetector:
         from nucml_next.data.smooth_mean import compute_lengthscale_from_residuals
         return compute_lengthscale_from_residuals(log_E, log_sigma, mean_fn)
 
+    def _build_data_outputscale(self, log_E, log_sigma, mean_fn):
+        """Compute data-driven outputscale interpolator from residuals.
+
+        Returns ``None`` under the same conditions as ``_build_data_lengthscale``.
+
+        The returned callable maps ``log₁₀(E) → σ(E)`` (standard deviation)
+        so the kernel uses ``K(xᵢ,xⱼ) = σ(xᵢ)·σ(xⱼ)·K_unit(xᵢ,xⱼ)``,
+        giving energy-appropriate prior variance.
+        """
+        source = self.config.gibbs_lengthscale_source
+        if source == 'ripl':
+            return None
+
+        sm_config = self.config.gp_config.smooth_mean_config
+        kc = self.config.gp_config.kernel_config
+        if (mean_fn is None
+                or sm_config is None
+                or sm_config.smooth_mean_type != 'spline'
+                or kc is None
+                or kc.kernel_type != 'gibbs'):
+            return None
+
+        from nucml_next.data.smooth_mean import compute_outputscale_from_residuals
+        return compute_outputscale_from_residuals(log_E, log_sigma, mean_fn)
+
     def _score_single_experiment(
         self,
         df_group: pd.DataFrame,
@@ -551,17 +576,23 @@ class ExperimentOutlierDetector:
             _log_sigma = exp_df['log_sigma'].values
             single_mean_fn = fit_smooth_mean(_log_E, _log_sigma, sm_config)
 
-        # Inject data-driven lengthscale if available
+        # Inject data-driven lengthscale and outputscale if available
         if group_kernel_config is not None:
-            data_ls_fn = self._build_data_lengthscale(
-                exp_df['log_E'].values, exp_df['log_sigma'].values,
-                single_mean_fn,
-            )
+            _le = exp_df['log_E'].values
+            _ls = exp_df['log_sigma'].values
+            data_ls_fn = self._build_data_lengthscale(_le, _ls, single_mean_fn)
             if data_ls_fn is not None:
                 from dataclasses import replace
                 group_kernel_config = replace(
                     group_kernel_config,
                     data_lengthscale_interpolator=data_ls_fn,
+                )
+            data_os_fn = self._build_data_outputscale(_le, _ls, single_mean_fn)
+            if data_os_fn is not None:
+                from dataclasses import replace
+                group_kernel_config = replace(
+                    group_kernel_config,
+                    data_outputscale_interpolator=data_os_fn,
                 )
 
         # Cannot flag experiment as discrepant with no comparison
@@ -797,7 +828,7 @@ class ExperimentOutlierDetector:
 
         group_kernel_config = self._build_kernel_config_for_group(Z, A, S_n=S_n)
 
-        # Inject data-driven lengthscale if available
+        # Inject data-driven lengthscale and outputscale if available
         if group_kernel_config is not None:
             _log_E_pool = df_group['log_E'].values
             _log_sigma_pool = df_group['log_sigma'].values
@@ -809,6 +840,15 @@ class ExperimentOutlierDetector:
                 group_kernel_config = replace(
                     group_kernel_config,
                     data_lengthscale_interpolator=data_ls_fn,
+                )
+            data_os_fn = self._build_data_outputscale(
+                _log_E_pool, _log_sigma_pool, group_mean_fn,
+            )
+            if data_os_fn is not None:
+                from dataclasses import replace
+                group_kernel_config = replace(
+                    group_kernel_config,
+                    data_outputscale_interpolator=data_os_fn,
                 )
 
         # Fit GPs to large experiments

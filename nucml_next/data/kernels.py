@@ -36,7 +36,7 @@ Design Decisions
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple, Union
 
 import numpy as np
 
@@ -72,6 +72,13 @@ class KernelConfig:
         Computed from local residual variability by
         ``compute_lengthscale_from_residuals()``.
         **Takes priority over ``ripl_log_D_interpolator``** when both set.
+    data_outputscale_interpolator : callable or None
+        Injected callable: ``log₁₀(E [eV]) → σ(E)`` (standard deviation).
+        Computed from local residual variability by
+        ``compute_outputscale_from_residuals()``.
+        When set, the kernel computes
+        ``K(xᵢ,xⱼ) = σ(xᵢ)·σ(xⱼ)·K_unit(xᵢ,xⱼ)``
+        and the scalar ``outputscale`` field is ignored.
     """
     kernel_type: str = 'rbf'
     outputscale: float = 1.0
@@ -81,6 +88,7 @@ class KernelConfig:
     gibbs_lengthscale_bounds: Tuple[float, float] = (0.01, 10.0)
     ripl_log_D_interpolator: Optional[Callable] = None
     data_lengthscale_interpolator: Optional[Callable] = None
+    data_outputscale_interpolator: Optional[Callable] = None
 
 
 class Kernel(ABC):
@@ -159,8 +167,21 @@ class Kernel(ABC):
             'outputscale': self.config.outputscale,
         }
 
-    def prior_variance(self) -> float:
-        """Prior variance at a single point: K(x, x) = outputscale."""
+    def prior_variance(
+        self, x: Optional[np.ndarray] = None,
+    ) -> Union[float, np.ndarray]:
+        """Prior variance K(x, x).
+
+        When ``data_outputscale_interpolator`` is set and ``x`` is provided,
+        returns σ(x)² as an array (energy-dependent prior variance).
+        Otherwise returns the scalar ``outputscale``.
+        """
+        if (x is not None
+                and self.config.data_outputscale_interpolator is not None):
+            sigma = self.config.data_outputscale_interpolator(
+                np.asarray(x, dtype=float).ravel()
+            )
+            return sigma ** 2
         return self.config.outputscale
 
 
@@ -188,7 +209,16 @@ class RBFKernel(Kernel):
         x2 = np.asarray(x2, dtype=float).ravel()
 
         diff = x1[:, None] - x2[None, :]
-        K = self.config.outputscale * np.exp(
+
+        # Energy-dependent or scalar outputscale
+        if self.config.data_outputscale_interpolator is not None:
+            sigma1 = self.config.data_outputscale_interpolator(x1)  # (n1,)
+            sigma2 = self.config.data_outputscale_interpolator(x2)  # (n2,)
+            scale = sigma1[:, None] * sigma2[None, :]               # (n1, n2)
+        else:
+            scale = self.config.outputscale  # scalar
+
+        K = scale * np.exp(
             -0.5 * diff ** 2 / self.config.lengthscale ** 2
         )
         return K
@@ -200,7 +230,20 @@ class RBFKernel(Kernel):
             x2 = x1
 
         diff = x1.unsqueeze(1) - x2.unsqueeze(0)
-        K = self.config.outputscale * torch.exp(
+
+        # Energy-dependent or scalar outputscale
+        if self.config.data_outputscale_interpolator is not None:
+            x1_np = x1.detach().cpu().numpy()
+            x2_np = x2.detach().cpu().numpy()
+            s1_np = self.config.data_outputscale_interpolator(x1_np)
+            s2_np = self.config.data_outputscale_interpolator(x2_np)
+            s1 = torch.tensor(s1_np, dtype=x1.dtype, device=x1.device)
+            s2 = torch.tensor(s2_np, dtype=x2.dtype, device=x2.device)
+            scale = s1.unsqueeze(1) * s2.unsqueeze(0)  # (n1, n2)
+        else:
+            scale = self.config.outputscale  # scalar
+
+        K = scale * torch.exp(
             -0.5 * diff.pow(2) / (self.config.lengthscale ** 2)
         )
         return K
@@ -333,7 +376,15 @@ class GibbsKernel(Kernel):
         diff = x1[:, None] - x2[None, :]
 
         # Exponential factor: exp(-(xi - xj)² / (li² + lj²))
-        K = self.config.outputscale * norm * np.exp(-diff ** 2 / sum_l2)
+        # Energy-dependent or scalar outputscale
+        if self.config.data_outputscale_interpolator is not None:
+            sigma1 = self.config.data_outputscale_interpolator(x1)  # (n1,)
+            sigma2 = self.config.data_outputscale_interpolator(x2)  # (n2,)
+            scale = sigma1[:, None] * sigma2[None, :]               # (n1, n2)
+        else:
+            scale = self.config.outputscale  # scalar
+
+        K = scale * norm * np.exp(-diff ** 2 / sum_l2)
 
         return K
 
@@ -357,7 +408,19 @@ class GibbsKernel(Kernel):
 
         diff = x1.unsqueeze(1) - x2.unsqueeze(0)
 
-        K = self.config.outputscale * norm * torch.exp(-diff ** 2 / sum_l2)
+        # Energy-dependent or scalar outputscale
+        if self.config.data_outputscale_interpolator is not None:
+            x1_np = x1.detach().cpu().numpy()
+            x2_np = x2.detach().cpu().numpy()
+            s1_np = self.config.data_outputscale_interpolator(x1_np)
+            s2_np = self.config.data_outputscale_interpolator(x2_np)
+            s1 = torch.tensor(s1_np, dtype=x1.dtype, device=x1.device)
+            s2 = torch.tensor(s2_np, dtype=x2.dtype, device=x2.device)
+            scale = s1.unsqueeze(1) * s2.unsqueeze(0)  # (n1, n2)
+        else:
+            scale = self.config.outputscale  # scalar
+
+        K = scale * norm * torch.exp(-diff ** 2 / sum_l2)
 
         return K
 
@@ -379,10 +442,6 @@ class GibbsKernel(Kernel):
         d['gibbs_correction_a0'] = self.config.gibbs_correction_a0
         d['gibbs_correction_a1'] = self.config.gibbs_correction_a1
         return d
-
-    def prior_variance(self) -> float:
-        """Prior variance K(x, x) = outputscale (norm factor = 1 on diagonal)."""
-        return self.config.outputscale
 
 
 def build_kernel(config: Optional[KernelConfig] = None) -> Kernel:

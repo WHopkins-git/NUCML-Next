@@ -12,6 +12,7 @@ from nucml_next.data.smooth_mean import (
     SmoothMeanConfig,
     fit_smooth_mean,
     compute_lengthscale_from_residuals,
+    compute_outputscale_from_residuals,
     _softplus_inverse,
 )
 from nucml_next.data.kernels import (
@@ -439,3 +440,193 @@ class TestEndToEnd:
 
         result = detector._build_data_lengthscale(log_E, log_sigma, mean_fn)
         assert result is None, "Should return None when source='ripl'"
+
+
+# ---------------------------------------------------------------------------
+# Energy-dependent outputscale tests
+# ---------------------------------------------------------------------------
+
+class TestComputeOutputscaleFromResiduals:
+    """Tests for compute_outputscale_from_residuals()."""
+
+    def test_basic_returns_callable(self):
+        """Verify returns callable mapping log_E → σ values."""
+        log_E, log_sigma, mean_fn = _make_synthetic_data(n=200)
+        result = compute_outputscale_from_residuals(log_E, log_sigma, mean_fn)
+        assert result is not None
+        assert callable(result)
+
+        # Evaluate at query points
+        query = np.linspace(0, 6, 50)
+        sigma = result(query)
+        assert sigma.shape == (50,)
+        assert np.all(np.isfinite(sigma))
+        assert np.all(sigma > 0)
+
+    def test_resonance_vs_smooth(self):
+        """Volatile resonance region should have larger σ than smooth region."""
+        rng = np.random.RandomState(42)
+        n = 300
+        log_E = np.sort(rng.uniform(0, 6, n))
+
+        # Smooth trend everywhere
+        trend = 2.0 - 0.3 * log_E
+        noise = rng.normal(0, 0.05, n)
+
+        # Add large resonance peaks in 2–4 eV range
+        resonance_mask = (log_E >= 2.0) & (log_E <= 4.0)
+        noise[resonance_mask] += rng.normal(0, 1.5, resonance_mask.sum())
+
+        log_sigma = trend + noise
+        mean_fn = fit_smooth_mean(
+            log_E, log_sigma, SmoothMeanConfig(smooth_mean_type='spline')
+        )
+        result = compute_outputscale_from_residuals(log_E, log_sigma, mean_fn)
+        assert result is not None
+
+        # σ in resonance region should be larger than in smooth regions
+        sigma_smooth = result(np.array([0.5, 1.0, 5.0, 5.5]))
+        sigma_resonance = result(np.array([2.5, 3.0, 3.5]))
+        assert np.median(sigma_resonance) > np.median(sigma_smooth), (
+            f"Resonance σ ({np.median(sigma_resonance):.3f}) should be > "
+            f"smooth σ ({np.median(sigma_smooth):.3f})"
+        )
+
+    def test_output_range(self):
+        """All σ values within [min_std, max_std]."""
+        log_E, log_sigma, mean_fn = _make_synthetic_data(n=200)
+        min_std, max_std = 0.05, 3.0
+        result = compute_outputscale_from_residuals(
+            log_E, log_sigma, mean_fn,
+            min_outputscale_std=min_std,
+            max_outputscale_std=max_std,
+        )
+        assert result is not None
+
+        query = np.linspace(0, 6, 100)
+        sigma = result(query)
+        assert np.all(sigma >= min_std - 1e-10)
+        assert np.all(sigma <= max_std + 1e-10)
+
+    def test_few_points_returns_none(self):
+        """Fewer than 10 points returns None."""
+        log_E = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+        log_sigma = np.array([1.0, 0.8, 0.6, 0.4, 0.2])
+        mean_fn = lambda x: np.ones_like(x)
+        result = compute_outputscale_from_residuals(log_E, log_sigma, mean_fn)
+        assert result is None
+
+
+class TestEnergyDependentOutputscaleKernel:
+    """Tests for kernel integration with energy-dependent outputscale."""
+
+    def test_gibbs_kernel_psd_with_outputscale_interp(self):
+        """GibbsKernel with data_outputscale_interpolator produces PSD matrix."""
+        from scipy.interpolate import interp1d
+
+        # Create lengthscale interpolator
+        x_grid = np.linspace(0, 6, 20)
+        signal = _softplus_inverse(np.full(20, 0.5))
+        ls_interp = interp1d(
+            x_grid, signal,
+            kind='linear',
+            fill_value=(signal[0], signal[-1]),
+            bounds_error=False,
+        )
+
+        # Create outputscale interpolator: σ varies from 0.2 to 2.0
+        sigma_vals = np.linspace(0.2, 2.0, 20)
+        os_interp = interp1d(
+            x_grid, sigma_vals,
+            kind='linear',
+            fill_value=(sigma_vals[0], sigma_vals[-1]),
+            bounds_error=False,
+        )
+
+        config = KernelConfig(
+            kernel_type='gibbs',
+            data_lengthscale_interpolator=ls_interp,
+            data_outputscale_interpolator=os_interp,
+        )
+        kernel = GibbsKernel(config)
+        x = np.linspace(0.5, 5.5, 30)
+        K = kernel.compute_matrix(x)
+
+        # PSD check: all eigenvalues ≥ 0
+        eigvals = np.linalg.eigvalsh(K)
+        assert np.all(eigvals >= -1e-10), f"Min eigenvalue: {eigvals.min()}"
+
+        # Diagonal should be σ(x)² (norm=1 on diagonal)
+        diag = np.diag(K)
+        expected_diag = os_interp(x) ** 2
+        np.testing.assert_allclose(diag, expected_diag, rtol=1e-10)
+
+    def test_prior_variance_returns_array_with_interp(self):
+        """prior_variance(x) returns σ(x)² when interpolator is set."""
+        from scipy.interpolate import interp1d
+
+        x_grid = np.linspace(0, 6, 10)
+        sigma_vals = np.linspace(0.5, 2.0, 10)
+        os_interp = interp1d(
+            x_grid, sigma_vals, kind='linear',
+            fill_value=(sigma_vals[0], sigma_vals[-1]),
+            bounds_error=False,
+        )
+
+        config = KernelConfig(
+            kernel_type='rbf',
+            outputscale=1.0,
+            data_outputscale_interpolator=os_interp,
+        )
+        from nucml_next.data.kernels import RBFKernel
+        kernel = RBFKernel(config)
+
+        # With x: returns array
+        x_test = np.array([1.0, 3.0, 5.0])
+        pv = kernel.prior_variance(x_test)
+        assert isinstance(pv, np.ndarray)
+        expected = os_interp(x_test) ** 2
+        np.testing.assert_allclose(pv, expected, rtol=1e-10)
+
+        # Without x: returns scalar
+        pv_scalar = kernel.prior_variance()
+        assert pv_scalar == 1.0
+
+    def test_predict_with_energy_dependent_outputscale(self):
+        """GP predict() works with energy-dependent outputscale."""
+        from nucml_next.data.experiment_gp import (
+            ExactGPExperiment,
+            ExactGPExperimentConfig,
+        )
+
+        rng = np.random.RandomState(42)
+        n = 60
+        log_E = np.sort(rng.uniform(0, 6, n))
+        trend = 2.0 - 0.3 * log_E
+        log_sigma = trend + rng.normal(0, 0.1, n)
+        log_unc = np.full(n, 0.05)
+
+        mean_fn = fit_smooth_mean(
+            log_E, log_sigma, SmoothMeanConfig(smooth_mean_type='spline')
+        )
+        data_ls = compute_lengthscale_from_residuals(log_E, log_sigma, mean_fn)
+        data_os = compute_outputscale_from_residuals(log_E, log_sigma, mean_fn)
+
+        config = ExactGPExperimentConfig(
+            kernel_config=KernelConfig(
+                kernel_type='gibbs',
+                data_lengthscale_interpolator=data_ls,
+                data_outputscale_interpolator=data_os,
+            ),
+        )
+        gp = ExactGPExperiment(config)
+        gp.fit(log_E, log_sigma, log_unc, mean_fn=mean_fn)
+
+        # Predict should return valid arrays
+        query = np.linspace(0.5, 5.5, 40)
+        mean, std = gp.predict(query)
+        assert mean.shape == (40,)
+        assert std.shape == (40,)
+        assert np.all(np.isfinite(mean))
+        assert np.all(np.isfinite(std))
+        assert np.all(std > 0)

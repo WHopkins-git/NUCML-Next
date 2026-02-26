@@ -694,7 +694,8 @@ class ExactGPExperiment:
 
         # Variance prediction: K_** - K_* @ K^{-1} @ K_*^T
         # K_** is the prior variance at query points (diagonal only)
-        K_star_star = self._kernel.prior_variance()
+        # Returns array when data_outputscale_interpolator is set, scalar otherwise
+        K_star_star = self._kernel.prior_variance(log_E_query)
 
         # v = L^{-1} @ K_*^T
         v = np.linalg.solve(self._L, K_star.T)

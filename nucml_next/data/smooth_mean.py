@@ -440,3 +440,120 @@ def compute_lengthscale_from_residuals(
     )
 
     return interpolator
+
+
+def compute_outputscale_from_residuals(
+    log_E: np.ndarray,
+    log_sigma: np.ndarray,
+    mean_fn: Callable[[np.ndarray], np.ndarray],
+    window_fraction: float = 0.1,
+    min_window_points: int = 15,
+    min_outputscale_std: float = 0.1,
+    max_outputscale_std: float = 5.0,
+) -> Optional[Callable[[np.ndarray], np.ndarray]]:
+    """Compute energy-dependent outputscale (std dev) from local residual variability.
+
+    Estimates σ(E) — the GP prior standard deviation — at each energy from
+    how volatile the smooth-mean residuals are locally.  Where residuals are
+    large (resonance region, peaks deviate orders of magnitude), σ is large;
+    where residuals are small (thermal, continuum), σ is small.
+
+    The returned callable maps ``log₁₀(E [eV])`` to σ(E) values.  The kernel
+    uses ``K(xᵢ, xⱼ) = σ(xᵢ)·σ(xⱼ)·K_unit(xᵢ, xⱼ)`` so that the prior
+    variance at each energy is σ(E)² — energy-appropriate.
+
+    Args:
+        log_E: log₁₀(Energy) values, shape (n,).
+        log_sigma: log₁₀(CrossSection) values, shape (n,).
+        mean_fn: Smooth mean function (from ``fit_smooth_mean``).
+        window_fraction: Half-width of the rolling window as a fraction
+            of the total energy range (in log₁₀ decades).
+        min_window_points: Minimum number of neighbours in a window.
+        min_outputscale_std: Floor for σ(E).
+        max_outputscale_std: Ceiling for σ(E).
+
+    Returns:
+        Callable ``log_E_query → σ(log_E_query)`` array, or ``None`` if the
+        data is too sparse (fewer than 10 points).
+    """
+    from scipy.interpolate import interp1d
+    from scipy.ndimage import median_filter
+
+    log_E = np.asarray(log_E, dtype=float).ravel()
+    log_sigma = np.asarray(log_sigma, dtype=float).ravel()
+
+    # Edge case: too few points
+    if len(log_E) < 10:
+        return None
+
+    # Filter NaN/inf
+    valid = np.isfinite(log_E) & np.isfinite(log_sigma)
+    log_E = log_E[valid]
+    log_sigma = log_sigma[valid]
+
+    if len(log_E) < 10:
+        return None
+
+    # 1. Sort by energy
+    order = np.argsort(log_E)
+    x = log_E[order]
+    y = log_sigma[order]
+
+    # 2. Compute residuals from smooth mean
+    r = y - mean_fn(x)
+
+    n = len(x)
+
+    # 3. Rolling MAD in adaptive energy window
+    energy_range = x[-1] - x[0]
+    half_width = max(energy_range * window_fraction, 0.1)
+
+    sigma_local = np.empty(n)
+    for i in range(n):
+        # Energy-based window
+        lo = x[i] - half_width
+        hi = x[i] + half_width
+        mask = (x >= lo) & (x <= hi)
+        n_in_window = mask.sum()
+
+        if n_in_window < min_window_points:
+            # Expand to k-nearest neighbours
+            distances = np.abs(x - x[i])
+            k = min(min_window_points, n)
+            if k >= n:
+                r_local = r  # Use all points
+            else:
+                idx = np.argpartition(distances, k)[:k]
+                r_local = r[idx]
+        else:
+            r_local = r[mask]
+
+        # MAD with consistency constant → robust std estimate
+        med_local = np.median(r_local)
+        sigma_local[i] = np.median(np.abs(r_local - med_local)) * 1.4826
+
+    # 4. Clip to [min, max]
+    sigma_local = np.clip(sigma_local, min_outputscale_std, max_outputscale_std)
+
+    # 5. Smooth with median filter (same logic as lengthscale)
+    filter_size = max(3, min(51, n // 10))
+    if filter_size % 2 == 0:
+        filter_size += 1
+    sigma_smooth = median_filter(sigma_local, size=filter_size)
+
+    # 6. Build interpolator
+    x_unique, indices = np.unique(x, return_index=True)
+    sigma_unique = sigma_smooth[indices]
+
+    if len(x_unique) < 2:
+        const_sigma = float(sigma_unique[0])
+        return lambda log_E_q: np.full(np.asarray(log_E_q).shape, const_sigma)
+
+    interpolator = interp1d(
+        x_unique, sigma_unique,
+        kind='linear',
+        fill_value=(sigma_unique[0], sigma_unique[-1]),
+        bounds_error=False,
+    )
+
+    return interpolator
