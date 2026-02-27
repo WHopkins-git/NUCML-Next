@@ -294,7 +294,73 @@ Sanity checks are logged as warnings (not enforced as filters):
 
 ## 6. Outlier Detection
 
-### Per-Experiment GP (Recommended)
+### Local MAD Scoring (Recommended)
+
+Selected with `--outlier-method local_mad`.
+
+**Motivation.** Gaussian Process-based scoring produces 55--93% false-positive rates on
+resonance-region nuclear cross-section data. No GP kernel choice (long lengthscale,
+short lengthscale, energy-dependent lengthscale, energy-dependent outputscale) can
+simultaneously model resonance structure from subsampled data and provide calibrated
+uncertainty. The task does not require modelling resonance structure -- it requires
+identifying points that are clearly wrong compared to what other experiments measured
+at similar energies.
+
+**Algorithm.** Direct statistical scoring without GP fitting:
+
+```
+score_dataframe(df)
+  -> Group by (Z, A, MT, Projectile)
+  -> For each group:
+       1. Pool all experiments' log_E, log_sigma
+       2. Fit sigma-clipped spline smooth mean on pooled data
+       3. Compute residuals: r = log_sigma - mean_fn(log_E)
+       4. Compute rolling MAD in sliding energy windows
+          Returns callable: mad_fn(log_E) -> local_MAD
+       5. Z-score every point: z = |r| / mad_fn(log_E)
+       6. Point outlier: z > point_z_threshold (default 3.0)
+       7. Experiment discrepancy: fraction(z > exp_z_threshold) > exp_fraction_threshold
+```
+
+**Rolling MAD.** The rolling MAD uses adaptive energy windows (default 10% of the
+total energy range, minimum 15 points). In sparse regions, it expands to the k-nearest
+neighbours. The MAD is smoothed with a median filter and floored at `mad_floor`
+(default 0.01) to prevent division by zero.
+
+**Experiment discrepancy.** An experiment is flagged as discrepant if more than
+`exp_fraction_threshold` (default 30%) of its points have z-scores above
+`exp_z_threshold` (default 3.0). Single-experiment groups cannot be flagged as
+discrepant (no comparison baseline).
+
+**Performance.** O(n log n) per group (binary-search windowing via `np.searchsorted`).
+No Cholesky decomposition, no subsampling. Groups are processed in parallel across
+50% of CPU cores by default via `ProcessPoolExecutor`.
+
+| Config field | Default | Description |
+|-------------|---------|-------------|
+| `scoring_method` | `'gp'` | Set to `'local_mad'` for this method |
+| `mad_window_fraction` | 0.1 | Rolling window as fraction of energy range |
+| `mad_min_window_points` | 15 | Minimum points per MAD window |
+| `mad_floor` | 0.01 | Minimum MAD (prevents div-by-zero) |
+| `exp_z_threshold` | 3.0 | z-score threshold for counting "bad" points |
+| `exp_fraction_threshold` | 0.30 | Fraction of bad points to flag experiment |
+
+**Output columns:** Same as per-experiment GP for downstream compatibility.
+`gp_mean` contains the smooth mean, `gp_std` contains the local MAD,
+`calibration_metric` and `outlier_probability` are NaN.
+
+**Edge cases:**
+
+| Condition | Handling |
+|-----------|----------|
+| Group < 10 points | MAD fallback (global median) |
+| Single-experiment group | Point scoring works; `experiment_outlier` always False |
+| All data identical | MAD = floor, z-scores near zero |
+| NaN/inf values | Filtered before fitting |
+
+---
+
+### Per-Experiment GP (Legacy)
 
 Selected with `--outlier-method experiment`.
 
@@ -686,7 +752,7 @@ Year, Author, ReactionType, FullCode, NDataPoints
 | Core (Entry through Uncertainty) | Always |
 | Metadata (sf5 through data_type) | Metadata filtering is ON (default) |
 | GP columns (log_E through z_score) | `--outlier-method` is set |
-| Experiment columns (experiment_outlier through experiment_id) | `--outlier-method experiment` |
+| Experiment columns (experiment_outlier through experiment_id) | `--outlier-method local_mad` or `experiment` |
 | Diagnostic columns (Year through NDataPoints) | `--diagnostics` is set |
 
 ### Diagnostic Columns
@@ -739,8 +805,10 @@ python scripts/ingest_exfor.py [FLAGS]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--outlier-method` | None | `experiment` (recommended) or `svgp` (legacy) |
+| `--outlier-method` | None | `local_mad` (recommended), `experiment` (legacy GP), or `svgp` (legacy) |
 | `--z-threshold` | 3.0 | Z-score threshold for point outliers |
+| `--exp-z-threshold` | 3.0 | Z-score threshold for counting bad points in experiment discrepancy (local_mad only) |
+| `--exp-fraction-threshold` | 0.30 | Fraction of bad points to flag experiment as discrepant (local_mad only) |
 | `--svgp-device` | `cpu` | `cpu` or `cuda` |
 | `--max-gpu-points` | 40000 | Max points per experiment on GPU; larger auto-route to CPU |
 | `--max-subsample-points` | 15000 | Subsample large experiments to this many points for GP fitting |

@@ -72,8 +72,12 @@ python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db
 # Test subset (Uranium + Chlorine only)
 python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --test-subset
 
-# With per-experiment GP outlier detection (recommended)
-python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method experiment
+# With smooth mean + local MAD outlier detection (recommended)
+python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method local_mad
+
+# Custom experiment discrepancy thresholds
+python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method local_mad \
+    --z-threshold 5 --exp-z-threshold 3 --exp-fraction-threshold 0.25
 
 # With diagnostic metadata for interactive inspection
 python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --test-subset --diagnostics
@@ -81,10 +85,13 @@ python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --test-subset --diagnos
 # Include non-pure data for analysis
 python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --include-non-pure
 
-# Full pipeline with GPU and checkpointing
+# Legacy per-experiment GP outlier detection
+python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method experiment
+
+# Legacy GP with GPU and checkpointing
 python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method experiment --svgp-device cuda --svgp-checkpoint-dir data/checkpoints/
 
-# Full Phase 1-4 GP stack (spline mean + Gibbs kernel + contaminated likelihood + hierarchical refit)
+# Legacy full Phase 1-4 GP stack (spline mean + Gibbs kernel + contaminated likelihood + hierarchical refit)
 python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method experiment \
     --smooth-mean spline \
     --kernel-type gibbs --ripl-data-path data/levels-param.data \
@@ -105,8 +112,10 @@ See `docs/INGESTION_PIPELINE.md` for algorithm details and edge-case handling.
 | `--include-non-pure` | OFF | Include non-pure data (relative, ratio, averaged, etc.) |
 | `--include-superseded` | OFF | Include superseded entries |
 | `--diagnostics` | OFF | Add Author, Year, ReactionType, FullCode, NDataPoints columns for interactive inspection |
-| `--outlier-method` | None | `experiment` (recommended) or `svgp` (legacy) |
+| `--outlier-method` | None | `local_mad` (recommended), `experiment` (legacy GP), or `svgp` (legacy) |
 | `--z-threshold` | 3.0 | Z-score threshold for point outliers |
+| `--exp-z-threshold` | 3.0 | Z-score threshold for counting bad points in experiment discrepancy (local_mad only) |
+| `--exp-fraction-threshold` | 0.30 | Fraction of bad points to flag experiment as discrepant (local_mad only) |
 | `--svgp-device` | `cpu` | `cpu` or `cuda` |
 | `--max-gpu-points` | 40000 | Max points per experiment on GPU; larger auto-route to CPU |
 | `--max-subsample-points` | 15000 | Subsample large experiments for GP fitting |
@@ -131,7 +140,7 @@ gp_mean, gp_std, z_score, experiment_outlier, point_outlier, calibration_metric,
 Year, Author, ReactionType, FullCode, NDataPoints
 ```
 
-The GP columns (`gp_mean` through `experiment_id`) are only present when `--outlier-method experiment` is used. The diagnostic columns (`Year` through `NDataPoints`) are only present when `--diagnostics` is used.
+The scoring columns (`gp_mean` through `experiment_id`) are present when `--outlier-method local_mad` or `--outlier-method experiment` is used. For `local_mad`, `gp_mean` contains the smooth mean and `gp_std` contains the local MAD. The diagnostic columns (`Year` through `NDataPoints`) are only present when `--diagnostics` is used.
 
 ---
 
@@ -170,24 +179,28 @@ Tier A is always included. Reaction channels (MT codes) are encoded as a 9-compo
 
 ## Outlier Detection
 
-Two methods are available via `--outlier-method`:
+Three methods are available via `--outlier-method`:
 
 | Method | Flag | Approach |
 |--------|------|----------|
-| Per-experiment GP | `experiment` | Fits independent GPs per experiment, builds consensus, flags discrepant experiments. **Recommended.** |
+| Smooth mean + local MAD | `local_mad` | Fits pooled smooth mean, computes energy-local MAD, scores by z = \|residual\| / MAD. Parallel across CPU cores. **Recommended.** |
+| Per-experiment GP (legacy) | `experiment` | Fits independent GPs per experiment, builds consensus, flags discrepant experiments. |
 | Legacy SVGP | `svgp` | Pools all experiments per (Z, A, MT) group into a single Sparse Variational GP. Point-level only. |
 
-### Output Columns (per-experiment GP)
+### Output Columns (local_mad)
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `experiment_outlier` | bool | Entire experiment flagged as discrepant |
-| `point_outlier` | bool | Individual point is anomalous |
-| `z_score` | float | Continuous anomaly score |
-| `calibration_metric` | float | Per-experiment Wasserstein distance |
+| `experiment_outlier` | bool | Experiment has > 30% of points with z > 3 (configurable) |
+| `point_outlier` | bool | Individual point exceeds z-threshold |
+| `z_score` | float | \|residual from smooth mean\| / local MAD |
+| `gp_mean` | float | Smooth mean value (consensus trend) |
+| `gp_std` | float | Local MAD (energy-dependent scatter estimate) |
 | `experiment_id` | str | EXFOR Entry identifier |
+| `calibration_metric` | float | NaN (not used by local_mad) |
+| `outlier_probability` | float | NaN (not used by local_mad) |
 
-**Advanced options:**
+### Legacy GP options
 
 - **Smooth mean** (`SmoothMeanConfig`): Data-driven consensus trend from pooled EXFOR data. Opt-in via `smooth_mean_type='spline'`. Removes gross energy dependence before GP fitting.
 - **Gibbs kernel** (`KernelConfig`): Physics-informed nonstationary kernel using RIPL-3 level density. Opt-in via `kernel_type='gibbs'`. Adapts lengthscale to nuclear resonance structure.

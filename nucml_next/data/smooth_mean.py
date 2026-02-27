@@ -1,11 +1,10 @@
 """
-Data-Driven Consensus Smooth Mean for GP Outlier Detection
-==========================================================
+Data-Driven Consensus Smooth Mean for Outlier Detection
+=======================================================
 
 Computes a robust smooth mean from pooled EXFOR data across all experiments
-per (Z, A, MT) group BEFORE fitting per-experiment GPs.  The GP then only
-models residuals from this trend, dramatically reducing the structure a
-single-lengthscale RBF kernel must capture.
+per (Z, A, MT) group.  Used by both the ``local_mad`` scoring method (smooth
+mean + rolling MAD) and the legacy GP path (subtracts trend before GP fitting).
 
 **Evaluation-independence principle:** The smooth mean comes from the EXFOR
 data itself, NOT from evaluated nuclear data libraries (ENDF/B, JEFF, JENDL),
@@ -17,6 +16,10 @@ Key Classes:
 
 Key Functions:
     fit_smooth_mean: Fit a smooth mean function from pooled data.
+    compute_rolling_mad_interpolator: Energy-dependent MAD interpolator
+        for the ``local_mad`` scoring method.
+    compute_lengthscale_from_residuals: Data-driven lengthscale for Gibbs kernel.
+    compute_outputscale_from_residuals: Energy-dependent outputscale for GP kernels.
 
 Usage:
     >>> from nucml_next.data.smooth_mean import SmoothMeanConfig, fit_smooth_mean
@@ -328,8 +331,9 @@ def _compute_rolling_mad(
     for i in range(n):
         lo = x[i] - half_width
         hi = x[i] + half_width
-        mask = (x >= lo) & (x <= hi)
-        n_in_window = mask.sum()
+        lo_idx = np.searchsorted(x, lo, side='left')    # O(log n)
+        hi_idx = np.searchsorted(x, hi, side='right')   # O(log n)
+        n_in_window = hi_idx - lo_idx
 
         if n_in_window < min_window_points:
             distances = np.abs(x - x[i])
@@ -340,7 +344,7 @@ def _compute_rolling_mad(
                 idx = np.argpartition(distances, k)[:k]
                 r_local = r[idx]
         else:
-            r_local = r[mask]
+            r_local = r[lo_idx:hi_idx]  # contiguous slice, no copy
 
         med_local = np.median(r_local)
         mad[i] = np.median(np.abs(r_local - med_local)) * 1.4826

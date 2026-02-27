@@ -1,37 +1,43 @@
 """
-Per-Experiment GP Outlier Detection for EXFOR Cross-Section Data
-================================================================
+Outlier Detection for EXFOR Cross-Section Data
+===============================================
 
-Fits independent Exact GPs to each EXFOR experiment (Entry) within a (Z, A, MT)
-group, builds consensus from multiple experiment posteriors, and identifies
-discrepant experiments.
+Two scoring methods are available, controlled by ``scoring_method`` in
+``ExperimentOutlierConfig``:
+
+**local_mad (recommended):**
+    Direct statistical scoring using smooth mean + rolling MAD.
+    z_score = |residual from smooth mean| / local_MAD.
+    No GP fitting, O(n log n), parallelised across CPU cores.
+    Set ``scoring_method='local_mad'``.
+
+**gp (legacy):**
+    Fits independent Exact GPs to each EXFOR experiment (Entry),
+    builds consensus from multiple experiment posteriors, and
+    identifies discrepant experiments via Wasserstein calibration.
+    Set ``scoring_method='gp'`` (default for backward compatibility).
 
 Key Classes:
-    ExperimentOutlierConfig: Configuration dataclass
+    ExperimentOutlierConfig: Configuration dataclass (scoring_method, thresholds)
     ExperimentOutlierDetector: Main detector with score_dataframe() API
 
-Compared to SVGPOutlierDetector:
-    - Fits per-experiment (not pooled across all experiments)
-    - Uses heteroscedastic noise from measurement uncertainties
-    - Calibrates lengthscale via Wasserstein distance
-    - Flags entire experiments as discrepant (not just individual points)
-    - More robust to resonance structure (no over-smoothing)
-
-Output columns:
+Output columns (both methods):
     - experiment_outlier: bool - Entire EXFOR Entry flagged as discrepant
-    - point_outlier: bool - Individual point anomalous within its experiment
-    - z_score: float - Continuous anomaly score (backward compat)
-    - calibration_metric: float - Per-experiment Wasserstein distance
-    - outlier_probability: float - Per-point outlier probability from
-        contaminated normal EM (NaN when contaminated likelihood not used)
+    - point_outlier: bool - Individual point anomalous
+    - z_score: float - Continuous anomaly score
+    - gp_mean: float - Smooth mean (local_mad) or GP posterior mean (gp)
+    - gp_std: float - Local MAD (local_mad) or GP posterior std (gp)
+    - calibration_metric: float - Wasserstein distance (gp) or NaN (local_mad)
+    - outlier_probability: float - Contaminated normal prob (gp) or NaN (local_mad)
     - experiment_id: str - EXFOR Entry identifier
-    - log_E, log_sigma, gp_mean, gp_std: float - Backward compat columns
 
 Usage:
-    >>> from nucml_next.data.experiment_outlier import ExperimentOutlierDetector
-    >>> detector = ExperimentOutlierDetector()
+    >>> from nucml_next.data.experiment_outlier import (
+    ...     ExperimentOutlierDetector, ExperimentOutlierConfig,
+    ... )
+    >>> config = ExperimentOutlierConfig(scoring_method='local_mad')
+    >>> detector = ExperimentOutlierDetector(config)
     >>> df_scored = detector.score_dataframe(df)
-    >>> # df_scored has experiment_outlier, point_outlier, z_score columns
 """
 
 import logging
@@ -51,6 +57,99 @@ from nucml_next.data.experiment_gp import (
 from nucml_next.data.consensus import ConsensusBuilder, ConsensusConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _local_mad_worker(args):
+    """Process one (Z,A,MT) group with local_mad scoring.
+
+    Module-level function (not a method) so it can be pickled by
+    ``concurrent.futures.ProcessPoolExecutor``.
+
+    Args:
+        args: Tuple of (group_df, experiment_ids, config_dict) where
+            group_df is a DataFrame for one group, experiment_ids is a
+            list of Entry strings, and config_dict holds threshold values.
+
+    Returns:
+        Tuple of (index, scored_dict) where index is the DataFrame index
+        and scored_dict maps column names to numpy arrays.
+    """
+    (group_df, experiment_ids, config_dict) = args
+
+    from nucml_next.data.smooth_mean import (
+        fit_smooth_mean, compute_rolling_mad_interpolator, SmoothMeanConfig,
+    )
+
+    log_E_all = group_df['log_E'].values
+    log_sigma_all = group_df['log_sigma'].values
+
+    # 1. Fit smooth mean (always spline for local_mad)
+    mean_fn = fit_smooth_mean(
+        log_E_all, log_sigma_all,
+        SmoothMeanConfig(smooth_mean_type='spline'),
+    )
+
+    # 2. Rolling MAD
+    mad_fn = compute_rolling_mad_interpolator(
+        log_E_all, log_sigma_all, mean_fn,
+        window_fraction=config_dict['mad_window_fraction'],
+        min_window_points=config_dict['mad_min_window_points'],
+        mad_floor=config_dict['mad_floor'],
+    )
+
+    n = len(group_df)
+
+    if mad_fn is None:
+        # Too few points — simple MAD fallback
+        center = np.median(log_sigma_all)
+        scale = np.median(np.abs(log_sigma_all - center)) * 1.4826
+        if scale < 1e-10:
+            scale = 1e-6
+        z_scores = np.abs(log_sigma_all - center) / scale
+        return group_df.index, {
+            'gp_mean': np.full(n, center),
+            'gp_std': np.full(n, scale),
+            'z_score': z_scores,
+            'point_outlier': z_scores > config_dict['point_z_threshold'],
+            'experiment_outlier': np.zeros(n, dtype=bool),
+            'calibration_metric': np.full(n, np.nan),
+            'outlier_probability': np.full(n, np.nan),
+        }
+
+    # 3. Score every point
+    residuals = log_sigma_all - mean_fn(log_E_all)
+    local_mad = mad_fn(log_E_all)
+    z_scores = np.abs(residuals) / local_mad
+    point_outlier = z_scores > config_dict['point_z_threshold']
+
+    # 4. Experiment discrepancy
+    experiment_outlier = np.zeros(n, dtype=bool)
+    n_experiments = len(experiment_ids)
+
+    if 'experiment_id' in group_df.columns:
+        exp_id_col = group_df['experiment_id'].values
+    else:
+        exp_id_col = group_df.get('Entry', pd.Series(['unknown'] * n)).values
+
+    for entry_id in experiment_ids:
+        exp_mask = exp_id_col == entry_id
+        exp_z = z_scores[exp_mask]
+        if len(exp_z) == 0:
+            continue
+        n_bad = np.sum(exp_z > config_dict['exp_z_threshold'])
+        fraction_bad = n_bad / len(exp_z)
+        if n_experiments > 1 and fraction_bad > config_dict['exp_fraction_threshold']:
+            experiment_outlier[exp_mask] = True
+
+    return group_df.index, {
+        'gp_mean': mean_fn(log_E_all),
+        'gp_std': local_mad,
+        'z_score': z_scores,
+        'point_outlier': point_outlier,
+        'experiment_outlier': experiment_outlier,
+        'calibration_metric': np.full(n, np.nan),
+        'outlier_probability': np.full(n, np.nan),
+    }
 
 
 @dataclass
@@ -268,6 +367,96 @@ class ExperimentOutlierDetector:
         if streaming_mode:
             logger.info(f"Streaming mode enabled: writing to {self.config.streaming_output}")
 
+        # --- Fast path: parallel local_mad scoring ---
+        if self.config.scoring_method == 'local_mad' and not streaming_mode:
+            import multiprocessing
+            from concurrent.futures import ProcessPoolExecutor
+
+            n_workers = self.config.n_workers
+            if n_workers is None:
+                n_workers = max(1, multiprocessing.cpu_count() // 2)
+
+            # Only use multiprocessing when it's worth the overhead
+            # (process spawn on Windows is expensive; need enough groups)
+            use_parallel = n_workers > 1 and n_groups >= 4
+
+            config_dict = {
+                'mad_window_fraction': self.config.mad_window_fraction,
+                'mad_min_window_points': self.config.mad_min_window_points,
+                'mad_floor': self.config.mad_floor,
+                'point_z_threshold': self.config.point_z_threshold,
+                'exp_z_threshold': self.config.exp_z_threshold,
+                'exp_fraction_threshold': self.config.exp_fraction_threshold,
+            }
+
+            # Partition groups into MAD-fallback (tiny) and main work items
+            work_items = []
+            for group_key, group_df in groups:
+                if len(group_df) < self.config.min_group_size:
+                    self._stats['mad_groups'] += 1
+                    scored = self._score_with_mad(group_df.copy())
+                    for col in ['gp_mean', 'gp_std', 'z_score', 'experiment_outlier',
+                               'point_outlier', 'calibration_metric',
+                               'outlier_probability', 'experiment_id']:
+                        if col in scored.columns:
+                            result.loc[scored.index, col] = scored[col].values
+                else:
+                    experiments = self._partition_by_experiment(group_df)
+                    experiment_ids = list(experiments.keys())
+                    work_items.append((group_df, experiment_ids, config_dict))
+
+            n_work = len(work_items)
+            if use_parallel:
+                logger.info(
+                    f"Local MAD parallel: {n_work} groups on {n_workers} workers"
+                )
+            else:
+                logger.info(
+                    f"Local MAD sequential: {n_work} groups (n_workers={n_workers})"
+                )
+
+            if n_work > 0:
+                if use_parallel:
+                    with ProcessPoolExecutor(max_workers=n_workers) as pool:
+                        futures = pool.map(_local_mad_worker, work_items)
+                        if has_tqdm:
+                            futures = tqdm(futures, total=n_work,
+                                           desc="Local MAD scoring")
+                        for idx, scored_dict in futures:
+                            for col, values in scored_dict.items():
+                                result.loc[idx, col] = values
+                else:
+                    # Sequential fallback (small jobs / n_workers=1)
+                    seq_iter = (
+                        _local_mad_worker(item) for item in work_items
+                    )
+                    if has_tqdm:
+                        seq_iter = tqdm(seq_iter, total=n_work,
+                                        desc="Local MAD scoring")
+                    for idx, scored_dict in seq_iter:
+                        for col, values in scored_dict.items():
+                            result.loc[idx, col] = values
+
+            # Log summary and return
+            n_discrepant = int(
+                result['experiment_outlier'].sum()
+                if 'experiment_outlier' in result.columns
+                else 0
+            )
+            n_point_outliers = int(
+                result['point_outlier'].sum()
+                if 'point_outlier' in result.columns
+                else 0
+            )
+            logger.info(
+                f"Local MAD scoring complete: "
+                f"{n_work} groups scored, "
+                f"{n_point_outliers:,} point outliers, "
+                f"{n_discrepant:,} experiment-outlier points"
+            )
+            return result
+
+        # --- Sequential GP scoring (legacy path) ---
         # Process groups
         iterator = enumerate(groups)
         if has_tqdm:

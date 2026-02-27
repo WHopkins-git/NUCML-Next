@@ -36,7 +36,10 @@ Usage:
     # Custom element subset
     python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --z-filter 79,92,26
 
-    # With per-experiment GP outlier detection (RECOMMENDED)
+    # With smooth mean + local MAD outlier detection (RECOMMENDED)
+    python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method local_mad
+
+    # With legacy per-experiment GP outlier detection
     python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method experiment
 
     # With legacy SVGP outlier detection
@@ -460,6 +463,7 @@ Note:
             exp_z_threshold=args.exp_z_threshold,
             exp_fraction_threshold=args.exp_fraction_threshold,
             checkpoint_dir=args.svgp_checkpoint_dir,
+            n_workers=max(1, args.num_threads),  # 50% of cores by default
         )
 
     run_svgp = outlier_method == 'svgp'
