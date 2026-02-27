@@ -119,6 +119,15 @@ class ExperimentOutlierConfig:
     min_experiments_for_refit: int = 3
     refit_bounds_iqr_margin: float = 1.0
     refit_share_outputscale: bool = True
+    # --- Scoring method selection ---
+    scoring_method: str = 'gp'  # 'gp' | 'local_mad'
+    # --- Local MAD scoring (scoring_method='local_mad') ---
+    mad_window_fraction: float = 0.1        # Rolling window as fraction of energy range
+    mad_min_window_points: int = 15          # Minimum points per MAD window
+    mad_floor: float = 0.01                  # Minimum MAD (prevents div-by-zero)
+    # --- Experiment discrepancy thresholds ---
+    exp_z_threshold: float = 3.0             # z-score threshold for counting "bad" points
+    exp_fraction_threshold: float = 0.30     # Fraction of bad points to flag experiment
 
 
 class ExperimentOutlierDetector:
@@ -404,6 +413,13 @@ class ExperimentOutlierDetector:
         log_E = df_group['log_E'].values
         log_sigma = df_group['log_sigma'].values
 
+        # Case 0: Local MAD scoring (bypasses GP entirely)
+        if self.config.scoring_method == 'local_mad':
+            if n < self.config.min_group_size:
+                self._stats['mad_groups'] += 1
+                return self._score_with_mad(result)
+            return self._score_group_local_mad(df_group, experiments)
+
         # Case 1: Very small group - MAD fallback
         if n < self.config.min_group_size:
             self._stats['mad_groups'] += 1
@@ -544,6 +560,103 @@ class ExperimentOutlierDetector:
 
         from nucml_next.data.smooth_mean import compute_outputscale_from_residuals
         return compute_outputscale_from_residuals(log_E, log_sigma, mean_fn)
+
+    def _score_group_local_mad(
+        self,
+        df_group: pd.DataFrame,
+        experiments: Dict[str, pd.DataFrame],
+    ) -> pd.DataFrame:
+        """Score all points in a group using smooth mean + local MAD.
+
+        This method:
+        1. Fits a smooth mean on ALL pooled data in the group
+        2. Computes rolling MAD of residuals in energy windows
+        3. Assigns z-scores to every point: |residual| / local_MAD
+        4. Flags point outliers by z-score threshold
+        5. Flags experiment discrepancy by fraction of flagged points
+
+        Works for both single-experiment and multi-experiment groups.
+        No GP fitting, no subsampling, no Cholesky decomposition.
+
+        Args:
+            df_group: Full DataFrame for this (Z, A, MT[, Projectile]) group.
+            experiments: Dict mapping Entry ID to experiment DataFrames.
+
+        Returns:
+            DataFrame with scoring columns populated.
+        """
+        result = df_group.copy()
+
+        log_E_all = result['log_E'].values
+        log_sigma_all = result['log_sigma'].values
+
+        # 1. Fit smooth mean on pooled data (always spline for local_mad)
+        from nucml_next.data.smooth_mean import (
+            fit_smooth_mean, compute_rolling_mad_interpolator, SmoothMeanConfig,
+        )
+
+        sm_config = self.config.gp_config.smooth_mean_config
+        if sm_config is not None and sm_config.smooth_mean_type == 'spline':
+            mean_fn = fit_smooth_mean(log_E_all, log_sigma_all, sm_config)
+        else:
+            # Force spline for local_mad even if config says constant
+            mean_fn = fit_smooth_mean(
+                log_E_all, log_sigma_all,
+                SmoothMeanConfig(smooth_mean_type='spline'),
+            )
+
+        # 2. Compute residuals and rolling MAD
+        mad_fn = compute_rolling_mad_interpolator(
+            log_E_all, log_sigma_all, mean_fn,
+            window_fraction=self.config.mad_window_fraction,
+            min_window_points=self.config.mad_min_window_points,
+            mad_floor=self.config.mad_floor,
+        )
+
+        if mad_fn is None:
+            # Too few points — fall back to simple MAD scoring
+            return self._score_with_mad(result)
+
+        # 3. Score every point
+        residuals = log_sigma_all - mean_fn(log_E_all)
+        local_mad = mad_fn(log_E_all)
+        z_scores = np.abs(residuals) / local_mad
+
+        result['gp_mean'] = mean_fn(log_E_all)   # Reuse column name for compat
+        result['gp_std'] = local_mad               # Local MAD fills "uncertainty"
+        result['z_score'] = z_scores
+
+        # 4. Flag point outliers
+        result['point_outlier'] = z_scores > self.config.point_z_threshold
+
+        # 5. Flag experiment discrepancy
+        for entry_id, exp_df in experiments.items():
+            exp_mask = result.index.isin(exp_df.index)
+            exp_z_scores = result.loc[exp_mask, 'z_score'].values
+
+            n_total = len(exp_z_scores)
+            if n_total == 0:
+                continue
+
+            n_bad = np.sum(exp_z_scores > self.config.exp_z_threshold)
+            fraction_bad = n_bad / n_total
+
+            # Single-experiment groups can't be flagged as discrepant
+            if len(experiments) == 1:
+                is_discrepant = False
+            else:
+                is_discrepant = fraction_bad > self.config.exp_fraction_threshold
+
+            result.loc[exp_mask, 'experiment_outlier'] = is_discrepant
+
+            if is_discrepant:
+                self._stats['discrepant_experiments'] += 1
+
+        # 6. Ensure compatibility columns
+        result['calibration_metric'] = np.nan
+        result['outlier_probability'] = np.nan
+
+        return result
 
     def _score_single_experiment(
         self,

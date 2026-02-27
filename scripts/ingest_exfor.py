@@ -130,10 +130,11 @@ Note:
         '--outlier-method',
         type=str,
         default=None,
-        choices=['svgp', 'experiment', None],
+        choices=['svgp', 'experiment', 'local_mad', None],
         help='Outlier detection method: '
-             '"svgp" (legacy pooled SVGP), '
-             '"experiment" (per-experiment GP with consensus, recommended). '
+             '"local_mad" (smooth mean + local MAD, recommended), '
+             '"experiment" (per-experiment GP with consensus, legacy), '
+             '"svgp" (legacy pooled SVGP). '
              'Default: None (no outlier detection)'
     )
     parser.add_argument(
@@ -191,6 +192,20 @@ Note:
         type=float,
         default=3.0,
         help='Z-score threshold for flagging point outliers (default: 3.0)'
+    )
+    parser.add_argument(
+        '--exp-z-threshold',
+        type=float,
+        default=3.0,
+        help='Z-score threshold for counting bad points in experiment discrepancy '
+             'detection (default: 3.0). Only used with --outlier-method local_mad.'
+    )
+    parser.add_argument(
+        '--exp-fraction-threshold',
+        type=float,
+        default=0.30,
+        help='Fraction of bad points to flag an experiment as discrepant '
+             '(default: 0.30 = 30%%). Only used with --outlier-method local_mad.'
     )
 
     # Phase 1–4 GP enhancement flags (only used with --outlier-method experiment)
@@ -428,8 +443,27 @@ Note:
             hierarchical_refitting=args.hierarchical_refitting,
         )
 
+    elif outlier_method == 'local_mad':
+        from nucml_next.data.experiment_outlier import ExperimentOutlierConfig
+        from nucml_next.data.experiment_gp import ExactGPExperimentConfig
+        from nucml_next.data.smooth_mean import SmoothMeanConfig
+
+        # Smooth mean is always spline for local_mad
+        gp_config = ExactGPExperimentConfig(
+            smooth_mean_config=SmoothMeanConfig(smooth_mean_type='spline'),
+        )
+
+        experiment_outlier_config = ExperimentOutlierConfig(
+            gp_config=gp_config,
+            point_z_threshold=args.z_threshold,
+            scoring_method='local_mad',
+            exp_z_threshold=args.exp_z_threshold,
+            exp_fraction_threshold=args.exp_fraction_threshold,
+            checkpoint_dir=args.svgp_checkpoint_dir,
+        )
+
     run_svgp = outlier_method == 'svgp'
-    run_experiment_outlier = outlier_method == 'experiment'
+    run_experiment_outlier = outlier_method in ('experiment', 'local_mad')
 
     # Run ingestion
     print("\n" + "="*70)
@@ -454,6 +488,10 @@ Note:
             features.append("hierarchical")
         feat_str = f", features=[{', '.join(features)}]" if features else ""
         print(f"Outlier:      Per-experiment GP - device={args.svgp_device}, z_threshold={args.z_threshold}{feat_str}")
+    elif outlier_method == 'local_mad':
+        print(f"Outlier:      Smooth mean + local MAD")
+        print(f"              Point threshold: z > {args.z_threshold}")
+        print(f"              Experiment: >{args.exp_fraction_threshold:.0%} of points with z > {args.exp_z_threshold}")
     else:
         print(f"Outlier:      Disabled (use --outlier-method to enable)")
     if args.svgp_checkpoint_dir:

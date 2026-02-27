@@ -565,3 +565,107 @@ def compute_outputscale_from_residuals(
     )
 
     return interpolator
+
+
+def compute_rolling_mad_interpolator(
+    log_E: np.ndarray,
+    log_sigma: np.ndarray,
+    mean_fn: Callable[[np.ndarray], np.ndarray],
+    window_fraction: float = 0.1,
+    min_window_points: int = 15,
+    mad_floor: float = 0.01,
+) -> Optional[Callable[[np.ndarray], np.ndarray]]:
+    """Compute energy-dependent MAD of residuals from smooth mean.
+
+    Returns a callable that maps ``log₁₀(E)`` → ``local_MAD(log₁₀(E))``.
+    The MAD is computed in sliding energy windows on the pooled residuals,
+    giving an energy-local measure of cross-section scatter.
+
+    In regions where data varies wildly (resonance region), MAD is large.
+    In smooth regions (thermal, continuum), MAD is small.
+
+    This is designed for the ``local_mad`` scoring method in
+    ``ExperimentOutlierDetector``, where z-scores are computed as
+    ``|residual| / local_MAD``.
+
+    Args:
+        log_E: log₁₀(Energy/eV) values from pooled group data.
+        log_sigma: log₁₀(CrossSection) values from pooled group data.
+        mean_fn: Smooth mean function (from ``fit_smooth_mean()``).
+        window_fraction: Fraction of energy range for rolling window.
+            Default 0.1 = 10% of the total energy range.
+        min_window_points: Minimum points per window. If the window
+            contains fewer points, it expands to include k-nearest.
+        mad_floor: Minimum MAD value. Prevents division by zero in
+            z-score computation and avoids flagging in very sparse regions.
+
+    Returns:
+        Callable ``log_E_query → MAD values``, or ``None`` if fewer
+        than 10 data points.
+    """
+    from scipy.interpolate import interp1d
+    from scipy.ndimage import median_filter
+
+    log_E = np.asarray(log_E, dtype=float).ravel()
+    log_sigma = np.asarray(log_sigma, dtype=float).ravel()
+
+    if len(log_E) < 10:
+        return None
+
+    # Filter NaN/inf
+    valid = np.isfinite(log_E) & np.isfinite(log_sigma)
+    log_E = log_E[valid]
+    log_sigma = log_sigma[valid]
+
+    if len(log_E) < 10:
+        return None
+
+    # Sort by energy
+    order = np.argsort(log_E)
+    x = log_E[order]
+    r = (log_sigma - mean_fn(log_E))[order]
+
+    n = len(x)
+
+    # Use existing _compute_rolling_mad() helper
+    mad = _compute_rolling_mad(x, r, window_fraction, min_window_points)
+
+    # Apply floor
+    mad = np.maximum(mad, mad_floor)
+
+    # Smooth with median filter to avoid sharp jumps
+    smooth_window = max(5, n // 20)
+    if smooth_window % 2 == 0:
+        smooth_window += 1
+    mad_smooth = median_filter(mad, size=smooth_window, mode='nearest')
+    mad_smooth = np.maximum(mad_smooth, mad_floor)
+
+    # Deduplicate x values (interp1d requires strictly increasing x)
+    # Average MAD values at duplicate x positions
+    x_unique, indices = np.unique(x, return_inverse=True)
+    mad_unique = np.zeros(len(x_unique))
+    counts = np.zeros(len(x_unique))
+    np.add.at(mad_unique, indices, mad_smooth)
+    np.add.at(counts, indices, 1)
+    mad_unique /= counts
+
+    if len(x_unique) < 2:
+        const_mad = float(mad_unique[0])
+        return lambda log_E_q: np.full(
+            np.asarray(log_E_q).shape, max(const_mad, mad_floor)
+        )
+
+    # Build interpolator
+    interp = interp1d(
+        x_unique, mad_unique, kind='linear',
+        bounds_error=False,
+        fill_value=(mad_unique[0], mad_unique[-1]),
+    )
+
+    floor = mad_floor  # capture in closure
+
+    def _mad_fn(log_E_query: np.ndarray) -> np.ndarray:
+        result = interp(np.asarray(log_E_query, dtype=float).ravel())
+        return np.maximum(result, floor)
+
+    return _mad_fn
