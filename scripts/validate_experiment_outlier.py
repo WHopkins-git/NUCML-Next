@@ -85,7 +85,6 @@ def run_detector(
     )
 
     config = ExperimentOutlierConfig(point_z_threshold=z_threshold)
-    config.gp_config.use_wasserstein_calibration = use_wasserstein
 
     detector = ExperimentOutlierDetector(config)
     result = detector.score_dataframe(df)

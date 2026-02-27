@@ -44,7 +44,7 @@ def __getattr__(name):
     if name == "HoldoutConfig":
         from nucml_next.experiment import HoldoutConfig
         return HoldoutConfig
-    # Outlier detection (requires torch/gpytorch)
+    # Legacy SVGP outlier detection (requires torch/gpytorch)
     if name == "SVGPOutlierDetector":
         from nucml_next.data.outlier_detection import SVGPOutlierDetector
         return SVGPOutlierDetector
@@ -54,34 +54,13 @@ def __getattr__(name):
     if name == "extract_svgp_hyperparameters":
         from nucml_next.data.outlier_detection import extract_svgp_hyperparameters
         return extract_svgp_hyperparameters
-    # Per-experiment outlier detection (new approach)
+    # Outlier detection (local MAD)
     if name == "ExperimentOutlierDetector":
         from nucml_next.data.experiment_outlier import ExperimentOutlierDetector
         return ExperimentOutlierDetector
     if name == "ExperimentOutlierConfig":
         from nucml_next.data.experiment_outlier import ExperimentOutlierConfig
         return ExperimentOutlierConfig
-    if name == "ExactGPExperiment":
-        from nucml_next.data.experiment_gp import ExactGPExperiment
-        return ExactGPExperiment
-    if name == "ExactGPExperimentConfig":
-        from nucml_next.data.experiment_gp import ExactGPExperimentConfig
-        return ExactGPExperimentConfig
-    if name == "ConsensusBuilder":
-        from nucml_next.data.consensus import ConsensusBuilder
-        return ConsensusBuilder
-    if name == "ConsensusConfig":
-        from nucml_next.data.consensus import ConsensusConfig
-        return ConsensusConfig
-    if name == "prepare_log_uncertainties":
-        from nucml_next.data.experiment_gp import prepare_log_uncertainties
-        return prepare_log_uncertainties
-    if name == "compute_wasserstein_calibration":
-        from nucml_next.data.calibration import compute_wasserstein_calibration
-        return compute_wasserstein_calibration
-    if name == "optimize_lengthscale_wasserstein":
-        from nucml_next.data.calibration import optimize_lengthscale_wasserstein
-        return optimize_lengthscale_wasserstein
     # Smooth mean (no heavy dependencies)
     if name == "SmoothMeanConfig":
         from nucml_next.data.smooth_mean import SmoothMeanConfig
@@ -93,31 +72,6 @@ def __getattr__(name):
     if name == "MetadataFilter":
         from nucml_next.data.metadata_filter import MetadataFilter
         return MetadataFilter
-    # Kernel abstraction (no heavy dependencies beyond numpy)
-    if name == "KernelConfig":
-        from nucml_next.data.kernels import KernelConfig
-        return KernelConfig
-    if name == "RBFKernel":
-        from nucml_next.data.kernels import RBFKernel
-        return RBFKernel
-    if name == "GibbsKernel":
-        from nucml_next.data.kernels import GibbsKernel
-        return GibbsKernel
-    if name == "build_kernel":
-        from nucml_next.data.kernels import build_kernel
-        return build_kernel
-    # RIPL-3 level density loader (no heavy dependencies)
-    if name == "RIPL3LevelDensity":
-        from nucml_next.data.ripl_loader import RIPL3LevelDensity
-        return RIPL3LevelDensity
-    # Kernel-aware calibration functions
-    if name == "optimize_kernel_wasserstein":
-        from nucml_next.data.calibration import optimize_kernel_wasserstein
-        return optimize_kernel_wasserstein
-    # Likelihood (Phase 3)
-    if name == "LikelihoodConfig":
-        from nucml_next.data.likelihood import LikelihoodConfig
-        return LikelihoodConfig
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
@@ -144,28 +98,12 @@ __all__ = [
     "SVGPOutlierDetector",
     "SVGPConfig",
     "extract_svgp_hyperparameters",
-    # Per-experiment outlier detection (new approach)
+    # Outlier detection (local MAD)
     "ExperimentOutlierDetector",
     "ExperimentOutlierConfig",
-    "ExactGPExperiment",
-    "ExactGPExperimentConfig",
-    "ConsensusBuilder",
-    "ConsensusConfig",
-    "prepare_log_uncertainties",
-    "compute_wasserstein_calibration",
-    "optimize_lengthscale_wasserstein",
     # Smooth mean
     "SmoothMeanConfig",
     "fit_smooth_mean",
     # Metadata filter
     "MetadataFilter",
-    # Kernel abstraction (Phase 2)
-    "KernelConfig",
-    "RBFKernel",
-    "GibbsKernel",
-    "build_kernel",
-    "RIPL3LevelDensity",
-    "optimize_kernel_wasserstein",
-    # Likelihood (Phase 3)
-    "LikelihoodConfig",
 ]

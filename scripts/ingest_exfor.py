@@ -39,15 +39,8 @@ Usage:
     # With smooth mean + local MAD outlier detection (RECOMMENDED)
     python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method local_mad
 
-    # With legacy per-experiment GP outlier detection
-    python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method experiment
-
     # With legacy SVGP outlier detection
     python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method svgp
-
-    # Full pipeline: test subset + per-experiment outlier detection
-    python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --test-subset \\
-        --outlier-method experiment --z-threshold 3.0
 
 Requirements:
     - X4Pro SQLite database (x4sqlite1.db)
@@ -92,14 +85,11 @@ Examples:
   # Custom element subset (Gold, Uranium, Iron)
   python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --z-filter 79,92,26
 
-  # With SVGP outlier detection (Student-t likelihood, default)
-  python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --run-svgp
+  # With local MAD outlier detection (RECOMMENDED)
+  python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method local_mad
 
-  # With SVGP using heteroscedastic likelihood (uses measurement uncertainties)
-  python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --run-svgp --svgp-likelihood heteroscedastic
-
-  # Full pipeline: test subset + SVGP + CUDA acceleration
-  python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --test-subset --run-svgp --svgp-device cuda
+  # With legacy SVGP outlier detection
+  python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method svgp
 
 Note:
   AME2020/NUBASE2020 enrichment is now handled during feature generation.
@@ -133,10 +123,9 @@ Note:
         '--outlier-method',
         type=str,
         default=None,
-        choices=['svgp', 'experiment', 'local_mad', None],
+        choices=['svgp', 'local_mad', None],
         help='Outlier detection method: '
              '"local_mad" (smooth mean + local MAD, recommended), '
-             '"experiment" (per-experiment GP with consensus, legacy), '
              '"svgp" (legacy pooled SVGP). '
              'Default: None (no outlier detection)'
     )
@@ -209,60 +198,6 @@ Note:
         default=0.30,
         help='Fraction of bad points to flag an experiment as discrepant '
              '(default: 0.30 = 30%%). Only used with --outlier-method local_mad.'
-    )
-
-    # Phase 1–4 GP enhancement flags (only used with --outlier-method experiment)
-    parser.add_argument(
-        '--smooth-mean',
-        type=str,
-        default='constant',
-        choices=['constant', 'spline'],
-        help='Mean function type for per-experiment GP (default: constant). '
-             '"spline" fits a data-driven consensus trend before GP fitting.'
-    )
-    parser.add_argument(
-        '--kernel-type',
-        type=str,
-        default='rbf',
-        choices=['rbf', 'gibbs'],
-        help='GP kernel type (default: rbf). '
-             '"gibbs" uses a physics-informed nonstationary kernel based on '
-             'RIPL-3 nuclear level density (requires --ripl-data-path).'
-    )
-    parser.add_argument(
-        '--gibbs-lengthscale-source',
-        type=str,
-        default='data',
-        choices=['data', 'ripl', 'auto'],
-        help='Lengthscale source for Gibbs kernel (default: data). '
-             '"data" computes from local residual variability (requires --smooth-mean spline). '
-             '"ripl" uses RIPL-3 level density (requires --ripl-data-path). '
-             '"auto" tries data first, falls back to RIPL-3.'
-    )
-    parser.add_argument(
-        '--ripl-data-path',
-        type=str,
-        default=None,
-        help='Path to RIPL-3 levels-param.data file (required for --kernel-type gibbs '
-             'with --gibbs-lengthscale-source ripl). '
-             'Without this, Gibbs kernel falls back to RBF.'
-    )
-    parser.add_argument(
-        '--likelihood',
-        type=str,
-        default='gaussian',
-        choices=['gaussian', 'contaminated'],
-        help='GP likelihood type (default: gaussian). '
-             '"contaminated" uses a contaminated normal mixture for principled '
-             'outlier identification, producing per-point outlier_probability.'
-    )
-    parser.add_argument(
-        '--hierarchical-refitting',
-        action='store_true',
-        default=False,
-        help='Enable two-pass hierarchical fitting: Pass 1 fits independently, '
-             'Pass 2 re-fits with group-informed constrained bounds and shared '
-             'outputscale. Produces more consistent GP fits across experiments.'
     )
 
     import multiprocessing
@@ -381,93 +316,19 @@ Note:
             checkpoint_dir=args.svgp_checkpoint_dir,
             likelihood=args.svgp_likelihood,
         )
-    elif outlier_method == 'experiment':
-        from nucml_next.data.experiment_outlier import ExperimentOutlierConfig
-        from nucml_next.data.experiment_gp import ExactGPExperimentConfig
-
-        # Validate CUDA availability before proceeding
-        if args.svgp_device == 'cuda':
-            try:
-                import torch
-                if not torch.cuda.is_available():
-                    print(f"WARNING: --svgp-device cuda requested but CUDA is not available.")
-                    print(f"         Falling back to CPU. Check your PyTorch installation.")
-                    args.svgp_device = 'cpu'
-                else:
-                    print(f"CUDA available: {torch.cuda.get_device_name(0)}")
-            except ImportError:
-                print(f"WARNING: --svgp-device cuda requested but PyTorch not installed.")
-                print(f"         Falling back to CPU.")
-                args.svgp_device = 'cpu'
-
-        # Warn about Gibbs kernel requirements
-        if args.kernel_type == 'gibbs':
-            ls_src = args.gibbs_lengthscale_source
-            if ls_src in ('data', 'auto') and args.smooth_mean == 'constant':
-                print("WARNING: --gibbs-lengthscale-source data requires --smooth-mean spline. "
-                      "Will fall back to RIPL-3 or RBF.")
-            if ls_src == 'ripl' and not args.ripl_data_path:
-                print("WARNING: --gibbs-lengthscale-source ripl requires --ripl-data-path. "
-                      "Gibbs kernel will fall back to RBF.")
-
-        # Phase 1: Smooth mean config
-        smooth_mean_config = None
-        if args.smooth_mean == 'spline':
-            from nucml_next.data.smooth_mean import SmoothMeanConfig
-            smooth_mean_config = SmoothMeanConfig(smooth_mean_type='spline')
-
-        # Phase 2: Kernel config
-        kernel_config = None
-        if args.kernel_type == 'gibbs':
-            from nucml_next.data.kernels import KernelConfig
-            kernel_config = KernelConfig(kernel_type='gibbs')
-
-        # Phase 3: Likelihood config
-        likelihood_config = None
-        if args.likelihood == 'contaminated':
-            from nucml_next.data.likelihood import LikelihoodConfig
-            likelihood_config = LikelihoodConfig(likelihood_type='contaminated')
-
-        # Build GP and detector configs with all phase settings
-        gp_config = ExactGPExperimentConfig(
-            device=args.svgp_device,
-            max_gpu_points=args.max_gpu_points,
-            max_subsample_points=args.max_subsample_points,
-            smooth_mean_config=smooth_mean_config,
-            kernel_config=kernel_config,
-            likelihood_config=likelihood_config,
-        )
-        experiment_outlier_config = ExperimentOutlierConfig(
-            gp_config=gp_config,
-            point_z_threshold=args.z_threshold,
-            checkpoint_dir=args.svgp_checkpoint_dir,
-            ripl_data_path=args.ripl_data_path,
-            gibbs_lengthscale_source=args.gibbs_lengthscale_source,
-            hierarchical_refitting=args.hierarchical_refitting,
-        )
 
     elif outlier_method == 'local_mad':
         from nucml_next.data.experiment_outlier import ExperimentOutlierConfig
-        from nucml_next.data.experiment_gp import ExactGPExperimentConfig
-        from nucml_next.data.smooth_mean import SmoothMeanConfig
-
-        # Smooth mean is always spline for local_mad
-        gp_config = ExactGPExperimentConfig(
-            smooth_mean_config=SmoothMeanConfig(smooth_mean_type='spline'),
-        )
 
         experiment_outlier_config = ExperimentOutlierConfig(
-            gp_config=gp_config,
             point_z_threshold=args.z_threshold,
-            scoring_method='local_mad',
             exp_z_threshold=args.exp_z_threshold,
             exp_fraction_threshold=args.exp_fraction_threshold,
-            checkpoint_dir=args.svgp_checkpoint_dir,
-            n_workers=max(1, args.num_threads),  # 50% of cores by default
+            n_workers=max(1, args.num_threads),
         )
 
     run_svgp = outlier_method == 'svgp'
-    run_experiment_outlier = outlier_method in ('experiment', 'local_mad')
+    run_experiment_outlier = outlier_method == 'local_mad'
 
     # Run ingestion
     print("\n" + "="*70)
@@ -480,26 +341,12 @@ Note:
         print(f"Z Filter:     {z_filter} (subset mode)")
     if outlier_method == 'svgp':
         print(f"Outlier:      SVGP (legacy) - device={args.svgp_device}, likelihood={args.svgp_likelihood}")
-    elif outlier_method == 'experiment':
-        features = []
-        if args.smooth_mean != 'constant':
-            features.append(f"mean={args.smooth_mean}")
-        if args.kernel_type != 'rbf':
-            features.append(f"kernel={args.kernel_type}({args.gibbs_lengthscale_source})")
-        if args.likelihood != 'gaussian':
-            features.append(f"likelihood={args.likelihood}")
-        if args.hierarchical_refitting:
-            features.append("hierarchical")
-        feat_str = f", features=[{', '.join(features)}]" if features else ""
-        print(f"Outlier:      Per-experiment GP - device={args.svgp_device}, z_threshold={args.z_threshold}{feat_str}")
     elif outlier_method == 'local_mad':
         print(f"Outlier:      Smooth mean + local MAD")
         print(f"              Point threshold: z > {args.z_threshold}")
         print(f"              Experiment: >{args.exp_fraction_threshold:.0%} of points with z > {args.exp_z_threshold}")
     else:
         print(f"Outlier:      Disabled (use --outlier-method to enable)")
-    if args.svgp_checkpoint_dir:
-        print(f"Checkpoints:  {args.svgp_checkpoint_dir}")
     # Metadata filtering status
     exclude_non_pure = not args.include_non_pure
     exclude_superseded = not args.include_superseded
@@ -530,10 +377,10 @@ Note:
         diagnostics=args.diagnostics,
     )
 
-    # Run per-experiment outlier detection if requested
+    # Run local MAD outlier detection if requested
     if run_experiment_outlier:
         print("\n" + "-"*70)
-        print("Running per-experiment GP outlier detection...")
+        print("Running local MAD outlier detection...")
         print("-"*70 + "\n")
 
         from nucml_next.data.experiment_outlier import ExperimentOutlierDetector
@@ -559,7 +406,7 @@ Note:
     elif run_experiment_outlier and 'z_score' in df.columns:
         n_point_outliers = df['point_outlier'].sum() if 'point_outlier' in df.columns else 0
         n_exp_outliers = df[df['experiment_outlier']]['experiment_id'].nunique() if 'experiment_outlier' in df.columns else 0
-        print(f"[OK] Per-experiment outlier detection:")
+        print(f"[OK] Local MAD outlier detection:")
         print(f"    Point outliers: {n_point_outliers:,} ({100*n_point_outliers/len(df):.2f}%)")
         print(f"    Experiment outliers: {n_exp_outliers} experiments flagged")
     else:

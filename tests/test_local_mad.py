@@ -18,7 +18,6 @@ from nucml_next.data.experiment_outlier import (
     ExperimentOutlierConfig,
     ExperimentOutlierDetector,
 )
-from nucml_next.data.experiment_gp import ExactGPExperimentConfig
 
 
 # ---------------------------------------------------------------------------
@@ -114,20 +113,19 @@ def _make_multi_experiment_df(n_experiments=3, n_per_exp=100, seed=42,
 class TestConfig:
     """Test ExperimentOutlierConfig defaults and local_mad settings."""
 
-    def test_default_scoring_method_is_gp(self):
-        """Default scoring_method should be 'gp' for backward compat."""
+    def test_default_config(self):
+        """Default config should have sensible defaults."""
         config = ExperimentOutlierConfig()
-        assert config.scoring_method == 'gp'
+        assert config.point_z_threshold == 3.0
+        assert config.mad_use_measurement_uncertainty is True
 
     def test_local_mad_config_with_custom_thresholds(self):
-        """local_mad config should accept custom thresholds."""
+        """Config should accept custom thresholds."""
         config = ExperimentOutlierConfig(
-            scoring_method='local_mad',
             exp_z_threshold=5.0,
             exp_fraction_threshold=0.20,
             mad_floor=0.05,
         )
-        assert config.scoring_method == 'local_mad'
         assert config.exp_z_threshold == 5.0
         assert config.exp_fraction_threshold == 0.20
         assert config.mad_floor == 0.05
@@ -229,13 +227,7 @@ class TestPointScoring:
         """Synthetic smooth data should have very low z > 3 rate."""
         df = _make_multi_experiment_df(n_experiments=3, n_per_exp=150, seed=42)
 
-        config = ExperimentOutlierConfig(
-            gp_config=ExactGPExperimentConfig(
-                smooth_mean_config=SmoothMeanConfig(smooth_mean_type='spline'),
-            ),
-            scoring_method='local_mad',
-            point_z_threshold=3.0,
-        )
+        config = ExperimentOutlierConfig(point_z_threshold=3.0)
         detector = ExperimentOutlierDetector(config)
         result = detector.score_dataframe(df)
 
@@ -269,13 +261,7 @@ class TestPointScoring:
             'Entry': 'E0001',
         })
 
-        config = ExperimentOutlierConfig(
-            gp_config=ExactGPExperimentConfig(
-                smooth_mean_config=SmoothMeanConfig(smooth_mean_type='spline'),
-            ),
-            scoring_method='local_mad',
-            point_z_threshold=5.0,
-        )
+        config = ExperimentOutlierConfig(point_z_threshold=5.0)
         detector = ExperimentOutlierDetector(config)
         result = detector.score_dataframe(df)
 
@@ -296,13 +282,7 @@ class TestPointScoring:
             'Entry': 'E0001',
         })
 
-        config = ExperimentOutlierConfig(
-            gp_config=ExactGPExperimentConfig(
-                smooth_mean_config=SmoothMeanConfig(smooth_mean_type='spline'),
-            ),
-            scoring_method='local_mad',
-            point_z_threshold=3.0,
-        )
+        config = ExperimentOutlierConfig(point_z_threshold=3.0)
         detector = ExperimentOutlierDetector(config)
         result = detector.score_dataframe(df)
 
@@ -350,10 +330,6 @@ class TestExperimentDiscrepancy:
         df = _make_multi_experiment_df(n_experiments=3, n_per_exp=100)
 
         config = ExperimentOutlierConfig(
-            gp_config=ExactGPExperimentConfig(
-                smooth_mean_config=SmoothMeanConfig(smooth_mean_type='spline'),
-            ),
-            scoring_method='local_mad',
             exp_z_threshold=3.0,
             exp_fraction_threshold=0.30,
         )
@@ -372,10 +348,6 @@ class TestExperimentDiscrepancy:
         )
 
         config = ExperimentOutlierConfig(
-            gp_config=ExactGPExperimentConfig(
-                smooth_mean_config=SmoothMeanConfig(smooth_mean_type='spline'),
-            ),
-            scoring_method='local_mad',
             exp_z_threshold=3.0,
             exp_fraction_threshold=0.30,
         )
@@ -398,10 +370,6 @@ class TestExperimentDiscrepancy:
 
         # Strict threshold (60%) — harder to flag
         config_strict = ExperimentOutlierConfig(
-            gp_config=ExactGPExperimentConfig(
-                smooth_mean_config=SmoothMeanConfig(smooth_mean_type='spline'),
-            ),
-            scoring_method='local_mad',
             exp_z_threshold=3.0,
             exp_fraction_threshold=0.60,
         )
@@ -410,10 +378,6 @@ class TestExperimentDiscrepancy:
 
         # Loose threshold (10%) — easier to flag
         config_loose = ExperimentOutlierConfig(
-            gp_config=ExactGPExperimentConfig(
-                smooth_mean_config=SmoothMeanConfig(smooth_mean_type='spline'),
-            ),
-            scoring_method='local_mad',
             exp_z_threshold=3.0,
             exp_fraction_threshold=0.10,
         )
@@ -437,12 +401,7 @@ class TestIntegration:
         """Full pipeline with local_mad should complete and produce expected columns."""
         df = _make_multi_experiment_df(n_experiments=3, n_per_exp=100)
 
-        config = ExperimentOutlierConfig(
-            gp_config=ExactGPExperimentConfig(
-                smooth_mean_config=SmoothMeanConfig(smooth_mean_type='spline'),
-            ),
-            scoring_method='local_mad',
-        )
+        config = ExperimentOutlierConfig()
         detector = ExperimentOutlierDetector(config)
         result = detector.score_dataframe(df)
 
@@ -468,25 +427,11 @@ class TestIntegration:
         # Check calibration_metric is NaN (not used by local_mad)
         assert result['calibration_metric'].isna().all()
 
-    def test_gp_path_unchanged(self):
-        """scoring_method='gp' should use the existing GP code path."""
-        config = ExperimentOutlierConfig(
-            scoring_method='gp',
-        )
-        # Just verify config is accepted — the GP path is tested extensively
-        # in existing tests (test_data_lengthscale.py, etc.)
-        assert config.scoring_method == 'gp'
-
     def test_single_experiment_group(self):
         """Single-experiment group should score correctly, not flagged as discrepant."""
         df = _make_multi_experiment_df(n_experiments=1, n_per_exp=100)
 
-        config = ExperimentOutlierConfig(
-            gp_config=ExactGPExperimentConfig(
-                smooth_mean_config=SmoothMeanConfig(smooth_mean_type='spline'),
-            ),
-            scoring_method='local_mad',
-        )
+        config = ExperimentOutlierConfig()
         detector = ExperimentOutlierDetector(config)
         result = detector.score_dataframe(df)
 
@@ -522,12 +467,7 @@ class TestEdgeCases:
             'Entry': 'E0001',
         })
 
-        config = ExperimentOutlierConfig(
-            gp_config=ExactGPExperimentConfig(
-                smooth_mean_config=SmoothMeanConfig(smooth_mean_type='spline'),
-            ),
-            scoring_method='local_mad',
-        )
+        config = ExperimentOutlierConfig()
         detector = ExperimentOutlierDetector(config)
         result = detector.score_dataframe(df)
 
@@ -544,16 +484,156 @@ class TestEdgeCases:
             'Entry': 'E0001',
         })
 
-        config = ExperimentOutlierConfig(
-            gp_config=ExactGPExperimentConfig(
-                smooth_mean_config=SmoothMeanConfig(smooth_mean_type='spline'),
-            ),
-            scoring_method='local_mad',
-            min_group_size=10,  # > 5 points
-        )
+        config = ExperimentOutlierConfig(min_group_size=10)  # > 5 points
         detector = ExperimentOutlierDetector(config)
         result = detector.score_dataframe(df)
 
         # Should fall back to MAD but not crash
         assert len(result) == 5
         assert np.all(np.isfinite(result['z_score'].values))
+
+
+# ---------------------------------------------------------------------------
+# Measurement uncertainty integration tests
+# ---------------------------------------------------------------------------
+
+def _make_data_with_uncertainty(n=200, seed=42, rel_unc=0.03):
+    """Create synthetic data with EXFOR-like reported uncertainties.
+
+    Args:
+        n: Number of data points.
+        seed: Random seed.
+        rel_unc: Relative uncertainty (d_sigma/sigma) for each point.
+
+    Returns:
+        DataFrame with Z, A, MT, Energy, CrossSection, Uncertainty, Entry columns.
+    """
+    rng = np.random.RandomState(seed)
+    log_E = np.sort(rng.uniform(-2, 8, n))
+    trend = 2.0 - 0.3 * log_E
+    noise = rng.normal(0, 0.1, n)
+    log_sigma = trend + noise
+
+    energy = 10.0 ** log_E
+    cross_section = 10.0 ** log_sigma
+    uncertainty = cross_section * rel_unc  # absolute uncertainty
+
+    return pd.DataFrame({
+        'Z': 92,
+        'A': 235,
+        'MT': 18,
+        'Energy': energy,
+        'CrossSection': cross_section,
+        'Uncertainty': uncertainty,
+        'Entry': 'E0001',
+    })
+
+
+class TestMeasurementUncertainty:
+    """Tests for measurement uncertainty integration in local_mad scoring."""
+
+    def test_uncertainty_reduces_z_scores(self):
+        """Including measurement uncertainty should reduce z-scores."""
+        df = _make_data_with_uncertainty(n=200, rel_unc=0.05)
+
+        # Without uncertainty
+        config_no_unc = ExperimentOutlierConfig(
+            mad_use_measurement_uncertainty=False,
+        )
+        result_no_unc = ExperimentOutlierDetector(config_no_unc).score_dataframe(df)
+
+        # With uncertainty
+        config_with_unc = ExperimentOutlierConfig(
+            mad_use_measurement_uncertainty=True,
+        )
+        result_with_unc = ExperimentOutlierDetector(config_with_unc).score_dataframe(df)
+
+        z_no_unc = result_no_unc['z_score'].values
+        z_with_unc = result_with_unc['z_score'].values
+
+        # z-scores with uncertainty should be <= those without (for every point)
+        assert np.all(z_with_unc <= z_no_unc + 1e-10), (
+            "Uncertainty should never increase z-scores"
+        )
+
+        # Mean z-score should be meaningfully lower
+        assert np.mean(z_with_unc) < np.mean(z_no_unc), (
+            "Mean z-score should decrease when measurement uncertainty is included"
+        )
+
+    def test_no_uncertainty_column_unchanged(self):
+        """Data without Uncertainty column should behave like mad_use_measurement_uncertainty=False."""
+        df = _make_multi_experiment_df(n_experiments=1, n_per_exp=200)
+        # This df has no 'Uncertainty' column
+
+        config_on = ExperimentOutlierConfig(
+            mad_use_measurement_uncertainty=True,
+        )
+        config_off = ExperimentOutlierConfig(
+            mad_use_measurement_uncertainty=False,
+        )
+
+        result_on = ExperimentOutlierDetector(config_on).score_dataframe(df)
+        result_off = ExperimentOutlierDetector(config_off).score_dataframe(df)
+
+        # Should be identical since there's no Uncertainty column
+        np.testing.assert_array_almost_equal(
+            result_on['z_score'].values,
+            result_off['z_score'].values,
+        )
+
+    def test_large_uncertainty_suppresses_outliers(self):
+        """Large reported uncertainties should suppress false positives."""
+        # Create data with large noise but also large reported uncertainty
+        rng = np.random.RandomState(42)
+        n = 300
+        log_E = np.sort(rng.uniform(-2, 8, n))
+        trend = 2.0 - 0.3 * log_E
+        noise = rng.normal(0, 0.3, n)  # Large noise
+        log_sigma = trend + noise
+
+        energy = 10.0 ** log_E
+        cross_section = 10.0 ** log_sigma
+        # Report 30% relative uncertainty (much larger than MAD floor)
+        uncertainty = cross_section * 0.30
+
+        df = pd.DataFrame({
+            'Z': 92, 'A': 235, 'MT': 18,
+            'Energy': energy,
+            'CrossSection': cross_section,
+            'Uncertainty': uncertainty,
+            'Entry': 'E0001',
+        })
+
+        config = ExperimentOutlierConfig(
+            mad_use_measurement_uncertainty=True,
+            point_z_threshold=3.0,
+        )
+        result = ExperimentOutlierDetector(config).score_dataframe(df)
+
+        outlier_rate = result['point_outlier'].mean()
+        # With 30% reported uncertainty, the effective sigma is large,
+        # so very few points should be flagged
+        assert outlier_rate < 0.05, (
+            f"Outlier rate {outlier_rate:.1%} should be < 5% with large "
+            f"reported uncertainties"
+        )
+
+    def test_effective_sigma_stored_in_gp_std(self):
+        """gp_std should contain effective_sigma (not raw local_mad) when uncertainty is used."""
+        df = _make_data_with_uncertainty(n=200, rel_unc=0.10)
+
+        config = ExperimentOutlierConfig(
+            mad_use_measurement_uncertainty=True,
+        )
+        result = ExperimentOutlierDetector(config).score_dataframe(df)
+
+        config_no_unc = ExperimentOutlierConfig(
+            mad_use_measurement_uncertainty=False,
+        )
+        result_no_unc = ExperimentOutlierDetector(config_no_unc).score_dataframe(df)
+
+        # gp_std with uncertainty should be >= gp_std without (quadrature sum)
+        assert np.all(
+            result['gp_std'].values >= result_no_unc['gp_std'].values - 1e-10
+        ), "effective_sigma >= local_mad always (quadrature sum)"

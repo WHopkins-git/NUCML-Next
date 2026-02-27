@@ -49,18 +49,6 @@ Download from https://www-nds.iaea.org/amdc/
 
 **Note:** AME files are NOT used at ingestion time. They are loaded at runtime by `NucmlDataset` during feature generation.
 
-### RIPL-3 Level Density (required for Gibbs kernel)
-
-Download from https://www-nds.iaea.org/RIPL-3/levels/
-
-| File | Content |
-|------|---------|
-| `levels-param.data` | CT level density parameters (T, U0) per nuclide |
-
-Place in `data/levels/`. RIPL-3 data is evaluation-independent (nuclear structure,
-not cross-section evaluations). Required only for the physics-informed Gibbs kernel;
-the default RBF kernel works without it.
-
 ---
 
 ## Ingestion Pipeline
@@ -85,18 +73,8 @@ python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --test-subset --diagnos
 # Include non-pure data for analysis
 python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --include-non-pure
 
-# Legacy per-experiment GP outlier detection
-python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method experiment
-
-# Legacy GP with GPU and checkpointing
-python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method experiment --svgp-device cuda --svgp-checkpoint-dir data/checkpoints/
-
-# Legacy full Phase 1-4 GP stack (spline mean + Gibbs kernel + contaminated likelihood + hierarchical refit)
-python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method experiment \
-    --smooth-mean spline \
-    --kernel-type gibbs --ripl-data-path data/levels-param.data \
-    --likelihood contaminated \
-    --hierarchical-refitting
+# Legacy SVGP outlier detection
+python scripts/ingest_exfor.py --x4-db data/x4sqlite1.db --outlier-method svgp
 ```
 
 See `docs/INGESTION_PIPELINE.md` for algorithm details and edge-case handling.
@@ -112,21 +90,13 @@ See `docs/INGESTION_PIPELINE.md` for algorithm details and edge-case handling.
 | `--include-non-pure` | OFF | Include non-pure data (relative, ratio, averaged, etc.) |
 | `--include-superseded` | OFF | Include superseded entries |
 | `--diagnostics` | OFF | Add Author, Year, ReactionType, FullCode, NDataPoints columns for interactive inspection |
-| `--outlier-method` | None | `local_mad` (recommended), `experiment` (legacy GP), or `svgp` (legacy) |
+| `--outlier-method` | None | `local_mad` (recommended) or `svgp` (legacy) |
 | `--z-threshold` | 3.0 | Z-score threshold for point outliers |
 | `--exp-z-threshold` | 3.0 | Z-score threshold for counting bad points in experiment discrepancy (local_mad only) |
 | `--exp-fraction-threshold` | 0.30 | Fraction of bad points to flag experiment as discrepant (local_mad only) |
-| `--svgp-device` | `cpu` | `cpu` or `cuda` |
-| `--max-gpu-points` | 40000 | Max points per experiment on GPU; larger auto-route to CPU |
-| `--max-subsample-points` | 15000 | Subsample large experiments for GP fitting |
-| `--svgp-checkpoint-dir` | None | Enable checkpointing for resume on interruption |
-| `--svgp-likelihood` | `student_t` | Likelihood: `student_t`, `heteroscedastic`, `gaussian` |
-| `--smooth-mean` | `constant` | Mean function: `constant` or `spline` (Phase 1) |
-| `--kernel-type` | `rbf` | GP kernel: `rbf` or `gibbs` (Phase 2, needs `--ripl-data-path`) |
-| `--ripl-data-path` | None | Path to RIPL-3 `levels-param.data` (required for `gibbs`) |
-| `--likelihood` | `gaussian` | GP likelihood: `gaussian` or `contaminated` (Phase 3) |
-| `--hierarchical-refitting` | OFF | Two-pass group-constrained refit (Phase 4) |
-| `--num-threads` | 50% of cores | CPU threads for NumPy/PyTorch linear algebra |
+| `--svgp-device` | `cpu` | `cpu` or `cuda` (SVGP only) |
+| `--svgp-likelihood` | `student_t` | Likelihood: `student_t`, `heteroscedastic`, `gaussian` (SVGP only) |
+| `--num-threads` | 50% of cores | CPU threads for NumPy/SciPy linear algebra |
 | `--ame2020-dir` | None | DEPRECATED -- ignored (AME loaded at feature-generation time) |
 | `--run-svgp` | OFF | DEPRECATED -- use `--outlier-method svgp` instead |
 | `--no-svgp` | OFF | DEPRECATED -- outlier detection is off by default |
@@ -140,7 +110,7 @@ gp_mean, gp_std, z_score, experiment_outlier, point_outlier, calibration_metric,
 Year, Author, ReactionType, FullCode, NDataPoints
 ```
 
-The scoring columns (`gp_mean` through `experiment_id`) are present when `--outlier-method local_mad` or `--outlier-method experiment` is used. For `local_mad`, `gp_mean` contains the smooth mean and `gp_std` contains the local MAD. The diagnostic columns (`Year` through `NDataPoints`) are only present when `--diagnostics` is used.
+The scoring columns (`gp_mean` through `experiment_id`) are present when `--outlier-method local_mad` is used. `gp_mean` contains the smooth mean, `gp_std` contains the effective sigma (local MAD combined with measurement uncertainty in quadrature). The diagnostic columns (`Year` through `NDataPoints`) are only present when `--diagnostics` is used.
 
 ---
 
@@ -179,12 +149,11 @@ Tier A is always included. Reaction channels (MT codes) are encoded as a 9-compo
 
 ## Outlier Detection
 
-Three methods are available via `--outlier-method`:
+Two methods are available via `--outlier-method`:
 
 | Method | Flag | Approach |
 |--------|------|----------|
-| Smooth mean + local MAD | `local_mad` | Fits pooled smooth mean, computes energy-local MAD, scores by z = \|residual\| / MAD. Parallel across CPU cores. **Recommended.** |
-| Per-experiment GP (legacy) | `experiment` | Fits independent GPs per experiment, builds consensus, flags discrepant experiments. |
+| Smooth mean + local MAD | `local_mad` | Fits pooled smooth mean, computes energy-local MAD, incorporates EXFOR measurement uncertainties in quadrature. Parallel across CPU cores. **Recommended.** |
 | Legacy SVGP | `svgp` | Pools all experiments per (Z, A, MT) group into a single Sparse Variational GP. Point-level only. |
 
 ### Output Columns (local_mad)
@@ -193,9 +162,9 @@ Three methods are available via `--outlier-method`:
 |--------|------|-------------|
 | `experiment_outlier` | bool | Experiment has > 30% of points with z > 3 (configurable) |
 | `point_outlier` | bool | Individual point exceeds z-threshold |
-| `z_score` | float | \|residual from smooth mean\| / local MAD |
+| `z_score` | float | \|residual from smooth mean\| / effective_sigma |
 | `gp_mean` | float | Smooth mean value (consensus trend) |
-| `gp_std` | float | Local MAD (energy-dependent scatter estimate) |
+| `gp_std` | float | Effective sigma = sqrt(local_MAD² + σ_measurement²) |
 | `experiment_id` | str | EXFOR Entry identifier |
 | `calibration_metric` | float | NaN (not used by local_mad) |
 | `outlier_probability` | float | NaN (not used by local_mad) |
@@ -242,11 +211,8 @@ nucml_next/
   data/            NucmlDataset, DataSelection, TransformationPipeline,
                    MetadataFilter (metadata_filter.py),
                    ExperimentOutlierDetector (experiment_outlier.py),
-                   SVGPOutlierDetector (outlier_detection.py, legacy),
-                   KernelConfig/RBFKernel/GibbsKernel (kernels.py),
-                   RIPL3LevelDensity (ripl_loader.py),
                    SmoothMeanConfig (smooth_mean.py),
-                   LikelihoodConfig (likelihood.py)
+                   SVGPOutlierDetector (outlier_detection.py, legacy)
   baselines/       DecisionTreeEvaluator, XGBoostEvaluator
   model/           GNN-Transformer architecture
   physics/         Physics-informed and sensitivity-weighted loss
