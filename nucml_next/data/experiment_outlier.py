@@ -4,10 +4,12 @@ Outlier Detection for EXFOR Cross-Section Data
 
 Scores every data point using a smooth mean + rolling MAD approach:
 
-    z_score = |residual from smooth mean| / effective_sigma
+    z_score = |residual from smooth mean| / local_MAD
 
-where ``effective_sigma`` combines the local MAD (median absolute deviation)
-with reported EXFOR measurement uncertainties in quadrature.
+The smooth mean can optionally be weighted by reported EXFOR measurement
+uncertainties (1/σ²) to pull the consensus toward precise measurements.
+The z-score denominator is always the local MAD — no measurement uncertainty
+in the denominator.
 
 No GP fitting, O(n log n) per group, parallelised across CPU cores.
 
@@ -20,7 +22,7 @@ Output columns:
     - point_outlier: bool - Individual point anomalous
     - z_score: float - Continuous anomaly score
     - gp_mean: float - Smooth mean value (column name kept for compatibility)
-    - gp_std: float - Effective sigma (local MAD + measurement uncertainty)
+    - gp_std: float - Local MAD (column name kept for compatibility)
     - calibration_metric: float - NaN (reserved for compatibility)
     - outlier_probability: float - NaN (reserved for compatibility)
     - experiment_id: str - EXFOR Entry identifier
@@ -42,6 +44,41 @@ import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+
+def _compute_weights_for_worker(group_df):
+    """Compute inverse-variance weights for smooth mean fitting (worker version).
+
+    Module-level function for pickle compatibility with ProcessPoolExecutor.
+    Returns None if <10% of points have uncertainty data.
+    """
+    if 'Uncertainty' not in group_df.columns or 'CrossSection' not in group_df.columns:
+        return None
+
+    xs = group_df['CrossSection'].values
+    unc = group_df['Uncertainty'].values
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        has_unc = np.isfinite(unc) & (unc > 0) & (xs > 0)
+        rel_unc = np.where(has_unc, unc / xs, np.nan)
+
+    if has_unc.mean() < 0.10:
+        return None
+
+    log_unc = 0.434 * rel_unc
+    log_unc_clipped = np.where(
+        np.isfinite(log_unc),
+        np.clip(log_unc, 0.005, 0.5),
+        np.nan,
+    )
+    weights = np.where(
+        np.isfinite(log_unc_clipped),
+        1.0 / log_unc_clipped**2,
+        1.0,
+    )
+    median_w = np.median(weights)
+    weights = np.clip(weights, median_w / 100, median_w * 100)
+    return weights
 
 
 def _local_mad_worker(args):
@@ -69,9 +106,15 @@ def _local_mad_worker(args):
     log_sigma_all = group_df['log_sigma'].values
 
     # 1. Fit smooth mean (always spline for local_mad)
+    #    Optionally weight by 1/σ² from reported uncertainties
+    weights = None
+    if config_dict.get('use_uncertainty_weights', True):
+        weights = _compute_weights_for_worker(group_df)
+
     mean_fn = fit_smooth_mean(
         log_E_all, log_sigma_all,
         SmoothMeanConfig(smooth_mean_type='spline'),
+        weights=weights,
     )
 
     # 2. Rolling MAD
@@ -101,27 +144,10 @@ def _local_mad_worker(args):
             'outlier_probability': np.full(n, np.nan),
         }
 
-    # 3. Score every point
+    # 3. Score every point: z = |residual| / local_MAD
     residuals = log_sigma_all - mean_fn(log_E_all)
     local_mad = mad_fn(log_E_all)
-
-    # Optionally combine MAD with reported measurement uncertainties
-    if config_dict.get('mad_use_measurement_uncertainty', True):
-        log_unc = np.zeros(n)
-        if 'Uncertainty' in group_df.columns and 'CrossSection' in group_df.columns:
-            unc = group_df['Uncertainty'].values
-            xs = group_df['CrossSection'].values
-            valid = np.isfinite(unc) & (unc > 0) & np.isfinite(xs) & (xs > 0)
-            log_unc[valid] = 0.434 * (unc[valid] / xs[valid])
-        effective_sigma = np.where(
-            np.isfinite(log_unc) & (log_unc > 0),
-            np.sqrt(local_mad**2 + log_unc**2),
-            local_mad,
-        )
-    else:
-        effective_sigma = local_mad
-
-    z_scores = np.abs(residuals) / effective_sigma
+    z_scores = np.abs(residuals) / local_mad
     point_outlier = z_scores > config_dict['point_z_threshold']
 
     # 4. Experiment discrepancy
@@ -145,7 +171,7 @@ def _local_mad_worker(args):
 
     return group_df.index, {
         'gp_mean': mean_fn(log_E_all),
-        'gp_std': effective_sigma,
+        'gp_std': local_mad,
         'z_score': z_scores,
         'point_outlier': point_outlier,
         'experiment_outlier': experiment_outlier,
@@ -163,13 +189,13 @@ class ExperimentOutlierConfig:
         min_group_size: Minimum points in (Z, A, MT) group for rolling MAD.
             Below this, uses simple MAD fallback.
         entry_column: Column name containing EXFOR Entry identifier.
-        n_workers: Number of parallel workers (None = 50% of CPU cores).
+        n_workers: Number of parallel workers. None or -1 = auto (half of
+            logical cores). 0 = all logical cores. Positive int = exact count.
         mad_window_fraction: Rolling window as fraction of energy range.
         mad_min_window_points: Minimum points per MAD window.
         mad_floor: Minimum MAD value (prevents div-by-zero in flat regions).
-        mad_use_measurement_uncertainty: When True, combine local MAD with
-            reported EXFOR measurement uncertainties in quadrature:
-            effective_sigma = sqrt(local_MAD² + σ_measurement²).
+        use_uncertainty_weights: When True, weight the smooth mean fit by
+            1/σ² from reported EXFOR uncertainties (improves consensus line).
         exp_z_threshold: Z-score threshold for counting "bad" points
             within an experiment.
         exp_fraction_threshold: Fraction of bad points above which an
@@ -182,8 +208,8 @@ class ExperimentOutlierConfig:
     # --- Local MAD scoring ---
     mad_window_fraction: float = 0.1
     mad_min_window_points: int = 15
-    mad_floor: float = 0.01
-    mad_use_measurement_uncertainty: bool = True
+    mad_floor: float = 0.02  # ~5% relative — minimum plausible measurement scatter
+    use_uncertainty_weights: bool = True  # Weight smooth mean by 1/σ² when available
     # --- Experiment discrepancy thresholds ---
     exp_z_threshold: float = 3.0
     exp_fraction_threshold: float = 0.30
@@ -193,10 +219,11 @@ class ExperimentOutlierDetector:
     """Outlier detector using smooth mean + local MAD scoring.
 
     Scores every data point in a DataFrame grouped by (Z, A, MT):
-    1. Fits a smooth spline mean on pooled data
+    1. Fits a smooth spline mean on pooled data (optionally uncertainty-weighted)
     2. Computes rolling MAD of residuals in energy windows
-    3. Optionally incorporates EXFOR measurement uncertainties
-    4. Assigns z-scores and flags point + experiment outliers
+    3. Assigns z-scores: |residual| / local_MAD
+    4. Flags point outliers by z-score threshold
+    5. Flags experiment discrepancy by fraction of flagged points
 
     Args:
         config: Configuration for detector parameters.
@@ -231,8 +258,8 @@ class ExperimentOutlierDetector:
         - log_E: log10(Energy)
         - log_sigma: log10(CrossSection)
         - gp_mean: Smooth mean in log10 space (name kept for compatibility)
-        - gp_std: Effective sigma (local MAD + measurement uncertainty)
-        - z_score: |log_sigma - gp_mean| / gp_std
+        - gp_std: Local MAD (name kept for compatibility)
+        - z_score: |log_sigma - gp_mean| / local_MAD
         - experiment_outlier: bool - entire experiment is discrepant
         - point_outlier: bool - individual point is anomalous
         - calibration_metric: float - NaN (compatibility column)
@@ -295,12 +322,11 @@ class ExperimentOutlierDetector:
             f"(groupby {group_cols}), {len(df):,} points"
         )
 
+        import os
         import multiprocessing
         from concurrent.futures import ProcessPoolExecutor
 
-        n_workers = self.config.n_workers
-        if n_workers is None:
-            n_workers = max(1, multiprocessing.cpu_count() // 2)
+        n_workers = self._resolve_n_workers(self.config.n_workers)
 
         # Only use multiprocessing when it's worth the overhead
         # (process spawn on Windows is expensive; need enough groups)
@@ -310,7 +336,7 @@ class ExperimentOutlierDetector:
             'mad_window_fraction': self.config.mad_window_fraction,
             'mad_min_window_points': self.config.mad_min_window_points,
             'mad_floor': self.config.mad_floor,
-            'mad_use_measurement_uncertainty': self.config.mad_use_measurement_uncertainty,
+            'use_uncertainty_weights': self.config.use_uncertainty_weights,
             'point_z_threshold': self.config.point_z_threshold,
             'exp_z_threshold': self.config.exp_z_threshold,
             'exp_fraction_threshold': self.config.exp_fraction_threshold,
@@ -333,13 +359,16 @@ class ExperimentOutlierDetector:
                 work_items.append((group_df, experiment_ids, config_dict))
 
         n_work = len(work_items)
+        total_cores = os.cpu_count() or 4
         if use_parallel:
             logger.info(
-                f"Local MAD parallel: {n_work} groups on {n_workers} workers"
+                f"Local MAD parallel: {n_work} groups on {n_workers} workers "
+                f"(from {total_cores} logical cores)"
             )
         else:
             logger.info(
-                f"Local MAD sequential: {n_work} groups (n_workers={n_workers})"
+                f"Local MAD sequential: {n_work} groups "
+                f"(n_workers={n_workers}, n_groups={n_groups})"
             )
 
         if n_work > 0:
@@ -430,8 +459,9 @@ class ExperimentOutlierDetector:
 
         This method:
         1. Fits a smooth mean on ALL pooled data in the group
+           (optionally weighted by 1/σ² from reported uncertainties)
         2. Computes rolling MAD of residuals in energy windows
-        3. Assigns z-scores to every point: |residual| / effective_sigma
+        3. Assigns z-scores: |residual| / local_MAD
         4. Flags point outliers by z-score threshold
         5. Flags experiment discrepancy by fraction of flagged points
 
@@ -448,13 +478,20 @@ class ExperimentOutlierDetector:
         log_sigma_all = result['log_sigma'].values
 
         # 1. Fit smooth mean on pooled data (always spline)
+        #    Optionally weight by 1/σ² from reported uncertainties
         from nucml_next.data.smooth_mean import (
             fit_smooth_mean, compute_rolling_mad_interpolator, SmoothMeanConfig,
         )
 
+        if self.config.use_uncertainty_weights:
+            weights = self._compute_smooth_mean_weights(result)
+        else:
+            weights = None
+
         mean_fn = fit_smooth_mean(
             log_E_all, log_sigma_all,
             SmoothMeanConfig(smooth_mean_type='spline'),
+            weights=weights,
         )
 
         # 2. Compute residuals and rolling MAD
@@ -468,25 +505,13 @@ class ExperimentOutlierDetector:
         if mad_fn is None:
             return self._score_with_mad(result)
 
-        # 3. Score every point
+        # 3. Score every point: z = |residual| / local_MAD
         residuals = log_sigma_all - mean_fn(log_E_all)
         local_mad = mad_fn(log_E_all)
-
-        # Optionally combine MAD with reported measurement uncertainties
-        if self.config.mad_use_measurement_uncertainty:
-            log_unc = self._get_log_uncertainties_for_mad(result)
-            effective_sigma = np.where(
-                np.isfinite(log_unc) & (log_unc > 0),
-                np.sqrt(local_mad**2 + log_unc**2),
-                local_mad,
-            )
-        else:
-            effective_sigma = local_mad
-
-        z_scores = np.abs(residuals) / effective_sigma
+        z_scores = np.abs(residuals) / local_mad
 
         result['gp_mean'] = mean_fn(log_E_all)
-        result['gp_std'] = effective_sigma
+        result['gp_std'] = local_mad
         result['z_score'] = z_scores
 
         # 4. Flag point outliers
@@ -521,26 +546,79 @@ class ExperimentOutlierDetector:
 
         return result
 
-    def _get_log_uncertainties_for_mad(self, df: pd.DataFrame) -> np.ndarray:
-        """Convert EXFOR measurement uncertainties to log10 space.
+    @staticmethod
+    def _resolve_n_workers(n_workers: Optional[int]) -> int:
+        """Resolve worker count for parallel dispatch.
 
-        Returns sigma_log = 0.434 * (d_sigma / sigma) for each point,
-        where 0.434 = 1/ln(10).  Points without valid uncertainty get 0.0
-        (no contribution to effective sigma).
+        Args:
+            n_workers: None or -1 = auto (half of logical cores).
+                       0 = all logical cores.
+                       Positive int = exact count.
+
+        Returns:
+            Resolved number of workers (always >= 1).
         """
-        n = len(df)
-        log_unc = np.zeros(n)
+        import os
+        total = os.cpu_count() or 4
+        if n_workers is None or n_workers == -1:
+            return max(1, total // 2)
+        elif n_workers == 0:
+            return total
+        else:
+            return max(1, n_workers)
 
+    def _compute_smooth_mean_weights(
+        self, df: pd.DataFrame,
+    ) -> Optional[np.ndarray]:
+        """Compute inverse-variance weights from EXFOR uncertainties.
+
+        Returns weights proportional to 1/σ² in log₁₀ space, or None if
+        fewer than 10% of points have reported uncertainties.
+
+        Points without reported uncertainty get weight = 1.0 (neutral).
+        Points with reported uncertainty get weight = 1/σ_log² (capped).
+
+        Returns:
+            Array of weights shape (n,), or None if too few points have
+            uncertainty to make weighting meaningful.
+        """
         if 'Uncertainty' not in df.columns or 'CrossSection' not in df.columns:
-            return log_unc
+            return None
 
-        unc = df['Uncertainty'].values
         xs = df['CrossSection'].values
+        unc = df['Uncertainty'].values
 
-        valid = np.isfinite(unc) & (unc > 0) & np.isfinite(xs) & (xs > 0)
-        log_unc[valid] = 0.434 * (unc[valid] / xs[valid])
+        with np.errstate(divide='ignore', invalid='ignore'):
+            has_unc = np.isfinite(unc) & (unc > 0) & (xs > 0)
+            rel_unc = np.where(has_unc, unc / xs, np.nan)
 
-        return log_unc
+        # If fewer than 10% have uncertainty, don't weight (not enough info)
+        if has_unc.mean() < 0.10:
+            return None
+
+        # Convert to log₁₀ space: σ_log = 0.434 * (dσ/σ)
+        log_unc = 0.434 * rel_unc
+
+        # Inverse variance weights, capped to avoid extreme values
+        # Floor σ_log at 0.005 (0.5% relative) — prevents absurd weights
+        # Ceiling σ_log at 0.5 (100% relative) — prevents zero weights
+        log_unc_clipped = np.where(
+            np.isfinite(log_unc),
+            np.clip(log_unc, 0.005, 0.5),
+            np.nan,
+        )
+
+        weights = np.where(
+            np.isfinite(log_unc_clipped),
+            1.0 / log_unc_clipped**2,
+            1.0,  # Default weight for missing uncertainty
+        )
+
+        # Cap extreme weight ratios to prevent single points dominating
+        median_w = np.median(weights)
+        weights = np.clip(weights, median_w / 100, median_w * 100)
+
+        return weights
 
     def get_statistics(self) -> Dict[str, Any]:
         """Return processing statistics."""

@@ -117,7 +117,8 @@ class TestConfig:
         """Default config should have sensible defaults."""
         config = ExperimentOutlierConfig()
         assert config.point_z_threshold == 3.0
-        assert config.mad_use_measurement_uncertainty is True
+        assert config.use_uncertainty_weights is True
+        assert config.mad_floor == 0.02
 
     def test_local_mad_config_with_custom_thresholds(self):
         """Config should accept custom thresholds."""
@@ -529,49 +530,70 @@ def _make_data_with_uncertainty(n=200, seed=42, rel_unc=0.03):
     })
 
 
-class TestMeasurementUncertainty:
-    """Tests for measurement uncertainty integration in local_mad scoring."""
+class TestUncertaintyWeightedSmoothMean:
+    """Tests for uncertainty-weighted smooth mean in local_mad scoring.
 
-    def test_uncertainty_reduces_z_scores(self):
-        """Including measurement uncertainty should reduce z-scores."""
-        df = _make_data_with_uncertainty(n=200, rel_unc=0.05)
+    Uncertainty weights affect WHERE the consensus line sits (via 1/σ²
+    weighting in the spline fit), NOT the z-score denominator (which is
+    always local_MAD).
+    """
 
-        # Without uncertainty
-        config_no_unc = ExperimentOutlierConfig(
-            mad_use_measurement_uncertainty=False,
-        )
-        result_no_unc = ExperimentOutlierDetector(config_no_unc).score_dataframe(df)
+    def test_weighted_smooth_mean_prefers_precise(self):
+        """Smooth mean should be pulled toward high-precision measurements."""
+        # Two clusters at same energies:
+        #   Cluster A: 80 points at log_sigma ~ 1.0, σ_rel = 1% (precise)
+        #   Cluster B: 80 points at log_sigma ~ 1.5, σ_rel = 50% (imprecise)
+        # Unweighted mean: ~1.25. Weighted mean: closer to 1.0.
+        rng = np.random.RandomState(42)
+        n_each = 80
+        log_E = np.sort(rng.uniform(0, 2, n_each * 2))
+        trend = np.ones(n_each * 2) * 1.25  # flat underlying
 
-        # With uncertainty
-        config_with_unc = ExperimentOutlierConfig(
-            mad_use_measurement_uncertainty=True,
-        )
-        result_with_unc = ExperimentOutlierDetector(config_with_unc).score_dataframe(df)
+        # Cluster A: precise measurements near 1.0
+        log_sigma_A = rng.normal(1.0, 0.01, n_each)
+        unc_A = (10.0 ** log_sigma_A) * 0.01  # 1% relative
 
-        z_no_unc = result_no_unc['z_score'].values
-        z_with_unc = result_with_unc['z_score'].values
+        # Cluster B: imprecise measurements near 1.5
+        log_sigma_B = rng.normal(1.5, 0.05, n_each)
+        unc_B = (10.0 ** log_sigma_B) * 0.50  # 50% relative
 
-        # z-scores with uncertainty should be <= those without (for every point)
-        assert np.all(z_with_unc <= z_no_unc + 1e-10), (
-            "Uncertainty should never increase z-scores"
-        )
+        log_sigma = np.concatenate([log_sigma_A, log_sigma_B])
+        uncertainty = np.concatenate([unc_A, unc_B])
+        energy = 10.0 ** log_E
+        cross_section = 10.0 ** log_sigma
 
-        # Mean z-score should be meaningfully lower
-        assert np.mean(z_with_unc) < np.mean(z_no_unc), (
-            "Mean z-score should decrease when measurement uncertainty is included"
+        df = pd.DataFrame({
+            'Z': 92, 'A': 235, 'MT': 18,
+            'Energy': energy,
+            'CrossSection': cross_section,
+            'Uncertainty': uncertainty,
+            'Entry': 'E0001',
+        })
+
+        # With weights: smooth mean pulled toward precise cluster (1.0)
+        config_w = ExperimentOutlierConfig(use_uncertainty_weights=True)
+        result_w = ExperimentOutlierDetector(config_w).score_dataframe(df)
+
+        # Without weights: smooth mean near midpoint (~1.25)
+        config_nw = ExperimentOutlierConfig(use_uncertainty_weights=False)
+        result_nw = ExperimentOutlierDetector(config_nw).score_dataframe(df)
+
+        mean_w = np.median(result_w['gp_mean'].values)
+        mean_nw = np.median(result_nw['gp_mean'].values)
+
+        # Weighted mean should be closer to 1.0 than unweighted mean
+        assert abs(mean_w - 1.0) < abs(mean_nw - 1.0), (
+            f"Weighted mean ({mean_w:.3f}) should be closer to 1.0 than "
+            f"unweighted ({mean_nw:.3f})"
         )
 
     def test_no_uncertainty_column_unchanged(self):
-        """Data without Uncertainty column should behave like mad_use_measurement_uncertainty=False."""
+        """Data without Uncertainty column: weights=True and False should give identical results."""
         df = _make_multi_experiment_df(n_experiments=1, n_per_exp=200)
         # This df has no 'Uncertainty' column
 
-        config_on = ExperimentOutlierConfig(
-            mad_use_measurement_uncertainty=True,
-        )
-        config_off = ExperimentOutlierConfig(
-            mad_use_measurement_uncertainty=False,
-        )
+        config_on = ExperimentOutlierConfig(use_uncertainty_weights=True)
+        config_off = ExperimentOutlierConfig(use_uncertainty_weights=False)
 
         result_on = ExperimentOutlierDetector(config_on).score_dataframe(df)
         result_off = ExperimentOutlierDetector(config_off).score_dataframe(df)
@@ -582,20 +604,22 @@ class TestMeasurementUncertainty:
             result_off['z_score'].values,
         )
 
-    def test_large_uncertainty_suppresses_outliers(self):
-        """Large reported uncertainties should suppress false positives."""
-        # Create data with large noise but also large reported uncertainty
+    def test_few_uncertainties_skips_weighting(self):
+        """If < 10% have uncertainty, fall back to unweighted fit."""
         rng = np.random.RandomState(42)
-        n = 300
+        n = 200
         log_E = np.sort(rng.uniform(-2, 8, n))
         trend = 2.0 - 0.3 * log_E
-        noise = rng.normal(0, 0.3, n)  # Large noise
+        noise = rng.normal(0, 0.1, n)
         log_sigma = trend + noise
 
         energy = 10.0 ** log_E
         cross_section = 10.0 ** log_sigma
-        # Report 30% relative uncertainty (much larger than MAD floor)
-        uncertainty = cross_section * 0.30
+
+        # Only 5% of points have uncertainty (below 10% threshold)
+        uncertainty = np.full(n, np.nan)
+        n_with_unc = int(n * 0.05)
+        uncertainty[:n_with_unc] = cross_section[:n_with_unc] * 0.05
 
         df = pd.DataFrame({
             'Z': 92, 'A': 235, 'MT': 18,
@@ -605,35 +629,63 @@ class TestMeasurementUncertainty:
             'Entry': 'E0001',
         })
 
-        config = ExperimentOutlierConfig(
-            mad_use_measurement_uncertainty=True,
-            point_z_threshold=3.0,
-        )
-        result = ExperimentOutlierDetector(config).score_dataframe(df)
+        config_w = ExperimentOutlierConfig(use_uncertainty_weights=True)
+        config_nw = ExperimentOutlierConfig(use_uncertainty_weights=False)
 
-        outlier_rate = result['point_outlier'].mean()
-        # With 30% reported uncertainty, the effective sigma is large,
-        # so very few points should be flagged
-        assert outlier_rate < 0.05, (
-            f"Outlier rate {outlier_rate:.1%} should be < 5% with large "
-            f"reported uncertainties"
+        result_w = ExperimentOutlierDetector(config_w).score_dataframe(df)
+        result_nw = ExperimentOutlierDetector(config_nw).score_dataframe(df)
+
+        # With so few uncertainties, weighting should be skipped → identical results
+        np.testing.assert_array_almost_equal(
+            result_w['z_score'].values,
+            result_nw['z_score'].values,
         )
 
-    def test_effective_sigma_stored_in_gp_std(self):
-        """gp_std should contain effective_sigma (not raw local_mad) when uncertainty is used."""
+    def test_extreme_weights_capped(self):
+        """No single point should dominate the spline fit (weights capped at 100× median)."""
+        from nucml_next.data.experiment_outlier import _compute_weights_for_worker
+
+        rng = np.random.RandomState(42)
+        n = 200
+        energy = 10.0 ** rng.uniform(-2, 8, n)
+        cross_section = 10.0 ** rng.normal(2.0, 0.1, n)
+
+        # Most points have 10% uncertainty
+        uncertainty = cross_section * 0.10
+        # One point has 0.01% uncertainty (extremely precise)
+        uncertainty[0] = cross_section[0] * 0.0001
+
+        df = pd.DataFrame({
+            'CrossSection': cross_section,
+            'Uncertainty': uncertainty,
+        })
+
+        weights = _compute_weights_for_worker(df)
+        assert weights is not None
+
+        # The extreme-precision point's weight should be capped
+        max_ratio = weights.max() / np.median(weights)
+        assert max_ratio <= 100 + 1e-6, (
+            f"Max weight ratio {max_ratio:.1f} should be <= 100"
+        )
+
+    def test_z_score_uses_local_mad_not_uncertainty(self):
+        """Z-score denominator should be local_MAD, never measurement uncertainty."""
         df = _make_data_with_uncertainty(n=200, rel_unc=0.10)
 
-        config = ExperimentOutlierConfig(
-            mad_use_measurement_uncertainty=True,
-        )
+        config = ExperimentOutlierConfig(use_uncertainty_weights=True)
         result = ExperimentOutlierDetector(config).score_dataframe(df)
 
-        config_no_unc = ExperimentOutlierConfig(
-            mad_use_measurement_uncertainty=False,
-        )
-        result_no_unc = ExperimentOutlierDetector(config_no_unc).score_dataframe(df)
+        # gp_std should equal the local MAD — same whether weighting is on or off
+        config_off = ExperimentOutlierConfig(use_uncertainty_weights=False)
+        result_off = ExperimentOutlierDetector(config_off).score_dataframe(df)
 
-        # gp_std with uncertainty should be >= gp_std without (quadrature sum)
-        assert np.all(
-            result['gp_std'].values >= result_no_unc['gp_std'].values - 1e-10
-        ), "effective_sigma >= local_mad always (quadrature sum)"
+        # gp_std (local MAD) may differ slightly because the smooth mean changes,
+        # which changes residuals, which changes the rolling MAD.
+        # But z = |residual| / gp_std must hold for both.
+        z = result['z_score'].values
+        residuals = result['log_sigma'].values - result['gp_mean'].values
+        gp_std = result['gp_std'].values
+        z_recomputed = np.abs(residuals) / gp_std
+
+        np.testing.assert_array_almost_equal(z, z_recomputed, decimal=10)

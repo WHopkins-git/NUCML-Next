@@ -69,6 +69,7 @@ def fit_smooth_mean(
     log_E: np.ndarray,
     log_sigma: np.ndarray,
     config: Optional[SmoothMeanConfig] = None,
+    weights: Optional[np.ndarray] = None,
 ) -> Callable[[np.ndarray], np.ndarray]:
     """Fit a smooth mean function from pooled cross-section data.
 
@@ -80,13 +81,17 @@ def fit_smooth_mean(
         1. Sort by log_E, filter NaN/inf.
         2. Fit initial ``UnivariateSpline(log_E, log_sigma, k=degree, s=auto)``.
         3. Iterate sigma-clipping: compute residuals, downweight
-           ``|r| > threshold * MAD``, refit with weights.
+           ``|r| > threshold * MAD``, refit with combined weights.
         4. Converge (max iterations) or stop when max change < tol.
 
     Args:
         log_E: log10(Energy) values, shape (n,).
         log_sigma: log10(CrossSection) values, shape (n,).
         config: Configuration.  ``None`` uses defaults (constant mean).
+        weights: Optional per-point fitting weights, shape (n,).  Typically
+            inverse-variance weights from reported measurement uncertainties:
+            ``w = 1 / σ_log²``.  Combined multiplicatively with sigma-clipping
+            weights during iterative reweighting.  ``None`` = equal weights.
 
     Returns:
         Callable ``mean_fn(log_E_array) -> log_sigma_array`` that evaluates
@@ -107,6 +112,7 @@ def fit_smooth_mean(
     valid = np.isfinite(log_E) & np.isfinite(log_sigma)
     log_E_clean = log_E[valid]
     log_sigma_clean = log_sigma[valid]
+    weights_clean = weights[valid] if weights is not None else None
     n = len(log_E_clean)
 
     # Fall back to constant if requested, too few points, or degenerate data
@@ -118,7 +124,8 @@ def fit_smooth_mean(
         return _fit_constant_mean(log_sigma_clean)
 
     if config.smooth_mean_type == 'spline':
-        return _fit_spline_mean(log_E_clean, log_sigma_clean, config)
+        return _fit_spline_mean(log_E_clean, log_sigma_clean, config,
+                                weights=weights_clean)
 
     raise ValueError(
         f"Unknown smooth_mean_type: {config.smooth_mean_type!r}. "
@@ -147,11 +154,19 @@ def _fit_spline_mean(
     log_E: np.ndarray,
     log_sigma: np.ndarray,
     config: SmoothMeanConfig,
+    weights: Optional[np.ndarray] = None,
 ) -> Callable[[np.ndarray], np.ndarray]:
     """Fit an iterative reweighted UnivariateSpline.
 
     Returns a callable that evaluates the spline at arbitrary points.
     Falls back to constant mean if the spline fit fails for any reason.
+
+    Args:
+        log_E: Sorted-clean log10(Energy), shape (n,).
+        log_sigma: Corresponding log10(CrossSection), shape (n,).
+        config: Spline configuration.
+        weights: Optional per-point fitting weights (e.g. 1/σ²). Combined
+            multiplicatively with sigma-clipping weights each iteration.
     """
     from scipy.interpolate import UnivariateSpline
 
@@ -159,10 +174,11 @@ def _fit_spline_mean(
     order = np.argsort(log_E)
     x = log_E[order]
     y = log_sigma[order]
+    user_w = weights[order] if weights is not None else None
 
     # Handle duplicate x values: UnivariateSpline requires strictly
-    # increasing x.  Average y for duplicate x groups.
-    x, y = _deduplicate_sorted(x, y)
+    # increasing x.  Average y (and weights) for duplicate x groups.
+    x, y, user_w = _deduplicate_sorted(x, y, w=user_w)
     n = len(x)
 
     if n < config.spline_degree + 1:
@@ -178,8 +194,13 @@ def _fit_spline_mean(
         logger.debug("Degenerate energy range, falling back to constant mean")
         return _fit_constant_mean(y)
 
-    # Initial uniform weights
-    weights = np.ones(n)
+    # Normalise user weights so they sum to n (preserves effective sample
+    # size for the smoothing parameter s)
+    if user_w is not None:
+        user_w = user_w * n / max(user_w.sum(), 1e-10)
+
+    # Initial weights: user weights or uniform
+    w = user_w.copy() if user_w is not None else np.ones(n)
 
     # Determine smoothing factor.
     # scipy auto-selection (s ≈ n) allows ~n knots which can be too flexible
@@ -191,7 +212,7 @@ def _fit_spline_mean(
         s = n * max(np.var(y), 1e-6)
 
     try:
-        spl = UnivariateSpline(x, y, w=weights, k=config.spline_degree, s=s)
+        spl = UnivariateSpline(x, y, w=w, k=config.spline_degree, s=s)
     except Exception as e:
         logger.debug(f"Initial spline fit failed: {e}, falling back to constant mean")
         return _fit_constant_mean(y)
@@ -210,15 +231,23 @@ def _fit_spline_mean(
 
         # Downweight outliers (Huber-like soft clipping)
         abs_r = np.abs(residuals) / sigma_est
-        weights = np.where(
+        clip_weights = np.where(
             abs_r <= config.sigma_clip_threshold,
             1.0,
             config.sigma_clip_threshold / abs_r,
         )
 
+        # Combine clip weights with user weights multiplicatively
+        if user_w is not None:
+            w = clip_weights * user_w
+            # Re-normalise so combined weights sum to n
+            w = w * n / max(w.sum(), 1e-10)
+        else:
+            w = clip_weights
+
         # Refit with new weights
         try:
-            spl = UnivariateSpline(x, y, w=weights, k=config.spline_degree, s=s)
+            spl = UnivariateSpline(x, y, w=w, k=config.spline_degree, s=s)
         except Exception as e:
             logger.debug(
                 f"Spline refit failed at iteration {iteration}: {e}, "
@@ -247,18 +276,27 @@ def _fit_spline_mean(
     return _spline_mean
 
 
-def _deduplicate_sorted(x: np.ndarray, y: np.ndarray) -> tuple:
-    """Average y values for duplicate x entries in a sorted array.
+def _deduplicate_sorted(
+    x: np.ndarray,
+    y: np.ndarray,
+    w: Optional[np.ndarray] = None,
+) -> tuple:
+    """Average y (and w) values for duplicate x entries in a sorted array.
 
     Args:
         x: Sorted array of x values (may contain duplicates).
         y: Corresponding y values.
+        w: Optional weights array to average along with y.
 
     Returns:
-        (x_unique, y_averaged) with strictly increasing x.
+        ``(x_unique, y_averaged)`` with strictly increasing x when ``w``
+        is None, or ``(x_unique, y_averaged, w_averaged)`` when ``w``
+        is provided.
     """
     if len(x) <= 1:
-        return x.copy(), y.copy()
+        if w is not None:
+            return x.copy(), y.copy(), w.copy()
+        return x.copy(), y.copy(), None
 
     # Find indices where x changes
     diff = np.diff(x)
@@ -268,7 +306,9 @@ def _deduplicate_sorted(x: np.ndarray, y: np.ndarray) -> tuple:
 
     if len(split_indices) == len(x) - 1:
         # No duplicates
-        return x.copy(), y.copy()
+        if w is not None:
+            return x.copy(), y.copy(), w.copy()
+        return x.copy(), y.copy(), None
 
     # Split into groups and average
     x_groups = np.split(x, split_indices)
@@ -277,7 +317,12 @@ def _deduplicate_sorted(x: np.ndarray, y: np.ndarray) -> tuple:
     x_unique = np.array([g[0] for g in x_groups])
     y_averaged = np.array([np.mean(g) for g in y_groups])
 
-    return x_unique, y_averaged
+    if w is not None:
+        w_groups = np.split(w, split_indices)
+        w_averaged = np.array([np.mean(g) for g in w_groups])
+        return x_unique, y_averaged, w_averaged
+
+    return x_unique, y_averaged, None
 
 
 # ---------------------------------------------------------------------------
@@ -340,7 +385,7 @@ def compute_rolling_mad_interpolator(
     mean_fn: Callable[[np.ndarray], np.ndarray],
     window_fraction: float = 0.1,
     min_window_points: int = 15,
-    mad_floor: float = 0.01,
+    mad_floor: float = 0.02,  # ~5% relative — minimum plausible scatter
 ) -> Optional[Callable[[np.ndarray], np.ndarray]]:
     """Compute energy-dependent MAD of residuals from smooth mean.
 

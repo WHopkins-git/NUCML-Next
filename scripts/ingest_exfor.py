@@ -160,7 +160,7 @@ Note:
         '--max-subsample-points',
         type=int,
         default=15000,
-        help='Subsample large experiments to this many points for GP fitting '
+        help='Subsample large experiments to this many points for SVGP fitting '
              '(default: 15000). Predictions still made on all points.'
     )
     parser.add_argument(
@@ -198,6 +198,13 @@ Note:
         default=0.30,
         help='Fraction of bad points to flag an experiment as discrepant '
              '(default: 0.30 = 30%%). Only used with --outlier-method local_mad.'
+    )
+    parser.add_argument(
+        '--n-workers',
+        type=int,
+        default=-1,
+        help='Parallel workers for outlier detection. '
+             '-1 = auto (half CPU cores), 0 = all cores. Default: -1.'
     )
 
     import multiprocessing
@@ -318,13 +325,15 @@ Note:
         )
 
     elif outlier_method == 'local_mad':
-        from nucml_next.data.experiment_outlier import ExperimentOutlierConfig
+        from nucml_next.data.experiment_outlier import (
+            ExperimentOutlierConfig, ExperimentOutlierDetector,
+        )
 
         experiment_outlier_config = ExperimentOutlierConfig(
             point_z_threshold=args.z_threshold,
             exp_z_threshold=args.exp_z_threshold,
             exp_fraction_threshold=args.exp_fraction_threshold,
-            n_workers=max(1, args.num_threads),
+            n_workers=args.n_workers,  # -1 = auto (half cores), 0 = all, N = exact
         )
 
     run_svgp = outlier_method == 'svgp'
@@ -342,9 +351,11 @@ Note:
     if outlier_method == 'svgp':
         print(f"Outlier:      SVGP (legacy) - device={args.svgp_device}, likelihood={args.svgp_likelihood}")
     elif outlier_method == 'local_mad':
+        _resolved = ExperimentOutlierDetector._resolve_n_workers(args.n_workers)
         print(f"Outlier:      Smooth mean + local MAD")
         print(f"              Point threshold: z > {args.z_threshold}")
         print(f"              Experiment: >{args.exp_fraction_threshold:.0%} of points with z > {args.exp_z_threshold}")
+        print(f"              Workers: {_resolved} (from {multiprocessing.cpu_count()} logical cores)")
     else:
         print(f"Outlier:      Disabled (use --outlier-method to enable)")
     # Metadata filtering status

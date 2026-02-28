@@ -2,9 +2,9 @@
 Interactive Outlier Threshold Explorer
 =======================================
 
-ipywidgets-based interactive explorer for SVGP outlier detection results.
+ipywidgets-based interactive explorer for outlier detection results.
 Provides cascading dropdowns for (Z, A, MT) selection, a z-score threshold
-slider, a GP probability surface heatmap, and a z-score band plot with
+slider, a z-score heatmap, and a z-score band plot with
 auto-annotated extreme outliers.
 
 Usage (notebook)::
@@ -40,6 +40,7 @@ INLIER_COLOR = '#2E8B8B'       # teal
 OUTLIER_COLOR = '#DC143C'      # crimson (legacy, kept for compatibility)
 POINT_OUTLIER_COLOR = '#FF8C00'  # dark orange for point outliers (z > threshold)
 DISCREPANT_EXP_COLOR = '#DC143C'  # crimson for discrepant experiments
+NO_UNC_COLOR = '#E8836A'       # coral/salmon for points without uncertainty data
 INLIER_SIZE = 10
 OUTLIER_SIZE = 30
 
@@ -110,7 +111,7 @@ def _mt_str(mt: int) -> str:
 
 
 class ThresholdExplorer:
-    """Interactive widget-based outlier threshold explorer for SVGP results.
+    """Interactive widget-based outlier threshold explorer for scored results.
 
     Parameters
     ----------
@@ -167,7 +168,7 @@ class ThresholdExplorer:
         if 'z_score' not in self._df.columns:
             raise ValueError(
                 "z_score column not found in data. "
-                "Run ingestion with --run-svgp to add z_score column."
+                "Run ingestion with --outlier-method local_mad to add z_score column."
             )
 
         # Drop rows with missing z_score
@@ -316,8 +317,9 @@ class ThresholdExplorer:
         help_text = widgets.HTML(
             value=(
                 '<div style="font-size:11px; color:#555; margin:0 0 8px 5px; line-height:1.4;">'
-                '<b>RAW</b> = uncorrected experimental measurements (SF8=RAW); real data but may have systematic offsets. '
-                '<b>Discrepant experiments</b> = entire EXFOR entries whose GP posterior deviates from the multi-experiment consensus.'
+                '<b>Point outliers</b> = individual measurements with z-score above threshold. '
+                '<b>Discrepant experiments</b> = EXFOR entries where a high fraction of points exceed the z-score threshold. '
+                '<b>RAW</b> = uncorrected experimental measurements (SF8=RAW); real data but may have systematic offsets.'
                 '</div>'
             ),
         )
@@ -486,7 +488,7 @@ class ThresholdExplorer:
             self._plot_full(group)
 
     # =====================================================================
-    # Full GP plot (probability surface + z-score bands)
+    # Full 3-panel plot (z-score heatmap | highlighted | filtered)
     # =====================================================================
 
     def _plot_full(self, df: pd.DataFrame) -> None:
@@ -503,7 +505,7 @@ class ThresholdExplorer:
         with self._output:
             self._output.clear_output(wait=True)
 
-            # 3-panel layout: GP surface | All data highlighted | Filtered data
+            # 3-panel layout: Z-score heatmap | All data highlighted | Filtered data
             fig = plt.figure(figsize=(self._figsize[0] + 4, self._figsize[1] + 1.5))
 
             gs = gridspec.GridSpec(
@@ -567,6 +569,7 @@ class ThresholdExplorer:
 
             plt.tight_layout(rect=[0, 0, 1, 0.94])
             plt.show()
+            plt.close(fig)  # Prevent duplicate display by inline backend
 
     # =====================================================================
     # Fallback plot (MAD / single-point groups)
@@ -598,7 +601,7 @@ class ThresholdExplorer:
                 msg = (
                     f"MAD fallback group (N={len(df)} < min_group_size).\n"
                     f"Probability surface not available.\n"
-                    f"GP mean and std are constant (median / MAD)."
+                    f"Mean and MAD are constant (median / MAD)."
                 )
 
             # Plot data
@@ -618,7 +621,7 @@ class ThresholdExplorer:
             )
             ax.axhline(
                 gp_mean_val, color=GP_MEAN_COLOR, linewidth=2,
-                label='GP mean (median)',
+                label='Smooth mean (median)',
             )
             ax.axhline(
                 gp_mean_val + threshold * gp_std_val,
@@ -673,6 +676,7 @@ class ThresholdExplorer:
 
             plt.tight_layout()
             plt.show()
+            plt.close(fig)  # Prevent duplicate display by inline backend
 
     # =====================================================================
     # Z-Score heatmap panel (replaces probability surface)
@@ -684,7 +688,7 @@ class ThresholdExplorer:
         """Draw data points colored by z-score magnitude.
 
         Uses RdYlBu_r colormap where:
-        - Blue = low z-score (good fit to GP)
+        - Blue = low z-score (close to smooth mean)
         - Yellow = moderate z-score
         - Red = high z-score (outlier)
         """
@@ -831,7 +835,7 @@ class ThresholdExplorer:
                       family='sans-serif')
         ax.set_ylabel(r'$\log_{10}(\sigma)$ [b]', fontsize=11,
                       family='sans-serif')
-        ax.set_title('GP Predictive Distribution', fontsize=12,
+        ax.set_title('Smooth Mean Distribution', fontsize=12,
                      fontweight='bold', family='sans-serif')
         ax.spines['top'].set_visible(False)
         ax.spines['right'].set_visible(False)
@@ -855,10 +859,10 @@ class ThresholdExplorer:
         mu_s = gp_mean[sort_idx]
         std_s = gp_std[sort_idx]
 
-        # GP mean line
+        # Smooth mean line
         ax.plot(
             E_s, mu_s, color=GP_MEAN_COLOR, linewidth=2,
-            label='GP mean', zorder=5,
+            label='Smooth mean', zorder=5,
         )
 
         # Confidence bands
@@ -973,7 +977,7 @@ class ThresholdExplorer:
                       family='sans-serif')
         ax.set_ylabel(r'$\log_{10}(\sigma)$ [b]', fontsize=11,
                       family='sans-serif')
-        ax.set_title('GP Fit + Z-Score Bands', fontsize=12,
+        ax.set_title('Smooth Mean + Z-Score Bands', fontsize=12,
                      fontweight='bold', family='sans-serif')
         ax.legend(loc='best', fontsize=8, frameon=False)
         ax.spines['top'].set_visible(False)
@@ -1174,17 +1178,19 @@ class ThresholdExplorer:
                     yerr=[log_lower, log_upper],
                     fmt='o', color=INLIER_COLOR, markersize=4,
                     ecolor='gray', elinewidth=0.5, capsize=0,
-                    alpha=0.7,
+                    alpha=0.4, zorder=2,
                     label=f'With uncertainty ({valid_unc.sum():,})',
                 )
 
                 # Plot points without valid uncertainty as plain scatter
+                # Use distinct coral/salmon colour so they stand out from
+                # teal "with uncertainty" points
                 no_unc = ~valid_unc
                 if no_unc.any():
                     ax.scatter(
                         filt_log_E[no_unc], log_xs[no_unc],
-                        c=INLIER_COLOR, s=INLIER_SIZE, alpha=0.4,
-                        edgecolors='none',
+                        c=NO_UNC_COLOR, s=INLIER_SIZE, alpha=0.6,
+                        edgecolors='none', zorder=3,
                         label=f'No uncertainty ({no_unc.sum():,})',
                     )
             else:
