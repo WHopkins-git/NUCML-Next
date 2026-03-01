@@ -494,11 +494,19 @@ class CrossSectionFigure:
             energy_min=energy_min, energy_max=energy_max,
         )
 
-        # Filter out placeholder zeros only for raw MF=3 data
+        # Filter out placeholder zeros and non-positive values
+        # (essential for log-scale plotting; ENDF files use tiny placeholders
+        # like 1e-20 for below-threshold cross-sections)
+        pos_mask = (energies > 0) & (xs > 0)
         if source == "endf_mf3" and xs_min > 0:
-            valid_mask = xs >= xs_min
-            energies = energies[valid_mask]
-            xs = xs[valid_mask]
+            pos_mask &= xs >= xs_min
+        energies = energies[pos_mask]
+        xs = xs[pos_mask]
+
+        if len(energies) == 0:
+            import warnings
+            warnings.warn(f"No positive ENDF data for MT={mt} after filtering")
+            return self
 
         # Auto-assign color
         if color is None:

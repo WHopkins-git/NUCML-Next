@@ -123,6 +123,9 @@ class XGBoostEvaluator:
         max_depth_range: tuple = (3, 15),
         learning_rate_range: tuple = (0.01, 0.3),
         subsample_range: tuple = (0.6, 1.0),
+        # Subsampling for memory efficiency
+        subsample_fraction: Optional[float] = None,
+        subsample_max_samples: Optional[int] = None,
         # Uncertainty-based sample filtering
         use_uncertainty_weights: Optional[str] = None,
         missing_uncertainty_handling: str = 'median',
@@ -146,6 +149,10 @@ class XGBoostEvaluator:
             max_depth_range: (min, max) for max_depth. Default: (3, 15)
             learning_rate_range: (min, max) for learning_rate. Default: (0.01, 0.3)
             subsample_range: (min, max) for subsample. Default: (0.6, 1.0)
+            subsample_fraction: Fraction of data to use for hyperparameter search
+                (0.0-1.0). Final model is trained on full data. Default: None (no subsampling).
+            subsample_max_samples: Hard cap on samples for hyperparameter search.
+                If both this and subsample_fraction are given, the smaller result is used.
             use_uncertainty_weights: Weight mode (None, 'xs', or 'both').
                 When set with missing_uncertainty_handling='exclude', samples without
                 valid uncertainty are removed before hyperparameter search.
@@ -284,9 +291,36 @@ class XGBoostEvaluator:
                 "3. Feature columns don't have all-NaN values"
             )
 
-        # Split data
+        # Apply subsampling AFTER data preparation
+        n_samples = len(X_arr)
+        use_subsample = subsample_fraction is not None or subsample_max_samples is not None
+
+        if use_subsample:
+            target_size = n_samples
+            if subsample_fraction is not None:
+                target_size = min(target_size, int(n_samples * subsample_fraction))
+            if subsample_max_samples is not None:
+                target_size = min(target_size, subsample_max_samples)
+
+            if target_size < n_samples:
+                rng = np.random.default_rng(42)
+                subsample_idx = rng.choice(n_samples, size=target_size, replace=False)
+                X_arr_search = X_arr[subsample_idx]
+                y_arr_search = y_arr[subsample_idx]
+                if verbose:
+                    print(f"\nSubsampled for search: {n_samples:,} → {target_size:,} samples "
+                          f"({100*target_size/n_samples:.1f}%)")
+                    print(f"  NOTE: Final model will be trained on FULL data after search")
+            else:
+                X_arr_search = X_arr
+                y_arr_search = y_arr
+        else:
+            X_arr_search = X_arr
+            y_arr_search = y_arr
+
+        # Split data (use subsampled data for search)
         X_train, X_test, y_train, y_test = train_test_split(
-            X_arr, y_arr, test_size=test_size, random_state=42
+            X_arr_search, y_arr_search, test_size=test_size, random_state=42
         )
 
         # Hyperparameter search space (using provided ranges)
@@ -363,7 +397,15 @@ class XGBoostEvaluator:
         best_params['min_child_weight'] = int(best_params['min_child_weight'])
         best_params['random_state'] = 42
 
-        # Evaluate on test set
+        # Evaluate on test set (use full data when subsampling was active)
+        if use_subsample and target_size < n_samples:
+            X_train_full, X_test_full, y_train_full, y_test_full = train_test_split(
+                X_arr, y_arr, test_size=test_size, random_state=42
+            )
+        else:
+            X_train_full, X_test_full = X_train, X_test
+            y_train_full, y_test_full = y_train, y_test
+
         final_model = xgb.XGBRegressor(
             **best_params,
             objective='reg:squarederror',
@@ -371,16 +413,16 @@ class XGBoostEvaluator:
             n_jobs=-1,
             verbosity=0,
         )
-        final_model.fit(X_train, y_train, verbose=False)
-        y_test_pred = final_model.predict(X_test)
+        final_model.fit(X_train_full, y_train_full, verbose=False)
+        y_test_pred = final_model.predict(X_test_full)
 
         # Inverse transform if using log
         if pipeline.config.log_target:
             y_test_pred = pipeline.inverse_transform_target(pd.Series(y_test_pred)).values
-            y_test_orig = pipeline.inverse_transform_target(pd.Series(y_test)).values
+            y_test_orig = pipeline.inverse_transform_target(pd.Series(y_test_full)).values
         else:
             y_test_pred = y_test_pred
-            y_test_orig = y_test
+            y_test_orig = y_test_full
 
         test_mse = mean_squared_error(y_test_orig, y_test_pred)
         best_cv_score = -trials.best_trial['result']['loss']

@@ -728,8 +728,10 @@ class NNDCSigmaFetcher:
         Fetch cross-section data from NNDC Sigma web service.
 
         Uses the NNDC getPlotData.jsp endpoint to retrieve processed
-        pointwise cross-section data.
+        pointwise cross-section data.  Retries up to 3 times with
+        exponential back-off (90 s timeout per attempt).
         """
+        import time
         try:
             import urllib.request
             import urllib.parse
@@ -754,12 +756,27 @@ class NNDCSigmaFetcher:
 
         url = f"{self.BASE_URL}?{urllib.parse.urlencode(params)}"
 
-        try:
-            with urllib.request.urlopen(url, timeout=30) as response:
-                content = response.read().decode('utf-8')
-        except Exception as e:
+        max_retries = 3
+        last_error: Optional[Exception] = None
+        for attempt in range(max_retries):
+            try:
+                with urllib.request.urlopen(url, timeout=90) as response:
+                    content = response.read().decode('utf-8')
+                break  # success
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    wait = 2 ** attempt  # 1s, 2s
+                    warnings.warn(
+                        f"NNDC fetch attempt {attempt + 1}/{max_retries} failed "
+                        f"for {symbol}-{a} MT={mt}: {e}. Retrying in {wait}s...",
+                        UserWarning,
+                    )
+                    time.sleep(wait)
+        else:
             raise RuntimeError(
-                f"Failed to fetch data from NNDC Sigma for {symbol}-{a} MT={mt}: {e}\n"
+                f"Failed to fetch data from NNDC Sigma for {symbol}-{a} MT={mt} "
+                f"after {max_retries} attempts: {last_error}\n"
                 f"URL: {url}\n"
                 f"You may need to check your internet connection or try the NNDC website directly:\n"
                 f"https://www.nndc.bnl.gov/sigma/"

@@ -228,13 +228,15 @@ class DataSelection:
             - 'reactor_core': Essential for reactor physics (MT 2,4,16,18,102,103,107)
             - 'threshold_only': Reactions with energy thresholds (MT 16,17,103-107)
             - 'fission_details': Fission breakdown (MT 18,19,20,21,38)
-            - 'all_physical': All MT codes (including bookkeeping if exclude_bookkeeping=False)
+            - 'all_physical': All MT codes (subject to exclude_mt filtering)
             - 'custom': Use custom_mt_codes list
         custom_mt_codes: Custom MT code list (used when mt_mode='custom')
-        exclude_bookkeeping: Exclude MT 0 (undefined/non-standard data). Default: True
-                            When False with mt_mode='all_physical', includes MT 0.
-                            NOTE: MT 1 (total XS) and MT 9000+ (covariance/residual)
-                            are valid physics data, not bookkeeping!
+        exclude_mt: List of MT codes to exclude from the dataset. Default: [0]
+                   Entries are literal MT numbers. The sentinel value 9000
+                   means "exclude all MT >= 9000" (lumped covariance /
+                   residual production).  Use None or [] to include everything.
+                   Examples: [0] — exclude only MT 0 (undefined data)
+                             [0, 9000] — also remove all MT >= 9000
         drop_invalid: Drop NaN or non-positive cross-sections. Default: True
         holdout_isotopes: List of (Z,A) tuples to exclude from training.
                          Use for measuring true extrapolation capability.
@@ -280,8 +282,12 @@ class DataSelection:
     mt_mode: str = 'reactor_core'  # 'reactor_core', 'threshold_only', 'fission_details', 'all_physical', 'custom'
     custom_mt_codes: Optional[List[int]] = None
 
-    # Exclusion rules
-    exclude_bookkeeping: bool = True  # Exclude MT 0 (undefined/non-standard data only)
+    # MT exclusion list -- specific MT codes to exclude from the dataset.
+    # Entries are literal MT numbers, except that 9000 is a sentinel meaning
+    # "exclude all MT >= 9000" (lumped covariance / residual production).
+    # Example: [0] excludes only MT 0; [0, 9000] also removes all MT >= 9000.
+    # Default: [0] (exclude only MT 0, which is undefined/non-standard data).
+    exclude_mt: Optional[List[int]] = field(default_factory=lambda: [0])
 
     # Spectrum-averaged data exclusion (IAEA "Exclude non pure data" equivalent)
     exclude_spectrum_averaged: bool = True   # Exclude MXW, SPA, FIS, AV, BRA, BRS, SDT, FST, TTA
@@ -378,20 +384,25 @@ class DataSelection:
         elif self.mt_mode == 'fission_details':
             mt_codes = FISSION_DETAILS_MT.copy()
         elif self.mt_mode == 'all_physical':
-            # 'all_physical' includes ALL MT codes (including bookkeeping)
-            # The exclude_bookkeeping parameter controls whether to filter them out
-            # This avoids double-filtering and gives users explicit control
+            # 'all_physical' includes ALL MT codes; the exclude_mt list
+            # controls which specific codes are removed afterwards.
             mt_codes = None  # Signal to not filter by MT at this stage
         elif self.mt_mode == 'custom':
             mt_codes = self.custom_mt_codes.copy()
         else:
             raise ValueError(f"Unknown mt_mode: {self.mt_mode}")
 
-        # Apply bookkeeping exclusions if requested
-        # This is the ONLY place where bookkeeping codes are filtered
-        # NOTE: MT >= 9000 are valid neutron covariance/residual data, not bookkeeping
-        if self.exclude_bookkeeping and mt_codes is not None:
-            mt_codes = [mt for mt in mt_codes if mt not in BOOKKEEPING_MT]
+        # Apply MT exclusion list.
+        # Each entry is a literal MT to drop; the sentinel 9000 means
+        # "drop every MT >= 9000" (lumped covariance / residual production).
+        if self.exclude_mt and mt_codes is not None:
+            exclude_set = set(self.exclude_mt)
+            has_9k_sentinel = 9000 in exclude_set
+            mt_codes = [
+                mt for mt in mt_codes
+                if mt not in exclude_set
+                and not (has_9k_sentinel and mt >= 9000)
+            ]
 
         return mt_codes
 
@@ -464,10 +475,10 @@ class DataSelection:
         if mt_codes is not None:
             lines.append(f"  MT codes: {sorted(mt_codes)[:10]}{'...' if len(mt_codes) > 10 else ''} ({len(mt_codes)} total)")
         else:
-            if self.exclude_bookkeeping:
-                lines.append(f"  MT codes: all physical (excluding MT 0 undefined)")
+            if self.exclude_mt:
+                lines.append(f"  MT codes: all physical (excluding MT {self.exclude_mt})")
             else:
-                lines.append(f"  MT codes: all physical (including MT 0 undefined)")
+                lines.append(f"  MT codes: all physical (no exclusions)")
 
         # Show tier selection
         lines.append(f"  Feature tiers: {self.tiers}")

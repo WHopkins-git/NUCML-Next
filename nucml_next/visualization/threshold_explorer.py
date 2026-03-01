@@ -129,9 +129,11 @@ class ThresholdExplorer:
         data: Union[str, Path, pd.DataFrame],
         default_threshold: float = 3.0,
         figsize: Tuple[float, float] = (16, 7),
+        endf_dir: Union[str, Path] = 'data/ENDF-B/neutrons',
     ):
         self._figsize = figsize
         self._default_threshold = default_threshold
+        self._endf_dir = str(endf_dir)
 
         # ── Load data ────────────────────────────────────────────────────
         if isinstance(data, (str, Path)):
@@ -284,6 +286,17 @@ class ThresholdExplorer:
             style={'description_width': 'initial'},
             disabled=not self._has_sf8,
         )
+        self._w_exclude_no_unc = widgets.Checkbox(
+            value=False,
+            description='Exclude no-uncertainty',
+            style={'description_width': 'initial'},
+            disabled=not self._has_uncertainty,
+        )
+        self._w_show_endf = widgets.Checkbox(
+            value=False,
+            description='Show ENDF-B',
+            style={'description_width': 'initial'},
+        )
 
         # Wire observers
         self._w_z.observe(self._on_z_change, names='value')
@@ -295,6 +308,8 @@ class ThresholdExplorer:
         self._w_exclude_discrepant.observe(self._on_filter_change, names='value')
         self._w_color_by_experiment.observe(self._on_experiment_toggle, names='value')
         self._w_exclude_raw.observe(self._on_filter_change, names='value')
+        self._w_exclude_no_unc.observe(self._on_filter_change, names='value')
+        self._w_show_endf.observe(self._on_filter_change, names='value')
 
         # Build control rows
         row1 = widgets.HBox(
@@ -308,7 +323,9 @@ class ThresholdExplorer:
                 self._w_exclude_point_outliers,
                 self._w_exclude_discrepant,
                 self._w_exclude_raw,
+                self._w_exclude_no_unc,
                 self._w_color_by_experiment,
+                self._w_show_endf,
             ],
             layout=widgets.Layout(margin='0 0 5px 0'),
         )
@@ -325,6 +342,9 @@ class ThresholdExplorer:
         )
 
         self._ui = widgets.VBox([row1, row2, help_text, self._output])
+
+        # Guard flag: prevent re-entrant _update_plot during cascade
+        self._updating = False
 
         # Initialise cascade (triggers A -> MT -> plot)
         self._on_z_change(None)
@@ -449,6 +469,15 @@ class ThresholdExplorer:
         return df['sf8'].fillna('').str.contains('RAW', na=False).values
 
     def _update_plot(self) -> None:
+        if self._updating:
+            return
+        self._updating = True
+        try:
+            self._do_update_plot()
+        finally:
+            self._updating = False
+
+    def _do_update_plot(self) -> None:
         z = self._w_z.value
         a = self._w_a.value
         proj = self._w_proj.value
@@ -1125,6 +1154,10 @@ class ThresholdExplorer:
         if self._w_exclude_raw.value:
             mask &= ~self._is_raw(df)
 
+        if self._w_exclude_no_unc.value and self._has_uncertainty:
+            unc = df['Uncertainty'].values
+            mask &= np.isfinite(unc) & (unc > 0)
+
         filtered = df[mask].copy()
         n_filtered = len(filtered)
 
@@ -1166,9 +1199,10 @@ class ThresholdExplorer:
 
                 # Lower error: when xs - unc <= 0, cap at MAX_LOG_ERROR
                 lower_vals = xs_valid - unc_valid
+                safe_lower = np.where(lower_vals > 0, lower_vals, 1.0)
                 log_lower = np.where(
                     lower_vals > 0,
-                    log_xs_valid - np.log10(lower_vals),
+                    log_xs_valid - np.log10(safe_lower),
                     MAX_LOG_ERROR  # Cap when uncertainty >= value
                 )
                 log_lower = np.clip(log_lower, 0, MAX_LOG_ERROR)
@@ -1177,20 +1211,18 @@ class ThresholdExplorer:
                     filt_log_E_valid, log_xs_valid,
                     yerr=[log_lower, log_upper],
                     fmt='o', color=INLIER_COLOR, markersize=4,
-                    ecolor='gray', elinewidth=0.5, capsize=0,
-                    alpha=0.4, zorder=2,
+                    ecolor=INLIER_COLOR, elinewidth=0.8, capsize=2,
+                    alpha=0.5, zorder=2,
                     label=f'With uncertainty ({valid_unc.sum():,})',
                 )
 
-                # Plot points without valid uncertainty as plain scatter
-                # Use distinct coral/salmon colour so they stand out from
-                # teal "with uncertainty" points
+                # Plot points without valid uncertainty as distinct markers
                 no_unc = ~valid_unc
                 if no_unc.any():
                     ax.scatter(
                         filt_log_E[no_unc], log_xs[no_unc],
-                        c=NO_UNC_COLOR, s=INLIER_SIZE, alpha=0.6,
-                        edgecolors='none', zorder=3,
+                        c=NO_UNC_COLOR, s=INLIER_SIZE * 2, alpha=0.7,
+                        marker='D', edgecolors='none', zorder=3,
                         label=f'No uncertainty ({no_unc.sum():,})',
                     )
             else:
@@ -1209,6 +1241,10 @@ class ThresholdExplorer:
                 edgecolors='white', linewidths=0.3,
                 label=f'Filtered ({n_filtered:,})',
             )
+
+        # ── ENDF-B overlay ────────────────────────────────────────────────
+        if self._w_show_endf.value:
+            self._draw_endf_overlay(ax, filtered)
 
         # ── Energy region vertical spans ─────────────────────────────────
         y_lo, y_hi = ax.get_ylim()
@@ -1237,6 +1273,70 @@ class ThresholdExplorer:
         ax.legend(loc='best', fontsize=8, frameon=True, framealpha=0.9)
         ax.spines['top'].set_visible(False)
         ax.spines['right'].set_visible(False)
+
+    # =====================================================================
+    # ENDF-B overlay
+    # =====================================================================
+
+    def _draw_endf_overlay(self, ax: Axes, filtered: pd.DataFrame) -> None:
+        """Overlay ENDF-B evaluated data on the filtered-data panel.
+
+        Uses :class:`ENDFReader` to load MF=3 pointwise cross-section data
+        matching the currently selected Z, A, MT.  Only available for
+        neutron-projectile data since the ENDF-B files are neutron libraries.
+        """
+        from .endf_reader import ENDFReader
+
+        z = self._w_z.value
+        a = self._w_a.value
+        mt = self._w_mt.value
+        if z is None or a is None or mt is None:
+            return
+
+        try:
+            endf_path = ENDFReader.find_file(z, a, endf_dir=self._endf_dir)
+            if endf_path is None:
+                ax.text(
+                    0.98, 0.02, 'ENDF-B file not found',
+                    transform=ax.transAxes, ha='right', va='bottom',
+                    fontsize=7, color='#999', style='italic',
+                )
+                return
+
+            reader = ENDFReader(endf_path)
+            available_mts = reader.list_reactions()
+            if mt not in available_mts:
+                ax.text(
+                    0.98, 0.02, f'MT={mt} not in ENDF-B',
+                    transform=ax.transAxes, ha='right', va='bottom',
+                    fontsize=7, color='#999', style='italic',
+                )
+                return
+
+            energies, xs = reader.get_cross_section(mt)
+
+            # Filter to positive cross-sections (required for log scale)
+            pos = (energies > 0) & (xs > 0)
+            energies = energies[pos]
+            xs = xs[pos]
+
+            if len(energies) == 0:
+                return
+
+            log_E_endf = np.log10(energies)
+            log_xs_endf = np.log10(xs)
+
+            ax.plot(
+                log_E_endf, log_xs_endf,
+                color='black', linewidth=1.5, alpha=0.8, zorder=10,
+                label=f'ENDF/B-VIII.0 ({len(energies):,} pts)',
+            )
+        except Exception as exc:
+            ax.text(
+                0.98, 0.02, f'ENDF error: {exc}',
+                transform=ax.transAxes, ha='right', va='bottom',
+                fontsize=7, color='red', style='italic',
+            )
 
     # =====================================================================
     # Per-experiment scatter (for Color by experiment mode)
