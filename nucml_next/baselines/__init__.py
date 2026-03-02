@@ -8,6 +8,7 @@ classical approaches for nuclear data evaluation.
 Key Components:
     XGBoostEvaluator: Gradient boosting baseline
     DecisionTreeEvaluator: Decision tree baseline (shows "staircase effect")
+    NeuralNetEvaluator: CPU-friendly feedforward neural network baseline
 
 Pedagogical Goal:
     These models reveal why physics-informed deep learning is necessary:
@@ -18,8 +19,10 @@ Pedagogical Goal:
 
 from nucml_next.baselines.xgboost_evaluator import XGBoostEvaluator
 from nucml_next.baselines.decision_tree_evaluator import DecisionTreeEvaluator
+from nucml_next.baselines.nn_evaluator import NeuralNetEvaluator
 
 __all__ = [
     "XGBoostEvaluator",
     "DecisionTreeEvaluator",
+    "NeuralNetEvaluator",
 ]
