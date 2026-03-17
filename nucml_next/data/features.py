@@ -407,11 +407,11 @@ class FeatureGenerator:
                 'Shell_Closure_N', 'Shell_Closure_P'
             ])
 
-        # Tier E: Complete Q-values (AME2020 reaction energetics)
+        # Tier E: Complete Q-values (AME2020 reaction energetics, keV -> MeV)
         if 'E' in tiers:
             columns.update([
-                'Q_alpha', 'Q_2beta_minus', 'Q_ep', 'Q_beta_n',
-                'Q_4beta_minus', 'Q_d_alpha', 'Q_p_alpha', 'Q_n_alpha'
+                'Q_alpha_MeV', 'Q_2beta_minus_MeV', 'Q_ep_MeV', 'Q_beta_n_MeV',
+                'Q_4beta_minus_MeV', 'Q_d_alpha_MeV', 'Q_p_alpha_MeV', 'Q_n_alpha_MeV'
             ])
 
         return sorted(columns)
