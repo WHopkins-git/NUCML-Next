@@ -1,8 +1,12 @@
 """
 Regression test: Tier E Q-value columns must survive the column filter.
 
-Prior bug: _get_tier_columns() listed 'Q_alpha' etc., but _add_tier_e_features()
-renamed them to 'Q_alpha_MeV' etc.  The column filter then silently dropped all 8.
+Prior bugs:
+1. _get_tier_columns() listed 'Q_alpha' but output is 'Q_alpha_MeV'
+2. _add_tier_e_features() checked for 'Q_alpha' but enrichment stores 'Q_alpha_keV'
+
+The synthetic data uses _keV suffixed columns to match what AME2020DataEnricher
+actually produces (see enrichment.py lines 384-488).
 """
 
 import unittest
@@ -18,9 +22,19 @@ TIER_E_EXPECTED = [
     'Q_4beta_minus_MeV', 'Q_d_alpha_MeV', 'Q_p_alpha_MeV', 'Q_n_alpha_MeV',
 ]
 
+# Source columns as produced by AME2020DataEnricher (keV units)
+TIER_E_SOURCE_COLS = [
+    'Q_alpha_keV', 'Q_2beta_minus_keV', 'Q_ep_keV', 'Q_beta_n_keV',
+    'Q_4beta_minus_keV', 'Q_d_alpha_keV', 'Q_p_alpha_keV', 'Q_n_alpha_keV',
+]
+
 
 def _make_enriched_df(n=5):
-    """Build a minimal DataFrame that looks like pre-enriched Parquet output."""
+    """Build a minimal DataFrame that looks like on-demand AME enrichment output.
+
+    Column names use _keV suffix to match what AME2020DataEnricher.load_all()
+    produces (enrichment.py lines 384-488).
+    """
     rng = np.random.default_rng(42)
     df = pd.DataFrame({
         'Z': [92] * n,
@@ -30,15 +44,15 @@ def _make_enriched_df(n=5):
         'CrossSection': rng.uniform(0.1, 100, n),
         'Uncertainty': rng.uniform(0.01, 1, n),
         'MT': [18] * n,
-        # Pre-enriched Q-value columns (keV, as stored in Parquet)
-        'Q_alpha': rng.uniform(4000, 5000, n),
-        'Q_2beta_minus': rng.uniform(1000, 2000, n),
-        'Q_ep': rng.uniform(500, 1500, n),
-        'Q_beta_n': rng.uniform(200, 800, n),
-        'Q_4beta_minus': rng.uniform(3000, 4000, n),
-        'Q_d_alpha': rng.uniform(10000, 15000, n),
-        'Q_p_alpha': rng.uniform(8000, 12000, n),
-        'Q_n_alpha': rng.uniform(5000, 9000, n),
+        # Q-value columns in keV (as stored by AME enrichment)
+        'Q_alpha_keV': rng.uniform(4000, 5000, n),
+        'Q_2beta_minus_keV': rng.uniform(1000, 2000, n),
+        'Q_ep_keV': rng.uniform(500, 1500, n),
+        'Q_beta_n_keV': rng.uniform(200, 800, n),
+        'Q_4beta_minus_keV': rng.uniform(3000, 4000, n),
+        'Q_d_alpha_keV': rng.uniform(10000, 15000, n),
+        'Q_p_alpha_keV': rng.uniform(8000, 12000, n),
+        'Q_n_alpha_keV': rng.uniform(5000, 9000, n),
     })
     return df
 
@@ -68,8 +82,7 @@ class TestTierEColumns(unittest.TestCase):
         gen = FeatureGenerator()
         result = gen.generate_features(df, tiers=['A', 'E'])
 
-        for col in ['Q_alpha', 'Q_2beta_minus', 'Q_ep', 'Q_beta_n',
-                     'Q_4beta_minus', 'Q_d_alpha', 'Q_p_alpha', 'Q_n_alpha']:
+        for col in TIER_E_SOURCE_COLS:
             self.assertNotIn(col, result.columns,
                              f"Original keV column should be removed: {col}")
 

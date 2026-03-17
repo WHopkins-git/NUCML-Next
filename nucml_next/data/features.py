@@ -694,8 +694,8 @@ class FeatureGenerator:
         """
         result = df.copy()
 
-        # Check if data is pre-enriched (has AME2020 Q-value columns)
-        tier_e_cols = ['Q_alpha', 'Q_n_alpha']
+        # Check if data is pre-enriched (has AME2020 Q-value columns with _keV suffix)
+        tier_e_cols = ['Q_alpha_keV', 'Q_n_alpha_keV']
         has_enrichment = any(col in result.columns for col in tier_e_cols)
 
         if not has_enrichment:
@@ -713,13 +713,13 @@ class FeatureGenerator:
 
         # Convert keV to MeV for better numerical stability
         q_value_cols = [
-            'Q_alpha', 'Q_2beta_minus', 'Q_ep', 'Q_beta_n',
-            'Q_4beta_minus', 'Q_d_alpha', 'Q_p_alpha', 'Q_n_alpha'
+            'Q_alpha_keV', 'Q_2beta_minus_keV', 'Q_ep_keV', 'Q_beta_n_keV',
+            'Q_4beta_minus_keV', 'Q_d_alpha_keV', 'Q_p_alpha_keV', 'Q_n_alpha_keV'
         ]
 
         for col in q_value_cols:
             if col in result.columns:
-                result[f'{col}_MeV'] = result[col] / 1000.0
+                result[f'{col.replace("_keV", "")}_MeV'] = result[col] / 1000.0
                 result = result.drop(columns=[col])
 
         return result
